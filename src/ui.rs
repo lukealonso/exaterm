@@ -2,6 +2,10 @@ use crate::demo::WorkspaceBlueprint;
 use crate::model::{
     SessionId, SessionKind, SessionLaunch, WorkspaceState,
 };
+use crate::synthesis::{
+    summary_signature, summarize_blocking, MismatchLevel, OpenAiSynthesisConfig, TacticalEvidence,
+    TacticalSynthesis,
+};
 use crate::supervision::{
     build_battle_card, BattleCardStatus, DeterministicIntentEngine, ObservedActivity, SignalTone,
 };
@@ -13,7 +17,9 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::time::Instant;
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
 use vte::prelude::*;
 use vte4 as vte;
 
@@ -60,6 +66,45 @@ impl SessionObservation {
     }
 }
 
+struct SummaryWorker {
+    requests: mpsc::Sender<SummaryJob>,
+    responses: mpsc::Receiver<SummaryResult>,
+}
+
+struct SummaryJob {
+    session_id: SessionId,
+    signature: String,
+    evidence: TacticalEvidence,
+}
+
+struct SummaryResult {
+    session_id: SessionId,
+    signature: String,
+    summary: Result<TacticalSynthesis, String>,
+}
+
+struct SummaryCacheEntry {
+    completed_signature: Option<String>,
+    requested_signature: Option<String>,
+    last_summary: Option<TacticalSynthesis>,
+    last_error: Option<String>,
+    last_attempt: Option<Instant>,
+    in_flight: bool,
+}
+
+impl SummaryCacheEntry {
+    fn new() -> Self {
+        Self {
+            completed_signature: None,
+            requested_signature: None,
+            last_summary: None,
+            last_error: None,
+            last_attempt: None,
+            in_flight: false,
+        }
+    }
+}
+
 struct FocusWidgets {
     panel: gtk::Box,
     title: gtk::Label,
@@ -79,6 +124,8 @@ struct AppContext {
     focus: FocusWidgets,
     session_cards: RefCell<BTreeMap<SessionId, SessionCardWidgets>>,
     observations: RefCell<BTreeMap<SessionId, SessionObservation>>,
+    summary_worker: Option<SummaryWorker>,
+    summary_cache: RefCell<BTreeMap<SessionId, SummaryCacheEntry>>,
 }
 
 pub fn run() -> glib::ExitCode {
@@ -242,6 +289,8 @@ fn build_ui(app: &gtk::Application) {
         },
         session_cards: RefCell::new(BTreeMap::new()),
         observations: RefCell::new(BTreeMap::new()),
+        summary_worker: spawn_summary_worker(),
+        summary_cache: RefCell::new(BTreeMap::new()),
     });
 
     {
@@ -537,7 +586,30 @@ fn spawn_session(
     }
 }
 
+fn spawn_summary_worker() -> Option<SummaryWorker> {
+    let config = OpenAiSynthesisConfig::from_env()?;
+    let (request_tx, request_rx) = mpsc::channel::<SummaryJob>();
+    let (result_tx, result_rx) = mpsc::channel::<SummaryResult>();
+
+    thread::spawn(move || {
+        while let Ok(job) = request_rx.recv() {
+            let summary = summarize_blocking(&config, &job.evidence);
+            let _ = result_tx.send(SummaryResult {
+                session_id: job.session_id,
+                signature: job.signature,
+                summary,
+            });
+        }
+    });
+
+    Some(SummaryWorker {
+        requests: request_tx,
+        responses: result_rx,
+    })
+}
+
 fn refresh_runtime_and_cards(context: &Rc<AppContext>) {
+    drain_summary_results(context);
     let sessions = context.state.borrow().sessions().to_vec();
     for session in &sessions {
         refresh_observation(context, session);
@@ -548,6 +620,32 @@ fn refresh_runtime_and_cards(context: &Rc<AppContext>) {
     refresh_workspace(context);
     refresh_card_styles(context);
     refresh_focus_panel(context);
+}
+
+fn drain_summary_results(context: &Rc<AppContext>) {
+    let Some(worker) = context.summary_worker.as_ref() else {
+        return;
+    };
+
+    while let Ok(result) = worker.responses.try_recv() {
+        let mut cache = context.summary_cache.borrow_mut();
+        let entry = cache
+            .entry(result.session_id)
+            .or_insert_with(SummaryCacheEntry::new);
+        entry.in_flight = false;
+        entry.requested_signature = None;
+        entry.last_attempt = Some(Instant::now());
+        match result.summary {
+            Ok(summary) => {
+                entry.completed_signature = Some(result.signature);
+                entry.last_summary = Some(summary);
+                entry.last_error = None;
+            }
+            Err(error) => {
+                entry.last_error = Some(error);
+            }
+        }
+    }
 }
 
 fn refresh_observation(context: &Rc<AppContext>, session: &crate::model::SessionRecord) {
@@ -610,12 +708,17 @@ fn update_battle_card_widgets(context: &Rc<AppContext>, session: &crate::model::
         work_output_excerpt: observation.work_output_excerpt.clone(),
         idle_seconds: Some(observation.last_change.elapsed().as_secs()),
     };
-    let card_model = build_battle_card(
+    let mut card_model = build_battle_card(
         session,
         &observed,
         &observation.recent_lines,
         &DeterministicIntentEngine,
     );
+    let evidence = build_tactical_evidence(session, observation, &card_model);
+    maybe_queue_summary(context, session.id, &evidence);
+    if let Some(summary) = current_summary(context, session.id, &evidence) {
+        card_model = apply_tactical_synthesis(card_model, summary);
+    }
 
     apply_battle_status_style(&card.status, card_model.status);
     apply_battle_card_surface_style(&card.frame, card_model.status);
@@ -664,6 +767,115 @@ fn update_battle_card_widgets(context: &Rc<AppContext>, session: &crate::model::
     });
     card.alert
         .set_visible(!matches!(card_model.alignment.tone, SignalTone::Calm));
+}
+
+fn build_tactical_evidence(
+    session: &crate::model::SessionRecord,
+    observation: &SessionObservation,
+    card_model: &crate::supervision::BattleCardViewModel,
+) -> TacticalEvidence {
+    TacticalEvidence {
+        session_name: session.launch.name.clone(),
+        task_label: session.launch.subtitle.clone(),
+        battle_status: card_model.status.label().into(),
+        recency_label: card_model.recency_label.clone(),
+        deterministic_headline: card_model.headline.clone(),
+        deterministic_detail: card_model.primary_detail.clone(),
+        deterministic_evidence: card_model.evidence_fragments.clone(),
+        deterministic_alignment: card_model.alignment.text.clone(),
+        active_command: observation.active_command.clone(),
+        dominant_process: observation.dominant_process.clone(),
+        recent_files: observation.recent_files.clone(),
+        work_output_excerpt: observation.work_output_excerpt.clone(),
+        idle_seconds: Some(observation.last_change.elapsed().as_secs()),
+        recent_terminal_lines: observation
+            .recent_lines
+            .iter()
+            .rev()
+            .take(6)
+            .cloned()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect(),
+    }
+}
+
+fn maybe_queue_summary(context: &Rc<AppContext>, session_id: SessionId, evidence: &TacticalEvidence) {
+    let Some(worker) = context.summary_worker.as_ref() else {
+        return;
+    };
+
+    let signature = summary_signature(evidence);
+    let mut cache = context.summary_cache.borrow_mut();
+    let entry = cache
+        .entry(session_id)
+        .or_insert_with(SummaryCacheEntry::new);
+
+    if entry.completed_signature.as_deref() == Some(signature.as_str())
+        || entry.requested_signature.as_deref() == Some(signature.as_str())
+        || entry.in_flight
+    {
+        return;
+    }
+
+    if entry
+        .last_attempt
+        .is_some_and(|attempt| attempt.elapsed() < Duration::from_secs(12))
+    {
+        return;
+    }
+
+    entry.in_flight = true;
+    entry.last_attempt = Some(Instant::now());
+    entry.requested_signature = Some(signature.clone());
+    let _ = worker.requests.send(SummaryJob {
+        session_id,
+        signature,
+        evidence: evidence.clone(),
+    });
+}
+
+fn current_summary(
+    context: &Rc<AppContext>,
+    session_id: SessionId,
+    evidence: &TacticalEvidence,
+) -> Option<TacticalSynthesis> {
+    let signature = summary_signature(evidence);
+    let cache = context.summary_cache.borrow();
+    let entry = cache.get(&session_id)?;
+    if entry.completed_signature.as_deref() == Some(signature.as_str()) {
+        entry.last_summary.clone()
+    } else {
+        None
+    }
+}
+
+fn apply_tactical_synthesis(
+    mut card_model: crate::supervision::BattleCardViewModel,
+    summary: TacticalSynthesis,
+) -> crate::supervision::BattleCardViewModel {
+    if summary.confidence < 0.55 {
+        return card_model;
+    }
+
+    if let Some(headline) = summary.headline.as_ref() {
+        card_model.headline = headline.clone();
+    }
+    if let Some(primary_fragment) = summary.primary_fragment.as_ref() {
+        card_model.primary_detail = Some(primary_fragment.clone());
+    }
+    if !summary.supporting_fragments.is_empty() {
+        card_model.evidence_fragments = summary.supporting_fragments.clone();
+    }
+    if let Some(alignment_fragment) = summary.alignment_fragment.as_ref() {
+        card_model.alignment.text = alignment_fragment.clone();
+        card_model.alignment.tone = summary.signal_tone();
+    } else if matches!(summary.mismatch_level, MismatchLevel::High) {
+        card_model.alignment.tone = SignalTone::Alert;
+    }
+
+    card_model
 }
 
 fn refresh_workspace(context: &Rc<AppContext>) {
