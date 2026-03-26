@@ -6,7 +6,7 @@ use std::process::Command;
 fn demo_workspace_commands_have_program_and_args() {
     let demo = WorkspaceBlueprint::demo();
 
-    assert_eq!(demo.sessions.len(), 4);
+    assert_eq!(demo.sessions.len(), 5);
     for session in demo.sessions {
         let argv = session.argv();
         assert!(!argv.is_empty());

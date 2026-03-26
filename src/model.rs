@@ -6,6 +6,7 @@ pub struct SessionId(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SessionKind {
     WaitingShell,
+    PlanningStream,
     RunningStream,
     BlockingPrompt,
     FailingTask,
@@ -15,6 +16,7 @@ impl SessionKind {
     pub fn default_status(self) -> SessionStatus {
         match self {
             SessionKind::WaitingShell => SessionStatus::Waiting,
+            SessionKind::PlanningStream => SessionStatus::Running,
             SessionKind::RunningStream => SessionStatus::Running,
             SessionKind::BlockingPrompt => SessionStatus::Blocked,
             SessionKind::FailingTask => SessionStatus::Running,
@@ -64,6 +66,26 @@ impl SessionLaunch {
             name,
             subtitle,
             SessionKind::RunningStream,
+            "/usr/bin/env",
+            vec![
+                "bash".into(),
+                "--noprofile".into(),
+                "--norc".into(),
+                "-lc".into(),
+                script.into(),
+            ],
+        )
+    }
+
+    pub fn planning_stream(
+        name: impl Into<String>,
+        subtitle: impl Into<String>,
+        script: impl Into<String>,
+    ) -> Self {
+        Self::command(
+            name,
+            subtitle,
+            SessionKind::PlanningStream,
             "/usr/bin/env",
             vec![
                 "bash".into(),
@@ -137,6 +159,11 @@ impl SessionLaunch {
         }
     }
 
+    pub fn with_cwd(mut self, cwd: impl Into<PathBuf>) -> Self {
+        self.cwd = Some(cwd.into());
+        self
+    }
+
     pub fn argv(&self) -> Vec<String> {
         std::iter::once(self.program.clone())
             .chain(self.args.iter().cloned())
@@ -148,6 +175,7 @@ impl SessionLaunch {
             SessionStatus::Launching => "Starting session".into(),
             SessionStatus::Running => match self.kind {
                 SessionKind::FailingTask => "Running until failure signal".into(),
+                SessionKind::PlanningStream => "Visible planning narrative".into(),
                 _ => "Actively producing terminal activity".into(),
             },
             SessionStatus::Waiting => "Ready for direct intervention".into(),

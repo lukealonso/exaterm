@@ -177,6 +177,12 @@ pub fn derive_battle_card_status(
                 && observed.recent_files.is_empty()
             {
                 BattleCardStatus::Idle
+            } else if observed.active_command.is_none()
+                && observed.dominant_process.is_none()
+                && observed.recent_files.is_empty()
+                && intent.is_some()
+            {
+                BattleCardStatus::Thinking
             } else if observed.active_command.is_some()
                 || observed.dominant_process.is_some()
                 || observed.work_output_excerpt.is_some()

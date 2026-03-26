@@ -10,6 +10,8 @@ use gtk::prelude::*;
 use libadwaita as adw;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Instant;
 use vte::prelude::*;
@@ -40,6 +42,7 @@ struct SessionObservation {
     dominant_process: Option<String>,
     recent_files: Vec<String>,
     work_output_excerpt: Option<String>,
+    file_fingerprints: BTreeMap<PathBuf, (u64, u64)>,
 }
 
 impl SessionObservation {
@@ -52,6 +55,7 @@ impl SessionObservation {
             dominant_process: None,
             recent_files: Vec::new(),
             work_output_excerpt: None,
+            file_fingerprints: BTreeMap::new(),
         }
     }
 }
@@ -570,7 +574,12 @@ fn refresh_observation(context: &Rc<AppContext>, session: &crate::model::Session
     observation.active_command =
         launch_command_hint(&session.launch).or_else(|| observation.dominant_process.clone());
     observation.work_output_excerpt = output_excerpt;
-    observation.recent_files.clear();
+    observation.recent_files = session
+        .launch
+        .cwd
+        .as_deref()
+        .map(|cwd| scan_recent_files(cwd, &mut observation.file_fingerprints))
+        .unwrap_or_default();
 }
 
 fn update_battle_card_widgets(context: &Rc<AppContext>, session: &crate::model::SessionRecord) {
@@ -765,6 +774,59 @@ fn update_flowbox_columns(context: &Rc<AppContext>) {
     context.cards.set_min_children_per_line(columns);
 }
 
+fn scan_recent_files(root: &Path, fingerprints: &mut BTreeMap<PathBuf, (u64, u64)>) -> Vec<String> {
+    let mut current = BTreeMap::new();
+    let mut changed = Vec::new();
+    collect_file_changes(root, root, fingerprints, &mut current, &mut changed);
+    *fingerprints = current;
+    changed.truncate(2);
+    changed
+}
+
+fn collect_file_changes(
+    root: &Path,
+    path: &Path,
+    previous: &BTreeMap<PathBuf, (u64, u64)>,
+    current: &mut BTreeMap<PathBuf, (u64, u64)>,
+    changed: &mut Vec<String>,
+) {
+    let Ok(entries) = fs::read_dir(path) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let entry_path = entry.path();
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+
+        if metadata.is_dir() {
+            collect_file_changes(root, &entry_path, previous, current, changed);
+            continue;
+        }
+
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs())
+            .unwrap_or_default();
+        let signature = (modified, metadata.len());
+        current.insert(entry_path.clone(), signature);
+
+        let changed_now = previous
+            .get(&entry_path)
+            .map(|existing| *existing != signature)
+            .unwrap_or(true);
+
+        if changed_now {
+            if let Ok(relative) = entry_path.strip_prefix(root) {
+                changed.push(relative.display().to_string());
+            }
+        }
+    }
+}
+
 fn terminal_snapshot_lines(terminal: &vte::Terminal) -> Vec<String> {
     let rows = terminal.row_count();
     let cols = terminal.column_count();
@@ -786,6 +848,7 @@ fn terminal_snapshot_lines(terminal: &vte::Terminal) -> Vec<String> {
 fn launch_command_hint(launch: &SessionLaunch) -> Option<String> {
     match launch.kind {
         SessionKind::WaitingShell => Some("Interactive shell ready".into()),
+        SessionKind::PlanningStream => None,
         SessionKind::BlockingPrompt => Some("Waiting on approval prompt".into()),
         SessionKind::RunningStream => Some("Long-running tool activity".into()),
         SessionKind::FailingTask => Some("Task exited after failure".into()),
