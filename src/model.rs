@@ -236,6 +236,18 @@ impl ProbeMode {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PresentationMode {
+    Battlefield,
+    Focused(SessionId),
+}
+
+impl Default for PresentationMode {
+    fn default() -> Self {
+        Self::Battlefield
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProbeState {
     pub session_id: SessionId,
     pub lens: ProbeLens,
@@ -264,6 +276,7 @@ pub struct WorkspaceState {
     sessions: Vec<SessionRecord>,
     selected_session: Option<SessionId>,
     focused_terminal: Option<SessionId>,
+    presentation_mode: PresentationMode,
     open_probe: Option<ProbeState>,
 }
 
@@ -278,6 +291,7 @@ impl WorkspaceState {
         self.sessions.clear();
         self.selected_session = None;
         self.focused_terminal = None;
+        self.presentation_mode = PresentationMode::Battlefield;
         self.open_probe = None;
 
         let mut ids = Vec::with_capacity(launches.len());
@@ -316,6 +330,17 @@ impl WorkspaceState {
         self.focused_terminal
     }
 
+    pub fn presentation_mode(&self) -> PresentationMode {
+        self.presentation_mode
+    }
+
+    pub fn focused_session(&self) -> Option<SessionId> {
+        match self.presentation_mode {
+            PresentationMode::Battlefield => None,
+            PresentationMode::Focused(session_id) => Some(session_id),
+        }
+    }
+
     pub fn open_probe(&self) -> Option<ProbeState> {
         self.open_probe
     }
@@ -336,11 +361,24 @@ impl WorkspaceState {
     }
 
     pub fn activate_session(&mut self, session_id: SessionId) {
+        self.enter_focus_mode(session_id);
+    }
+
+    pub fn enter_focus_mode(&mut self, session_id: SessionId) {
         if self.sessions.iter().any(|session| session.id == session_id) {
             self.selected_session = Some(session_id);
             self.focused_terminal = Some(session_id);
-            self.push_event(session_id, "Terminal focused for intervention");
+            self.presentation_mode = PresentationMode::Focused(session_id);
+            self.push_event(session_id, "Entered focused terminal view");
         }
+    }
+
+    pub fn return_to_battlefield(&mut self) {
+        if let Some(session_id) = self.focused_session() {
+            self.push_event(session_id, "Returned to battlefield view");
+        }
+        self.presentation_mode = PresentationMode::Battlefield;
+        self.focused_terminal = None;
     }
 
     pub fn show_probe(&mut self, session_id: SessionId) {
@@ -464,7 +502,10 @@ impl WorkspaceState {
 
 #[cfg(test)]
 mod tests {
-    use super::{ProbeLens, ProbeMode, SessionKind, SessionLaunch, SessionStatus, WorkspaceState};
+    use super::{
+        PresentationMode, ProbeLens, ProbeMode, SessionKind, SessionLaunch, SessionStatus,
+        WorkspaceState,
+    };
 
     #[test]
     fn loading_workspace_selects_first_session() {
@@ -561,6 +602,23 @@ mod tests {
 
         assert_eq!(state.selected_session(), Some(second));
         assert_eq!(state.focused_terminal(), Some(second));
+        assert_eq!(state.presentation_mode(), PresentationMode::Focused(second));
+        assert_ne!(state.selected_session(), Some(first));
+    }
+
+    #[test]
+    fn return_to_battlefield_clears_focus_mode_but_preserves_selection() {
+        let mut state = WorkspaceState::new();
+        let first = state.add_session(SessionLaunch::shell("One", "shell", "banner"));
+        let second = state.add_session(SessionLaunch::shell("Two", "shell", "banner"));
+
+        state.enter_focus_mode(second);
+        state.return_to_battlefield();
+
+        assert_eq!(state.presentation_mode(), PresentationMode::Battlefield);
+        assert_eq!(state.focused_session(), None);
+        assert_eq!(state.focused_terminal(), None);
+        assert_eq!(state.selected_session(), Some(second));
         assert_ne!(state.selected_session(), Some(first));
     }
 
@@ -611,7 +669,9 @@ mod tests {
         let summaries: Vec<&str> = session.events.iter().map(|event| event.summary.as_str()).collect();
 
         assert!(summaries.iter().any(|summary| summary.contains("Spawned process 4242")));
-        assert!(summaries.iter().any(|summary| summary.contains("Terminal focused")));
+        assert!(summaries
+            .iter()
+            .any(|summary| summary.contains("Entered focused terminal view")));
         assert!(summaries.iter().any(|summary| summary.contains("Probe opened")));
         assert!(summaries
             .iter()

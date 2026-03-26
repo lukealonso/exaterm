@@ -1,5 +1,7 @@
 use crate::demo::WorkspaceBlueprint;
-use crate::model::{SessionId, SessionKind, SessionLaunch, SessionStatus, WorkspaceState};
+use crate::model::{
+    SessionId, SessionKind, SessionLaunch, SessionStatus, WorkspaceState,
+};
 use crate::supervision::{
     build_battle_card, BattleCardStatus, DeterministicIntentEngine, IntentSource,
     ObservedActivity,
@@ -56,23 +58,24 @@ impl SessionObservation {
     }
 }
 
-struct InterventionWidgets {
+struct FocusWidgets {
+    panel: gtk::Box,
     title: gtk::Label,
     subtitle: gtk::Label,
     terminal_stack: gtk::Stack,
+    exit_button: gtk::Button,
 }
 
 struct AppContext {
     state: Rc<RefCell<WorkspaceState>>,
     title: adw::WindowTitle,
     workspace_summary: gtk::Label,
+    content_root: gtk::Box,
     cards: gtk::FlowBox,
-    page_stack: gtk::Stack,
-    back_button: gtk::Button,
-    intervention: InterventionWidgets,
+    battlefield_scroller: gtk::ScrolledWindow,
+    focus: FocusWidgets,
     session_cards: RefCell<BTreeMap<SessionId, SessionCardWidgets>>,
     observations: RefCell<BTreeMap<SessionId, SessionObservation>>,
-    current_intervention: RefCell<Option<SessionId>>,
 }
 
 pub fn run() -> glib::ExitCode {
@@ -116,35 +119,48 @@ fn build_ui(app: &gtk::Application) {
         .margin_bottom(4)
         .build();
 
-    let battlefield_page = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .hexpand(true)
-        .vexpand(true)
-        .build();
-    battlefield_page.append(&workspace_summary);
-    battlefield_page.append(&battlefield_scroller);
-
-    let intervention_title = gtk::Label::builder()
+    let focus_title = gtk::Label::builder()
         .xalign(0.0)
-        .css_classes(vec!["intervention-title".to_string()])
+        .css_classes(vec!["focus-title".to_string()])
         .build();
-    let intervention_subtitle = gtk::Label::builder()
+    let focus_subtitle = gtk::Label::builder()
         .xalign(0.0)
-        .css_classes(vec!["intervention-subtitle".to_string()])
+        .css_classes(vec!["focus-subtitle".to_string()])
+        .wrap(true)
         .build();
     let terminal_stack = gtk::Stack::builder()
         .hexpand(true)
         .vexpand(true)
         .transition_type(gtk::StackTransitionType::Crossfade)
         .build();
-    let intervention_terminal_frame = gtk::Frame::builder()
+    let focus_terminal_frame = gtk::Frame::builder()
         .hexpand(true)
         .vexpand(true)
         .child(&terminal_stack)
         .build();
-    intervention_terminal_frame.add_css_class("intervention-frame");
+    focus_terminal_frame.add_css_class("focus-frame");
 
-    let intervention_page = gtk::Box::builder()
+    let focus_exit_button = gtk::Button::builder()
+        .label("Battlefield Only")
+        .css_classes(vec!["pill".to_string()])
+        .build();
+
+    let focus_header_left = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(4)
+        .hexpand(true)
+        .build();
+    focus_header_left.append(&focus_title);
+    focus_header_left.append(&focus_subtitle);
+
+    let focus_header = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(12)
+        .build();
+    focus_header.append(&focus_header_left);
+    focus_header.append(&focus_exit_button);
+
+    let focus_panel = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(10)
         .margin_top(18)
@@ -153,25 +169,12 @@ fn build_ui(app: &gtk::Application) {
         .margin_end(18)
         .hexpand(true)
         .vexpand(true)
-        .build();
-    intervention_page.append(&intervention_title);
-    intervention_page.append(&intervention_subtitle);
-    intervention_page.append(&intervention_terminal_frame);
-
-    let page_stack = gtk::Stack::builder()
-        .transition_type(gtk::StackTransitionType::Crossfade)
-        .hexpand(true)
-        .vexpand(true)
-        .build();
-    page_stack.add_titled(&battlefield_page, Some("battlefield"), "Battlefield");
-    page_stack.add_titled(&intervention_page, Some("intervention"), "Intervention");
-    page_stack.set_visible_child_name("battlefield");
-
-    let back_button = gtk::Button::builder()
-        .label("Back")
-        .css_classes(vec!["pill".to_string()])
         .visible(false)
         .build();
+    focus_panel.add_css_class("focus-panel");
+    focus_panel.append(&focus_header);
+    focus_panel.append(&focus_terminal_frame);
+
     let add_shell_button = gtk::Button::builder()
         .label("Add Shell")
         .css_classes(vec!["pill".to_string()])
@@ -183,14 +186,23 @@ fn build_ui(app: &gtk::Application) {
         .title_widget(&title)
         .show_end_title_buttons(true)
         .build();
-    header.pack_start(&back_button);
     header.pack_end(&add_shell_button);
+
+    let content_root = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .hexpand(true)
+        .vexpand(true)
+        .build();
+    content_root.add_css_class("battlefield-root");
+    content_root.append(&workspace_summary);
+    content_root.append(&battlefield_scroller);
+    content_root.append(&focus_panel);
 
     let body = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .build();
     body.append(&header);
-    body.append(&page_stack);
+    body.append(&content_root);
 
     let window = adw::ApplicationWindow::builder()
         .application(app)
@@ -204,23 +216,24 @@ fn build_ui(app: &gtk::Application) {
         state: Rc::new(RefCell::new(WorkspaceState::new())),
         title,
         workspace_summary,
+        content_root,
         cards,
-        page_stack,
-        back_button,
-        intervention: InterventionWidgets {
-            title: intervention_title,
-            subtitle: intervention_subtitle,
+        battlefield_scroller,
+        focus: FocusWidgets {
+            panel: focus_panel,
+            title: focus_title,
+            subtitle: focus_subtitle,
             terminal_stack,
+            exit_button: focus_exit_button,
         },
         session_cards: RefCell::new(BTreeMap::new()),
         observations: RefCell::new(BTreeMap::new()),
-        current_intervention: RefCell::new(None),
     });
 
     {
-        let back_button = context.back_button.clone();
+        let exit_button = context.focus.exit_button.clone();
         let context = context.clone();
-        back_button.connect_clicked(move |_| show_battlefield(&context));
+        exit_button.connect_clicked(move |_| show_battlefield(&context));
     }
 
     {
@@ -247,8 +260,12 @@ fn build_ui(app: &gtk::Application) {
                 .iter()
                 .find_map(|(session_id, card)| (card.row == *selected_child).then_some(*session_id));
             if let Some(session_id) = maybe_session {
-                context.state.borrow_mut().select_session(session_id);
-                refresh_card_styles(&context);
+                if context.state.borrow().focused_session().is_some() {
+                    show_intervention(&context, session_id);
+                } else {
+                    context.state.borrow_mut().select_session(session_id);
+                    refresh_card_styles(&context);
+                }
             }
         });
     }
@@ -258,7 +275,7 @@ fn build_ui(app: &gtk::Application) {
         let keys = gtk::EventControllerKey::new();
         keys.set_propagation_phase(gtk::PropagationPhase::Capture);
         keys.connect_key_pressed(move |_, key, _, _| {
-            if key == gdk::Key::Escape && *context.current_intervention.borrow() != None {
+            if key == gdk::Key::Escape && context.state.borrow().focused_session().is_some() {
                 show_battlefield(&context);
                 return glib::Propagation::Stop;
             }
@@ -304,7 +321,7 @@ fn append_session_card(context: &Rc<AppContext>, launch: SessionLaunch) {
 
     let card = build_battle_card_widgets(context, &session);
     context
-        .intervention
+        .focus
         .terminal_stack
         .add_named(&card.terminal, Some(&card.terminal_page));
     context.cards.insert(&card.row, -1);
@@ -404,7 +421,7 @@ fn build_battle_card_widgets(
     header.append(&header_right);
 
     let action_hint = gtk::Label::builder()
-        .label("Click card to select · Enter or Intervene for real terminal")
+        .label("Click to select · Enter or Intervene for focused terminal")
         .xalign(0.0)
         .css_classes(vec!["card-action-hint".to_string()])
         .hexpand(true)
@@ -447,8 +464,12 @@ fn build_battle_card_widgets(
         let click = gtk::GestureClick::new();
         click.connect_released(move |_, _, _, _| {
             context.cards.select_child(&row);
-            context.state.borrow_mut().select_session(session_id);
-            refresh_card_styles(&context);
+            if context.state.borrow().focused_session().is_some() {
+                show_intervention(&context, session_id);
+            } else {
+                context.state.borrow_mut().select_session(session_id);
+                refresh_card_styles(&context);
+            }
         });
         frame.add_controller(click);
     }
@@ -543,7 +564,7 @@ fn refresh_runtime_and_cards(context: &Rc<AppContext>) {
     }
     refresh_workspace(context);
     refresh_card_styles(context);
-    refresh_intervention_header(context);
+    refresh_focus_panel(context);
 }
 
 fn refresh_observation(context: &Rc<AppContext>, session: &crate::model::SessionRecord) {
@@ -646,8 +667,8 @@ fn update_battle_card_widgets(context: &Rc<AppContext>, session: &crate::model::
     }
 
     card.intervene
-        .set_label(if *context.current_intervention.borrow() == Some(session.id) {
-            "In Terminal"
+        .set_label(if context.state.borrow().focused_session() == Some(session.id) {
+            "Focused"
         } else {
             "Intervene"
         });
@@ -691,50 +712,81 @@ fn refresh_workspace(context: &Rc<AppContext>) {
     context.workspace_summary.set_label(&format!(
         "Idle {idle} · Thinking {thinking} · Working {working} · Blocked {blocked} · Failed {failed}"
     ));
-    context.title.set_subtitle(&format!(
-        "{} sessions · idle {} · working {} · failed {}",
-        sessions.len(),
-        idle,
-        working,
-        failed
-    ));
+    let state = context.state.borrow();
+    let subtitle = if let Some(session_id) = state.focused_session() {
+        let focus_name = state
+            .session(session_id)
+            .map(|session| session.launch.name.clone())
+            .unwrap_or_else(|| "Session".into());
+        format!(
+            "Focused terminal: {} · {} sessions · idle {} · failed {}",
+            focus_name,
+            sessions.len(),
+            idle,
+            failed
+        )
+    } else {
+        format!(
+            "{} sessions · idle {} · working {} · failed {}",
+            sessions.len(),
+            idle,
+            working,
+            failed
+        )
+    };
+    context.title.set_subtitle(&subtitle);
 }
 
 fn refresh_card_styles(context: &Rc<AppContext>) {
     let selected = context.state.borrow().selected_session();
+    let focused = context.state.borrow().focused_session();
     for (session_id, card) in context.session_cards.borrow().iter() {
         card.row.remove_css_class("selected-card");
+        card.row.remove_css_class("focused-card");
         if selected == Some(*session_id) {
             card.row.add_css_class("selected-card");
+        }
+        if focused == Some(*session_id) {
+            card.row.add_css_class("focused-card");
         }
     }
 }
 
 fn show_intervention(context: &Rc<AppContext>, session_id: SessionId) {
-    context.state.borrow_mut().activate_session(session_id);
-    *context.current_intervention.borrow_mut() = Some(session_id);
+    context.state.borrow_mut().enter_focus_mode(session_id);
     if let Some(card) = context.session_cards.borrow().get(&session_id) {
+        context.cards.select_child(&card.row);
         context
-            .intervention
+            .focus
             .terminal_stack
             .set_visible_child_name(&card.terminal_page);
         card.terminal.grab_focus();
     }
-    context.page_stack.set_visible_child_name("intervention");
-    context.back_button.set_visible(true);
+    context.focus.panel.set_visible(true);
+    context.content_root.add_css_class("focus-mode");
+    context.battlefield_scroller.set_vexpand(false);
+    context.battlefield_scroller.set_min_content_height(280);
+    context.battlefield_scroller.set_max_content_height(340);
+    update_flowbox_columns(context);
     refresh_card_styles(context);
-    refresh_intervention_header(context);
-}
-
-fn show_battlefield(context: &Rc<AppContext>) {
-    *context.current_intervention.borrow_mut() = None;
-    context.page_stack.set_visible_child_name("battlefield");
-    context.back_button.set_visible(false);
+    refresh_focus_panel(context);
     refresh_workspace(context);
 }
 
-fn refresh_intervention_header(context: &Rc<AppContext>) {
-    let Some(session_id) = *context.current_intervention.borrow() else {
+fn show_battlefield(context: &Rc<AppContext>) {
+    context.state.borrow_mut().return_to_battlefield();
+    context.focus.panel.set_visible(false);
+    context.content_root.remove_css_class("focus-mode");
+    context.battlefield_scroller.set_vexpand(true);
+    context.battlefield_scroller.set_min_content_height(0);
+    context.battlefield_scroller.set_max_content_height(-1);
+    update_flowbox_columns(context);
+    refresh_card_styles(context);
+    refresh_workspace(context);
+}
+
+fn refresh_focus_panel(context: &Rc<AppContext>) {
+    let Some(session_id) = context.state.borrow().focused_session() else {
         return;
     };
     let state = context.state.borrow();
@@ -743,24 +795,26 @@ fn refresh_intervention_header(context: &Rc<AppContext>) {
     };
 
     context
-        .intervention
+        .focus
         .title
-        .set_label(&format!("{} · Native Terminal", session.launch.name));
-    context.intervention.subtitle.set_label(&format!(
-        "{} · real terminal intervention stays one step from the battlefield",
+        .set_label(&format!("{} · Focused Terminal", session.launch.name));
+    context.focus.subtitle.set_label(&format!(
+        "{} · cards stay visible above; click another card to retarget focus or press Escape to return to battlefield-only mode",
         session.launch.subtitle
     ));
 }
 
 fn update_flowbox_columns(context: &Rc<AppContext>) {
     let total = context.session_cards.borrow().len();
-    let columns = if total <= 4 {
+    let columns = if context.state.borrow().focused_session().is_some() {
+        total.clamp(1, 4)
+    } else if total <= 4 {
         2
     } else if total <= 6 {
         3
     } else {
         4
-    };
+    } as u32;
     context.cards.set_max_children_per_line(columns);
     context.cards.set_min_children_per_line(columns);
 }
@@ -867,7 +921,7 @@ fn load_css() {
 
         .workspace-summary {
             color: rgba(199, 210, 222, 0.9);
-            font-size: 12px;
+            font-size: 13px;
             letter-spacing: 0.08em;
             text-transform: uppercase;
         }
@@ -877,47 +931,47 @@ fn load_css() {
             border: 1px solid rgba(163, 175, 194, 0.18);
             background: rgba(10, 18, 28, 0.96);
             box-shadow: 0 22px 42px rgba(0, 0, 0, 0.28);
-            min-width: 350px;
-            min-height: 228px;
+            min-width: 392px;
+            min-height: 262px;
         }
 
         .card-title {
             font-weight: 800;
-            font-size: 15px;
+            font-size: 18px;
             color: #f8fafc;
         }
 
         .card-subtitle {
             color: rgba(196, 208, 222, 0.72);
-            font-size: 12px;
+            font-size: 14px;
         }
 
         .card-status {
             border-radius: 999px;
-            padding: 4px 12px;
+            padding: 5px 14px;
             font-weight: 800;
-            font-size: 11px;
+            font-size: 12px;
         }
 
         .card-recency {
             color: rgba(176, 190, 206, 0.8);
-            font-size: 11px;
+            font-size: 12px;
         }
 
         .card-command {
             color: #dbeafe;
             font-weight: 700;
-            font-size: 12px;
+            font-size: 15px;
         }
 
         .card-line {
             color: rgba(225, 232, 240, 0.88);
-            font-size: 12px;
+            font-size: 14px;
         }
 
         .card-correlation {
             color: rgba(147, 197, 253, 0.9);
-            font-size: 12px;
+            font-size: 14px;
         }
 
         .card-correlation.correlation-alert {
@@ -926,27 +980,31 @@ fn load_css() {
 
         .card-action-hint {
             color: rgba(148, 163, 184, 0.82);
-            font-size: 11px;
+            font-size: 12px;
             letter-spacing: 0.04em;
         }
 
-        .intervention-title {
+        .focus-title {
             color: #f8fafc;
-            font-size: 18px;
+            font-size: 20px;
             font-weight: 800;
         }
 
-        .intervention-subtitle {
+        .focus-subtitle {
             color: rgba(196, 208, 222, 0.78);
-            font-size: 12px;
+            font-size: 14px;
             margin-bottom: 6px;
         }
 
-        .intervention-frame {
+        .focus-frame {
             border-radius: 24px;
             border: 1px solid rgba(120, 136, 158, 0.2);
             background: rgba(7, 13, 20, 0.96);
             padding: 10px;
+        }
+
+        .focus-panel {
+            margin-top: 4px;
         }
 
         .pill, .intervene-button {
@@ -962,6 +1020,11 @@ fn load_css() {
         .intervene-button {
             background: rgba(144, 230, 189, 0.18);
             color: #d1fae5;
+        }
+
+        flowboxchild.focused-card > * {
+            border-color: rgba(110, 231, 183, 0.92);
+            box-shadow: 0 0 0 1px rgba(110, 231, 183, 0.78), 0 20px 38px rgba(7, 88, 57, 0.22);
         }
 
         .battle-idle {
@@ -997,6 +1060,30 @@ fn load_css() {
         .battle-detached {
             background: rgba(192, 132, 252, 0.18);
             color: #e9d5ff;
+        }
+
+        .focus-mode .battle-card {
+            min-width: 286px;
+            min-height: 186px;
+            border-radius: 18px;
+            box-shadow: 0 14px 28px rgba(0, 0, 0, 0.22);
+        }
+
+        .focus-mode .card-title {
+            font-size: 15px;
+        }
+
+        .focus-mode .card-subtitle,
+        .focus-mode .card-status,
+        .focus-mode .card-recency,
+        .focus-mode .card-action-hint {
+            font-size: 11px;
+        }
+
+        .focus-mode .card-command,
+        .focus-mode .card-line,
+        .focus-mode .card-correlation {
+            font-size: 12px;
         }
 
         terminal {

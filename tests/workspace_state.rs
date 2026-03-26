@@ -1,5 +1,5 @@
 use exaterm::demo::WorkspaceBlueprint;
-use exaterm::model::{SessionLaunch, SessionStatus, WorkspaceState};
+use exaterm::model::{PresentationMode, SessionLaunch, SessionStatus, WorkspaceState};
 use std::process::Command;
 
 #[test]
@@ -41,4 +41,21 @@ fn workspace_state_tracks_focus_separately_from_selection() {
     assert_eq!(state.focused_terminal(), Some(a));
     assert_eq!(state.sessions()[0].status, SessionStatus::Waiting);
     assert_eq!(state.sessions()[1].status, SessionStatus::Blocked);
+}
+
+#[test]
+fn workspace_state_enters_and_exits_focused_terminal_mode() {
+    let mut state = WorkspaceState::new();
+    let session_id = state.add_session(SessionLaunch::shell("A", "shell", "a"));
+
+    state.enter_focus_mode(session_id);
+    assert_eq!(state.presentation_mode(), PresentationMode::Focused(session_id));
+    assert_eq!(state.focused_session(), Some(session_id));
+    assert_eq!(state.focused_terminal(), Some(session_id));
+
+    state.return_to_battlefield();
+    assert_eq!(state.presentation_mode(), PresentationMode::Battlefield);
+    assert_eq!(state.focused_session(), None);
+    assert_eq!(state.focused_terminal(), None);
+    assert_eq!(state.selected_session(), Some(session_id));
 }
