@@ -1,5 +1,8 @@
 use crate::demo::WorkspaceBlueprint;
-use crate::model::{SessionId, SessionLaunch, SessionStatus, WorkspaceState};
+use crate::model::{
+    ProbeLens, ProbeMode, SessionId, SessionLaunch, SessionStatus, WorkspaceState,
+};
+use crate::procfs::format_process_tree;
 use gtk::gdk;
 use gtk::prelude::*;
 use libadwaita as adw;
@@ -18,13 +21,22 @@ struct SessionTileWidgets {
     status: gtk::Label,
     detail: gtk::Label,
     terminal: vte::Terminal,
+    _probe: TileProbeWidgets,
 }
 
 #[derive(Clone)]
-struct ProbeWidgets {
+struct TileProbeWidgets {
     root: gtk::Frame,
+    title: gtk::Label,
     source: gtk::Label,
-    body: gtk::TextView,
+    stack: gtk::Stack,
+    output: gtk::TextView,
+    events: gtk::TextView,
+    process: gtk::TextView,
+    output_button: gtk::Button,
+    events_button: gtk::Button,
+    process_button: gtk::Button,
+    pin: gtk::Button,
     close: gtk::Button,
 }
 
@@ -34,7 +46,7 @@ struct AppContext {
     grid: gtk::Grid,
     title: adw::WindowTitle,
     tiles: RefCell<BTreeMap<SessionId, SessionTileWidgets>>,
-    probe: ProbeWidgets,
+    probe: TileProbeWidgets,
 }
 
 pub fn run() -> glib::ExitCode {
@@ -73,8 +85,7 @@ fn build_ui(app: &gtk::Application) {
         .hexpand(true)
         .vexpand(true)
         .build();
-
-    let probe = build_probe();
+    let probe = build_tile_probe();
     overlay.add_overlay(&probe.root);
 
     let context = Rc::new(AppContext {
@@ -87,9 +98,29 @@ fn build_ui(app: &gtk::Application) {
     });
 
     {
-        let close_button = context.probe.close.clone();
+        let button = context.probe.close.clone();
         let context = context.clone();
-        close_button.connect_clicked(move |_| close_probe(&context));
+        button.connect_clicked(move |_| close_probe(&context));
+    }
+    {
+        let button = context.probe.pin.clone();
+        let context = context.clone();
+        button.connect_clicked(move |_| toggle_probe_pin(&context));
+    }
+    {
+        let button = context.probe.output_button.clone();
+        let context = context.clone();
+        button.connect_clicked(move |_| set_probe_lens(&context, ProbeLens::Output));
+    }
+    {
+        let button = context.probe.events_button.clone();
+        let context = context.clone();
+        button.connect_clicked(move |_| set_probe_lens(&context, ProbeLens::Events));
+    }
+    {
+        let button = context.probe.process_button.clone();
+        let context = context.clone();
+        button.connect_clicked(move |_| set_probe_lens(&context, ProbeLens::Process));
     }
 
     let add_shell_button = gtk::Button::builder()
@@ -140,6 +171,26 @@ fn build_ui(app: &gtk::Application) {
                 return glib::Propagation::Stop;
             }
 
+            if matches!(key.to_unicode(), Some('1')) {
+                set_probe_lens(&context, ProbeLens::Output);
+                return glib::Propagation::Stop;
+            }
+
+            if matches!(key.to_unicode(), Some('2')) {
+                set_probe_lens(&context, ProbeLens::Events);
+                return glib::Propagation::Stop;
+            }
+
+            if matches!(key.to_unicode(), Some('3')) {
+                set_probe_lens(&context, ProbeLens::Process);
+                return glib::Propagation::Stop;
+            }
+
+            if matches!(key.to_unicode(), Some('f' | 'F')) {
+                toggle_probe_pin(&context);
+                return glib::Propagation::Stop;
+            }
+
             glib::Propagation::Proceed
         });
         window.add_controller(keys);
@@ -157,8 +208,8 @@ fn build_ui(app: &gtk::Application) {
     {
         let context = context.clone();
         glib::timeout_add_local(std::time::Duration::from_millis(750), move || {
-            if let Some(session_id) = context.state.borrow().open_probe() {
-                refresh_probe_snapshot(&context, session_id);
+            if let Some(probe) = context.state.borrow().open_probe() {
+                refresh_probe_snapshot(&context, probe.session_id);
             }
             glib::ControlFlow::Continue
         });
@@ -222,7 +273,7 @@ fn build_tile(
     let peek_button = gtk::Button::builder()
         .label("Peek · P")
         .css_classes(vec!["peek-button".to_string()])
-        .tooltip_text("Open a temporary output probe for this session, or press P")
+        .tooltip_text("Open a tile-local probe for this session, or press P")
         .build();
 
     let title_stack = gtk::Box::builder()
@@ -262,6 +313,8 @@ fn build_tile(
         .build();
     terminal_wrapper.append(&terminal);
 
+    let probe = build_tile_probe();
+
     let content = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .hexpand(true)
@@ -271,10 +324,17 @@ fn build_tile(
     content.append(&terminal_wrapper);
     content.append(&detail);
 
+    let overlay = gtk::Overlay::builder()
+        .child(&content)
+        .hexpand(true)
+        .vexpand(true)
+        .build();
+    overlay.add_overlay(&probe.root);
+
     let root = gtk::Frame::builder()
         .hexpand(true)
         .vexpand(true)
-        .child(&content)
+        .child(&overlay)
         .build();
     root.add_css_class("session-tile");
     install_activate_click(&title, context, session_id);
@@ -298,6 +358,34 @@ fn build_tile(
 
     {
         let context = context.clone();
+        probe.close.connect_clicked(move |_| close_probe(&context));
+    }
+
+    {
+        let context = context.clone();
+        probe.pin.connect_clicked(move |_| toggle_probe_pin(&context));
+    }
+
+    {
+        let context = context.clone();
+        probe.output_button
+            .connect_clicked(move |_| set_probe_lens(&context, ProbeLens::Output));
+    }
+
+    {
+        let context = context.clone();
+        probe.events_button
+            .connect_clicked(move |_| set_probe_lens(&context, ProbeLens::Events));
+    }
+
+    {
+        let context = context.clone();
+        probe.process_button
+            .connect_clicked(move |_| set_probe_lens(&context, ProbeLens::Process));
+    }
+
+    {
+        let context = context.clone();
         terminal.connect_notify_local(Some("has-focus"), move |term, _| {
             {
                 let mut state = context.state.borrow_mut();
@@ -316,6 +404,7 @@ fn build_tile(
         status: status_label,
         detail,
         terminal,
+        _probe: probe,
     }
 }
 
@@ -329,9 +418,9 @@ fn build_status_label(status: SessionStatus) -> gtk::Label {
         .build()
 }
 
-fn build_probe() -> ProbeWidgets {
+fn build_tile_probe() -> TileProbeWidgets {
     let title = gtk::Label::builder()
-        .label("Output Peek")
+        .label("Output Probe")
         .xalign(0.0)
         .css_classes(vec!["probe-title".to_string()])
         .build();
@@ -339,6 +428,22 @@ fn build_probe() -> ProbeWidgets {
         .label("No session selected")
         .xalign(0.0)
         .css_classes(vec!["probe-source".to_string()])
+        .build();
+    let output_button = gtk::Button::builder()
+        .label("Output")
+        .css_classes(vec!["probe-lens".to_string()])
+        .build();
+    let events_button = gtk::Button::builder()
+        .label("Events")
+        .css_classes(vec!["probe-lens".to_string()])
+        .build();
+    let process_button = gtk::Button::builder()
+        .label("Process")
+        .css_classes(vec!["probe-lens".to_string()])
+        .build();
+    let pin = gtk::Button::builder()
+        .label("Pin")
+        .css_classes(vec!["probe-pin".to_string()])
         .build();
     let close = gtk::Button::builder()
         .label("X")
@@ -360,10 +465,19 @@ fn build_probe() -> ProbeWidgets {
         .build();
     title_stack.append(&title);
     title_stack.append(&source);
+    let lenses = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(6)
+        .build();
+    lenses.append(&output_button);
+    lenses.append(&events_button);
+    lenses.append(&process_button);
+    title_stack.append(&lenses);
     header.append(&title_stack);
+    header.append(&pin);
     header.append(&close);
 
-    let body = gtk::TextView::builder()
+    let output = gtk::TextView::builder()
         .editable(false)
         .cursor_visible(false)
         .monospace(true)
@@ -373,10 +487,36 @@ fn build_probe() -> ProbeWidgets {
         .right_margin(12)
         .wrap_mode(gtk::WrapMode::WordChar)
         .build();
+    let events = gtk::TextView::builder()
+        .editable(false)
+        .cursor_visible(false)
+        .monospace(true)
+        .top_margin(12)
+        .bottom_margin(12)
+        .left_margin(12)
+        .right_margin(12)
+        .wrap_mode(gtk::WrapMode::WordChar)
+        .build();
+    let process = gtk::TextView::builder()
+        .editable(false)
+        .cursor_visible(false)
+        .monospace(true)
+        .top_margin(12)
+        .bottom_margin(12)
+        .left_margin(12)
+        .right_margin(12)
+        .wrap_mode(gtk::WrapMode::WordChar)
+        .build();
+    let stack = gtk::Stack::builder()
+        .transition_type(gtk::StackTransitionType::Crossfade)
+        .build();
+    stack.add_titled(&output, Some("output"), "Output");
+    stack.add_titled(&events, Some("events"), "Events");
+    stack.add_titled(&process, Some("process"), "Process");
     let scroller = gtk::ScrolledWindow::builder()
-        .child(&body)
-        .min_content_width(420)
-        .min_content_height(280)
+        .child(&stack)
+        .min_content_height(180)
+        .hscrollbar_policy(gtk::PolicyType::Never)
         .build();
 
     let content = gtk::Box::builder()
@@ -389,18 +529,26 @@ fn build_probe() -> ProbeWidgets {
         .child(&content)
         .halign(gtk::Align::End)
         .valign(gtk::Align::Start)
-        .margin_top(24)
-        .margin_end(24)
-        .width_request(440)
-        .height_request(320)
+        .margin_top(56)
+        .margin_end(12)
+        .width_request(340)
+        .height_request(260)
         .visible(false)
         .build();
     root.add_css_class("probe-surface");
 
-    ProbeWidgets {
+    TileProbeWidgets {
         root,
+        title,
         source,
-        body,
+        stack,
+        output,
+        events,
+        process,
+        output_button,
+        events_button,
+        process_button,
+        pin,
         close,
     }
 }
@@ -426,7 +574,13 @@ fn spawn_session(
             update_tile_labels(&context, session_id);
             refresh_window_title(&context);
             refresh_tile_styles(&context);
-            if context.state.borrow().open_probe() == Some(session_id) {
+            if context
+                .state
+                .borrow()
+                .open_probe()
+                .map(|probe| probe.session_id)
+                == Some(session_id)
+            {
                 refresh_probe_snapshot(&context, session_id);
             }
         });
@@ -459,7 +613,13 @@ fn spawn_session(
                 update_tile_labels(&context, session_id);
                 refresh_window_title(&context);
                 refresh_tile_styles(&context);
-                if context.state.borrow().open_probe() == Some(session_id) {
+                if context
+                    .state
+                    .borrow()
+                    .open_probe()
+                    .map(|probe| probe.session_id)
+                    == Some(session_id)
+                {
                     refresh_probe_snapshot(&context, session_id);
                 }
             },
@@ -531,22 +691,21 @@ fn refresh_tile_styles(context: &Rc<AppContext>) {
         if state.focused_terminal() == Some(*session_id) {
             tile.root.add_css_class("terminal-focused");
         }
-        if open_probe == Some(*session_id) {
+        if open_probe.map(|probe| probe.session_id) == Some(*session_id) {
             tile.root.add_css_class("probe-source");
         }
     }
+    context.probe.root.set_visible(open_probe.is_some());
 }
 
 fn open_probe(context: &Rc<AppContext>, session_id: SessionId) {
     context.state.borrow_mut().show_probe(session_id);
-    context.probe.root.set_visible(true);
     refresh_probe_snapshot(context, session_id);
     refresh_tile_styles(context);
 }
 
 fn close_probe(context: &Rc<AppContext>) {
     context.state.borrow_mut().close_probe();
-    context.probe.root.set_visible(false);
     refresh_tile_styles(context);
 }
 
@@ -554,7 +713,9 @@ fn toggle_probe_for_selection(context: &Rc<AppContext>) {
     let selected = context.state.borrow().selected_session();
     let current_probe = context.state.borrow().open_probe();
     match selected {
-        Some(session_id) if current_probe == Some(session_id) => close_probe(context),
+        Some(session_id) if current_probe.map(|probe| probe.session_id) == Some(session_id) => {
+            close_probe(context)
+        }
         Some(session_id) => open_probe(context, session_id),
         None => {}
     }
@@ -564,20 +725,18 @@ fn refresh_probe_snapshot(context: &Rc<AppContext>, session_id: SessionId) {
     let Some(tile) = context.tiles.borrow().get(&session_id).cloned() else {
         return;
     };
-    let Some(session) = context
-        .state
-        .borrow()
-        .sessions()
-        .iter()
-        .find(|session| session.id == session_id)
-        .cloned()
-    else {
+    let state = context.state.borrow();
+    let Some(session) = state.session(session_id).cloned() else {
+        return;
+    };
+    let Some(probe) = state.open_probe().filter(|probe| probe.session_id == session_id) else {
+        context.probe.root.set_visible(false);
         return;
     };
 
     let rows = tile.terminal.row_count();
     let cols = tile.terminal.column_count();
-    let snapshot = if rows > 0 && cols > 0 {
+    let output_snapshot = if rows > 0 && cols > 0 {
         let (text, _) =
             tile.terminal
                 .text_range_format(vte::Format::Text, 0, 0, rows - 1, cols - 1);
@@ -588,12 +747,102 @@ fn refresh_probe_snapshot(context: &Rc<AppContext>, session_id: SessionId) {
         "Terminal buffer is not ready yet.".into()
     };
 
-    context.probe.source.set_label(&format!(
-        "{} · {}",
-        session.launch.name,
-        session.status.chip_label()
+    let event_snapshot = if session.events.is_empty() {
+        "No supervision events recorded yet.".into()
+    } else {
+        session
+            .events
+            .iter()
+            .rev()
+            .map(|event| format!("#{:02} {}", event.sequence, event.summary))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let process_snapshot = session
+        .pid
+        .map(|pid| {
+            format_process_tree(pid)
+                .unwrap_or_else(|error| format!("Process tree unavailable: {error}"))
+        })
+        .unwrap_or_else(|| "Main process has already exited.".into());
+
+    context.probe.title.set_label(&format!(
+        "{} {} Probe",
+        probe.lens.title(),
+        match probe.mode {
+            ProbeMode::Peek => "Peek",
+            ProbeMode::Pinned => "Pinned",
+        }
     ));
-    context.probe.body.buffer().set_text(&snapshot);
+    context.probe.source.set_label(&format!(
+        "{} · {} · {}",
+        session.launch.name,
+        session.status.chip_label(),
+        match probe.mode {
+            ProbeMode::Peek => "temporary watch",
+            ProbeMode::Pinned => "pinned watch",
+        }
+    ));
+    context.probe.pin.set_label(probe.mode.action_label());
+    context.probe.output.buffer().set_text(&output_snapshot);
+    context.probe.events.buffer().set_text(&event_snapshot);
+    context.probe.process.buffer().set_text(&process_snapshot);
+    context.probe.stack.set_visible_child_name(match probe.lens {
+        ProbeLens::Output => "output",
+        ProbeLens::Events => "events",
+        ProbeLens::Process => "process",
+    });
+    apply_lens_button_state(&context.probe, probe.lens);
+    update_probe_position(context, &tile);
+}
+
+fn set_probe_lens(context: &Rc<AppContext>, lens: ProbeLens) {
+    if let Some(session_id) = context.state.borrow().open_probe().map(|probe| probe.session_id) {
+        context.state.borrow_mut().set_probe_lens(lens);
+        refresh_probe_snapshot(context, session_id);
+        refresh_tile_styles(context);
+    }
+}
+
+fn toggle_probe_pin(context: &Rc<AppContext>) {
+    if let Some(session_id) = context.state.borrow().open_probe().map(|probe| probe.session_id) {
+        context.state.borrow_mut().toggle_probe_pin();
+        refresh_probe_snapshot(context, session_id);
+        refresh_tile_styles(context);
+    }
+}
+
+fn apply_lens_button_state(probe: &TileProbeWidgets, active_lens: ProbeLens) {
+    for button in [&probe.output_button, &probe.events_button, &probe.process_button] {
+        button.remove_css_class("probe-lens-active");
+    }
+    match active_lens {
+        ProbeLens::Output => probe.output_button.add_css_class("probe-lens-active"),
+        ProbeLens::Events => probe.events_button.add_css_class("probe-lens-active"),
+        ProbeLens::Process => probe.process_button.add_css_class("probe-lens-active"),
+    }
+}
+
+fn update_probe_position(context: &Rc<AppContext>, tile: &SessionTileWidgets) {
+    let Some(bounds) = tile.root.compute_bounds(&context.overlay) else {
+        return;
+    };
+    let overlay_width = context.overlay.width();
+    let probe_width = context.probe.root.width_request().max(340);
+    let desired_x = if bounds.x() < (overlay_width as f32 / 2.0) {
+        bounds.x() + bounds.width() - (probe_width as f32 * 0.55)
+    } else {
+        bounds.x() - (probe_width as f32 * 0.15)
+    };
+    let max_x = (overlay_width - probe_width - 12).max(12);
+    let clamped_x = desired_x.round() as i32;
+    let margin_start = clamped_x.clamp(12, max_x);
+    let margin_top = (bounds.y().round() as i32 + 56).max(24);
+
+    context.probe.root.set_halign(gtk::Align::Start);
+    context.probe.root.set_valign(gtk::Align::Start);
+    context.probe.root.set_margin_start(margin_start);
+    context.probe.root.set_margin_top(margin_top);
 }
 
 fn activate_terminal_session(context: &Rc<AppContext>, session_id: SessionId) {
@@ -712,7 +961,7 @@ fn load_css() {
             color: #e9d5ff;
         }
 
-        .pill, .peek-button, .probe-close {
+        .pill, .peek-button, .probe-close, .probe-pin, .probe-lens {
             border-radius: 999px;
             padding: 6px 14px;
         }
@@ -724,6 +973,22 @@ fn load_css() {
 
         .peek-button {
             background: rgba(144, 230, 189, 0.18);
+            color: #d1fae5;
+        }
+
+        .probe-pin {
+            background: rgba(96, 165, 250, 0.16);
+            color: #dbeafe;
+        }
+
+        .probe-lens {
+            background: rgba(148, 163, 184, 0.12);
+            color: #cbd5e1;
+            font-size: 11px;
+        }
+
+        .probe-lens-active {
+            background: rgba(144, 230, 189, 0.2);
             color: #d1fae5;
         }
 

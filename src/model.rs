@@ -203,21 +203,68 @@ impl SessionStatus {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProbeLens {
+    Output,
+    Events,
+    Process,
+}
+
+impl ProbeLens {
+    pub fn title(self) -> &'static str {
+        match self {
+            ProbeLens::Output => "Output",
+            ProbeLens::Events => "Events",
+            ProbeLens::Process => "Process",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProbeMode {
+    Peek,
+    Pinned,
+}
+
+impl ProbeMode {
+    pub fn action_label(self) -> &'static str {
+        match self {
+            ProbeMode::Peek => "Pin",
+            ProbeMode::Pinned => "Unpin",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProbeState {
+    pub session_id: SessionId,
+    pub lens: ProbeLens,
+    pub mode: ProbeMode,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionEvent {
+    pub sequence: u64,
+    pub summary: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionRecord {
     pub id: SessionId,
     pub launch: SessionLaunch,
     pub status: SessionStatus,
     pub pid: Option<u32>,
+    pub events: Vec<SessionEvent>,
 }
 
 #[derive(Debug, Default)]
 pub struct WorkspaceState {
     next_session_id: u32,
+    next_event_sequence: u64,
     sessions: Vec<SessionRecord>,
     selected_session: Option<SessionId>,
     focused_terminal: Option<SessionId>,
-    open_probe: Option<SessionId>,
+    open_probe: Option<ProbeState>,
 }
 
 impl WorkspaceState {
@@ -227,6 +274,7 @@ impl WorkspaceState {
 
     pub fn load_workspace(&mut self, launches: Vec<SessionLaunch>) -> Vec<SessionId> {
         self.next_session_id = 1;
+        self.next_event_sequence = 1;
         self.sessions.clear();
         self.selected_session = None;
         self.focused_terminal = None;
@@ -248,9 +296,11 @@ impl WorkspaceState {
             launch,
             status: SessionStatus::Launching,
             pid: None,
+            events: Vec::new(),
         });
 
         self.selected_session.get_or_insert(id);
+        self.push_event(id, "Session added to workspace");
         id
     }
 
@@ -266,8 +316,12 @@ impl WorkspaceState {
         self.focused_terminal
     }
 
-    pub fn open_probe(&self) -> Option<SessionId> {
+    pub fn open_probe(&self) -> Option<ProbeState> {
         self.open_probe
+    }
+
+    pub fn session(&self, session_id: SessionId) -> Option<&SessionRecord> {
+        self.sessions.iter().find(|session| session.id == session_id)
     }
 
     pub fn select_session(&mut self, session_id: SessionId) {
@@ -285,18 +339,59 @@ impl WorkspaceState {
         if self.sessions.iter().any(|session| session.id == session_id) {
             self.selected_session = Some(session_id);
             self.focused_terminal = Some(session_id);
+            self.push_event(session_id, "Terminal focused for intervention");
         }
     }
 
     pub fn show_probe(&mut self, session_id: SessionId) {
         if self.sessions.iter().any(|session| session.id == session_id) {
             self.selected_session = Some(session_id);
-            self.open_probe = Some(session_id);
+            let probe = ProbeState {
+                session_id,
+                lens: self
+                    .open_probe
+                    .filter(|probe| probe.session_id == session_id)
+                    .map(|probe| probe.lens)
+                    .unwrap_or(ProbeLens::Output),
+                mode: self
+                    .open_probe
+                    .filter(|probe| probe.session_id == session_id)
+                    .map(|probe| probe.mode)
+                    .unwrap_or(ProbeMode::Peek),
+            };
+            self.open_probe = Some(probe);
+            self.push_event(session_id, "Probe opened");
         }
     }
 
     pub fn close_probe(&mut self) {
+        if let Some(probe) = self.open_probe {
+            self.push_event(probe.session_id, "Probe closed");
+        }
         self.open_probe = None;
+    }
+
+    pub fn set_probe_lens(&mut self, lens: ProbeLens) {
+        if let Some(mut probe) = self.open_probe {
+            probe.lens = lens;
+            self.open_probe = Some(probe);
+            self.push_event(probe.session_id, format!("Probe switched to {}", lens.title()));
+        }
+    }
+
+    pub fn toggle_probe_pin(&mut self) {
+        if let Some(mut probe) = self.open_probe {
+            probe.mode = match probe.mode {
+                ProbeMode::Peek => ProbeMode::Pinned,
+                ProbeMode::Pinned => ProbeMode::Peek,
+            };
+            let label = match probe.mode {
+                ProbeMode::Peek => "Probe returned to peek mode",
+                ProbeMode::Pinned => "Probe pinned for ongoing watch",
+            };
+            self.open_probe = Some(probe);
+            self.push_event(probe.session_id, label);
+        }
     }
 
     pub fn mark_spawned(&mut self, session_id: SessionId, pid: u32) {
@@ -308,6 +403,7 @@ impl WorkspaceState {
             session.status = session.launch.kind.default_status();
             session.pid = Some(pid);
         }
+        self.push_event(session_id, format!("Spawned process {pid}"));
     }
 
     pub fn mark_exited(&mut self, session_id: SessionId, exit_code: i32) {
@@ -326,6 +422,14 @@ impl WorkspaceState {
                 self.focused_terminal = None;
             }
         }
+        self.push_event(
+            session_id,
+            if exit_code == 0 {
+                "Process exited cleanly".into()
+            } else {
+                format!("Process exited with code {exit_code}")
+            },
+        );
     }
 
     pub fn tile_position(index: usize, columns: usize) -> (i32, i32) {
@@ -334,11 +438,33 @@ impl WorkspaceState {
         let col = index % columns;
         (col as i32, row as i32)
     }
+
+    fn push_event(&mut self, session_id: SessionId, summary: impl Into<String>) {
+        let Some(session) = self
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == session_id)
+        else {
+            return;
+        };
+
+        session.events.push(SessionEvent {
+            sequence: self.next_event_sequence,
+            summary: summary.into(),
+        });
+        self.next_event_sequence += 1;
+
+        const MAX_EVENTS: usize = 16;
+        if session.events.len() > MAX_EVENTS {
+            let extra = session.events.len() - MAX_EVENTS;
+            session.events.drain(0..extra);
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{SessionKind, SessionLaunch, SessionStatus, WorkspaceState};
+    use super::{ProbeLens, ProbeMode, SessionKind, SessionLaunch, SessionStatus, WorkspaceState};
 
     #[test]
     fn loading_workspace_selects_first_session() {
@@ -446,13 +572,49 @@ mod tests {
 
         state.show_probe(second);
         assert_eq!(state.selected_session(), Some(second));
-        assert_eq!(state.open_probe(), Some(second));
+        assert_eq!(state.open_probe().map(|probe| probe.session_id), Some(second));
 
         state.close_probe();
         assert_eq!(state.open_probe(), None);
         assert_eq!(state.selected_session(), Some(second));
 
         state.show_probe(first);
-        assert_eq!(state.open_probe(), Some(first));
+        assert_eq!(state.open_probe().map(|probe| probe.session_id), Some(first));
+    }
+
+    #[test]
+    fn probe_can_switch_lenses_and_modes() {
+        let mut state = WorkspaceState::new();
+        let first = state.add_session(SessionLaunch::shell("One", "shell", "banner"));
+
+        state.show_probe(first);
+        state.set_probe_lens(ProbeLens::Process);
+        state.toggle_probe_pin();
+
+        let probe = state.open_probe().expect("probe should stay open");
+        assert_eq!(probe.session_id, first);
+        assert_eq!(probe.lens, ProbeLens::Process);
+        assert_eq!(probe.mode, ProbeMode::Pinned);
+    }
+
+    #[test]
+    fn events_capture_supervision_transitions() {
+        let mut state = WorkspaceState::new();
+        let session_id = state.add_session(SessionLaunch::shell("One", "shell", "banner"));
+
+        state.mark_spawned(session_id, 4242);
+        state.activate_session(session_id);
+        state.show_probe(session_id);
+        state.set_probe_lens(ProbeLens::Events);
+
+        let session = state.session(session_id).expect("session must exist");
+        let summaries: Vec<&str> = session.events.iter().map(|event| event.summary.as_str()).collect();
+
+        assert!(summaries.iter().any(|summary| summary.contains("Spawned process 4242")));
+        assert!(summaries.iter().any(|summary| summary.contains("Terminal focused")));
+        assert!(summaries.iter().any(|summary| summary.contains("Probe opened")));
+        assert!(summaries
+            .iter()
+            .any(|summary| summary.contains("Probe switched to Events")));
     }
 }
