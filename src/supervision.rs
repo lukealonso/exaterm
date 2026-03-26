@@ -52,6 +52,19 @@ pub struct CorrelationSummary {
     pub suspicious_mismatch: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SignalTone {
+    Calm,
+    Watch,
+    Alert,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AlignmentSignal {
+    pub text: String,
+    pub tone: SignalTone,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BattleCardViewModel {
     pub session_id: SessionId,
@@ -62,7 +75,7 @@ pub struct BattleCardViewModel {
     pub headline: String,
     pub primary_detail: Option<String>,
     pub evidence_fragments: Vec<String>,
-    pub alert: Option<String>,
+    pub alignment: AlignmentSignal,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
@@ -148,7 +161,7 @@ pub fn build_battle_card(
         headline: tactical.headline,
         primary_detail: tactical.primary_detail,
         evidence_fragments: tactical.evidence_fragments,
-        alert: tactical.alert,
+        alignment: derive_alignment_signal(status, observed, intent.as_ref(), &correlation),
     }
 }
 
@@ -211,7 +224,6 @@ struct TacticalCopy {
     headline: String,
     primary_detail: Option<String>,
     evidence_fragments: Vec<String>,
-    alert: Option<String>,
 }
 
 fn tactical_copy(
@@ -219,17 +231,14 @@ fn tactical_copy(
     status: BattleCardStatus,
     observed: &ObservedActivity,
     intent: Option<&IntentSummary>,
-    correlation: &CorrelationSummary,
+    _correlation: &CorrelationSummary,
 ) -> TacticalCopy {
     let intent_text = intent.map(|intent| intent.text.as_str());
     let command_text = observed.active_command.as_deref();
     let process_text = observed.dominant_process.as_deref();
     let output_text = observed.work_output_excerpt.as_deref();
     let file_text = (!observed.recent_files.is_empty()).then(|| summarize_files(&observed.recent_files));
-
-    let alert = correlation
-        .suspicious_mismatch
-        .then(|| compact_fragment(&correlation.narrative));
+    let shell_ready = matches!(command_text, Some("Interactive shell ready"));
 
     let mut tactical = match status {
         BattleCardStatus::Idle => TacticalCopy {
@@ -244,18 +253,20 @@ fn tactical_copy(
                 .map(compact_fragment)
                 .or_else(|| file_text.clone().map(|files| format!("Last touched {files}"))),
             evidence_fragments: Vec::new(),
-            alert,
         },
         BattleCardStatus::Thinking => TacticalCopy {
             headline: compact_fragment(
-                intent_text
-                    .or(command_text)
-                    .or(process_text)
-                    .unwrap_or("Working through the next step"),
+                if shell_ready {
+                    "Terminal is ready for direct intervention"
+                } else {
+                    intent_text
+                        .or(command_text)
+                        .or(process_text)
+                        .unwrap_or("Working through the next step")
+                }
             ),
             primary_detail: output_text.map(compact_fragment),
             evidence_fragments: Vec::new(),
-            alert,
         },
         BattleCardStatus::Working => TacticalCopy {
             headline: compact_fragment(
@@ -269,7 +280,6 @@ fn tactical_copy(
                 .map(compact_fragment)
                 .or_else(|| output_text.map(compact_fragment)),
             evidence_fragments: Vec::new(),
-            alert,
         },
         BattleCardStatus::Blocked => TacticalCopy {
             headline: compact_fragment(
@@ -280,7 +290,6 @@ fn tactical_copy(
             ),
             primary_detail: Some("Waiting on an explicit unblock".into()),
             evidence_fragments: Vec::new(),
-            alert,
         },
         BattleCardStatus::Failed => TacticalCopy {
             headline: compact_fragment(
@@ -294,7 +303,6 @@ fn tactical_copy(
                 _ => "Failure needs inspection".into(),
             }),
             evidence_fragments: Vec::new(),
-            alert,
         },
         BattleCardStatus::Complete => TacticalCopy {
             headline: compact_fragment(
@@ -305,13 +313,11 @@ fn tactical_copy(
             ),
             primary_detail: None,
             evidence_fragments: Vec::new(),
-            alert,
         },
         BattleCardStatus::Detached => TacticalCopy {
             headline: "Session detached".into(),
             primary_detail: Some("Runtime visibility is no longer healthy".into()),
             evidence_fragments: Vec::new(),
-            alert,
         },
     };
 
@@ -351,6 +357,71 @@ fn tactical_copy(
     }
 
     tactical
+}
+
+fn derive_alignment_signal(
+    status: BattleCardStatus,
+    observed: &ObservedActivity,
+    intent: Option<&IntentSummary>,
+    correlation: &CorrelationSummary,
+) -> AlignmentSignal {
+    if correlation.suspicious_mismatch {
+        return AlignmentSignal {
+            text: compact_fragment(&correlation.narrative),
+            tone: SignalTone::Alert,
+        };
+    }
+
+    let has_files = !observed.recent_files.is_empty();
+    let has_output = observed.work_output_excerpt.is_some();
+    let has_runtime = observed.active_command.is_some() || observed.dominant_process.is_some();
+
+    match status {
+        BattleCardStatus::Blocked => AlignmentSignal {
+            text: "Prompt or explicit unblock is visible".into(),
+            tone: SignalTone::Alert,
+        },
+        BattleCardStatus::Failed => AlignmentSignal {
+            text: "Failure is explicit in machine output".into(),
+            tone: SignalTone::Alert,
+        },
+        BattleCardStatus::Working if has_files && has_output => AlignmentSignal {
+            text: "Files and output both confirm forward progress".into(),
+            tone: SignalTone::Calm,
+        },
+        BattleCardStatus::Working if has_files => AlignmentSignal {
+            text: "Recent file changes support the current work".into(),
+            tone: SignalTone::Calm,
+        },
+        BattleCardStatus::Working if has_output || has_runtime => AlignmentSignal {
+            text: "Live runtime evidence supports the current work".into(),
+            tone: SignalTone::Calm,
+        },
+        BattleCardStatus::Thinking
+            if matches!(observed.active_command.as_deref(), Some("Interactive shell ready")) =>
+        {
+            AlignmentSignal {
+                text: "Ready for direct control".into(),
+                tone: SignalTone::Calm,
+            }
+        }
+        BattleCardStatus::Thinking if intent.is_some() => AlignmentSignal {
+            text: "Visible planning is ahead of concrete execution".into(),
+            tone: SignalTone::Watch,
+        },
+        BattleCardStatus::Idle if has_files || has_output => AlignmentSignal {
+            text: "Recent evidence exists, but progress has gone quiet".into(),
+            tone: SignalTone::Watch,
+        },
+        BattleCardStatus::Idle => AlignmentSignal {
+            text: "No concrete execution is visible right now".into(),
+            tone: SignalTone::Watch,
+        },
+        _ => AlignmentSignal {
+            text: "Machine evidence is limited in the overview".into(),
+            tone: SignalTone::Watch,
+        },
+    }
 }
 
 fn derive_correlation(
@@ -500,7 +571,7 @@ fn mentions_editing(text: &str) -> bool {
 mod tests {
     use super::{
         build_battle_card, derive_battle_card_status, BattleCardStatus, DeterministicIntentEngine,
-        IntentEngine, IntentSource, ObservedActivity,
+        IntentEngine, IntentSource, ObservedActivity, SignalTone,
     };
     use crate::model::{SessionId, SessionKind, SessionLaunch, SessionRecord, SessionStatus};
 
@@ -616,6 +687,6 @@ mod tests {
             &DeterministicIntentEngine,
         );
 
-        assert!(card.alert.is_some());
+        assert_eq!(card.alignment.tone, SignalTone::Alert);
     }
 }

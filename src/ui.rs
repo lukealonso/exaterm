@@ -3,7 +3,7 @@ use crate::model::{
     SessionId, SessionKind, SessionLaunch, WorkspaceState,
 };
 use crate::supervision::{
-    build_battle_card, BattleCardStatus, DeterministicIntentEngine, ObservedActivity,
+    build_battle_card, BattleCardStatus, DeterministicIntentEngine, ObservedActivity, SignalTone,
 };
 use gtk::gdk;
 use gtk::prelude::*;
@@ -625,8 +625,16 @@ fn update_battle_card_widgets(context: &Rc<AppContext>, session: &crate::model::
     card.evidence_one.set_visible(!evidence_one.is_empty());
     card.evidence_two.set_visible(!evidence_two.is_empty());
 
-    card.alert.set_label(card_model.alert.as_deref().unwrap_or(""));
-    card.alert.set_visible(card_model.alert.is_some());
+    card.alert.set_label(&card_model.alignment.text);
+    for css in ["card-signal-calm", "card-signal-watch", "card-signal-alert"] {
+        card.alert.remove_css_class(css);
+    }
+    card.alert.add_css_class(match card_model.alignment.tone {
+        SignalTone::Calm => "card-signal-calm",
+        SignalTone::Watch => "card-signal-watch",
+        SignalTone::Alert => "card-signal-alert",
+    });
+    card.alert.set_visible(true);
 }
 
 fn refresh_workspace(context: &Rc<AppContext>) {
@@ -1009,9 +1017,20 @@ fn load_css() {
         }
 
         .card-alert {
-            color: #fecaca;
             font-size: 13px;
             font-weight: 700;
+        }
+
+        .card-signal-calm {
+            color: #bbf7d0;
+        }
+
+        .card-signal-watch {
+            color: #fde68a;
+        }
+
+        .card-signal-alert {
+            color: #fecaca;
         }
 
         .focus-title {
