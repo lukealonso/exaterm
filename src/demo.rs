@@ -13,29 +13,24 @@ impl WorkspaceBlueprint {
             sessions: vec![
                 SessionLaunch::shell(
                     "Planner",
-                    "Interactive shell",
-                    "Planner session ready. Use this tile like a normal terminal.",
+                    "Waiting shell",
+                    "Planner ready. Type directly in this terminal when intervention is needed.",
                 ),
-                SessionLaunch::command(
+                SessionLaunch::running_stream(
                     "Pulse Stream",
-                    "Live output",
-                    "/usr/bin/env",
-                    vec![
-                        "bash".into(),
-                        "-lc".into(),
-                        "i=1; while true; do printf '[%s] heartbeat %03d\\r\\n' \"$(date +%T)\" \"$i\"; i=$((i+1)); sleep 2; done".into(),
-                    ],
+                    "Running task",
+                    "i=1; while true; do printf '[%s] heartbeat %03d\\r\\n' \"$(date +%T)\" \"$i\"; i=$((i+1)); sleep 2; done",
                 ),
-                SessionLaunch::command(
-                    "Process View",
-                    "Native TUI",
-                    "/usr/bin/env",
-                    vec!["top".into()],
+                SessionLaunch::blocking_prompt(
+                    "Approval Gate",
+                    "Blocked prompt",
+                    "Waiting for approval. Type a response and press Enter.",
                 ),
-                SessionLaunch::shell(
-                    "Intervention Shell",
-                    "Operator handoff",
-                    "Use this shell for direct intervention and experiments.",
+                SessionLaunch::failing_task(
+                    "Failed Task",
+                    "Failure signal",
+                    "Compilation failed: missing dependency graph edge.",
+                    2,
                 ),
             ],
         }
@@ -45,7 +40,7 @@ impl WorkspaceBlueprint {
         SessionLaunch::shell(
             format!("Shell {number}"),
             "Generic command session",
-            format!("Shell {number} started. This is a real terminal session."),
+            format!("Shell {number} started. This terminal is ready for intervention."),
         )
     }
 }
@@ -53,6 +48,7 @@ impl WorkspaceBlueprint {
 #[cfg(test)]
 mod tests {
     use super::WorkspaceBlueprint;
+    use crate::model::SessionKind;
 
     #[test]
     fn demo_workspace_has_expected_shape() {
@@ -63,11 +59,11 @@ mod tests {
         assert!(workspace
             .sessions
             .iter()
-            .any(|session| session.name == "Process View"));
+            .any(|session| session.name == "Approval Gate"));
         assert!(workspace
             .sessions
             .iter()
-            .any(|session| session.subtitle == "Live output"));
+            .any(|session| session.kind == SessionKind::FailingTask));
     }
 
     #[test]

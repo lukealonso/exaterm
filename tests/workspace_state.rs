@@ -30,13 +30,15 @@ fn shell_launch_banner_command_is_spawnable() {
 fn workspace_state_tracks_focus_separately_from_selection() {
     let mut state = WorkspaceState::new();
     let a = state.add_session(SessionLaunch::shell("A", "shell", "a"));
-    let b = state.add_session(SessionLaunch::shell("B", "shell", "b"));
+    let b = state.add_session(SessionLaunch::blocking_prompt("B", "prompt", "b"));
 
     state.select_session(b);
     state.set_terminal_focus(Some(a));
     state.mark_spawned(a, 99);
+    state.mark_spawned(b, 100);
 
     assert_eq!(state.selected_session(), Some(b));
     assert_eq!(state.focused_terminal(), Some(a));
-    assert_eq!(state.sessions()[0].status, SessionStatus::Live);
+    assert_eq!(state.sessions()[0].status, SessionStatus::Waiting);
+    assert_eq!(state.sessions()[1].status, SessionStatus::Blocked);
 }
