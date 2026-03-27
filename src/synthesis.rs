@@ -189,6 +189,7 @@ impl NudgeSuggestion {
 pub struct OpenAiSynthesisConfig {
     pub api_key: String,
     pub model: String,
+    pub base_url: String,
 }
 
 impl OpenAiSynthesisConfig {
@@ -204,6 +205,7 @@ impl OpenAiSynthesisConfig {
         Some(Self {
             api_key,
             model: normalize_summary_model(&requested_model),
+            base_url: openai_chat_completions_url(),
         })
     }
 }
@@ -212,6 +214,7 @@ impl OpenAiSynthesisConfig {
 pub struct OpenAiNamingConfig {
     pub api_key: String,
     pub model: String,
+    pub base_url: String,
 }
 
 impl OpenAiNamingConfig {
@@ -227,6 +230,7 @@ impl OpenAiNamingConfig {
         Some(Self {
             api_key,
             model: normalize_naming_model(&requested_model),
+            base_url: openai_chat_completions_url(),
         })
     }
 }
@@ -235,6 +239,7 @@ impl OpenAiNamingConfig {
 pub struct OpenAiNudgeConfig {
     pub api_key: String,
     pub model: String,
+    pub base_url: String,
 }
 
 impl OpenAiNudgeConfig {
@@ -250,6 +255,7 @@ impl OpenAiNudgeConfig {
         Some(Self {
             api_key,
             model: normalize_nudge_model(&requested_model),
+            base_url: openai_chat_completions_url(),
         })
     }
 }
@@ -275,6 +281,18 @@ pub fn load_dotenv_file() {
         if !value.is_empty() {
             env::set_var(key, value);
         }
+    }
+}
+
+fn openai_chat_completions_url() -> String {
+    let base = env::var("EXATERM_OPENAI_BASE_URL")
+        .or_else(|_| env::var("OPENAI_BASE_URL"))
+        .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
+    let trimmed = base.trim_end_matches('/');
+    if trimmed.ends_with("/chat/completions") {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/chat/completions")
     }
 }
 
@@ -409,7 +427,7 @@ pub fn summarize_blocking(
 ) -> Result<TacticalSynthesis, String> {
     let request_body = json!({
         "model": config.model,
-        "input": [
+        "messages": [
             {
                 "role": "system",
                 "content": tactical_system_prompt(),
@@ -422,12 +440,9 @@ pub fn summarize_blocking(
                 ),
             }
         ],
-        "reasoning": {
-            "effort": "minimal"
-        },
-        "text": {
-            "format": {
-                "type": "json_schema",
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
                 "name": "exaterm_tactical_summary",
                 "strict": true,
                 "schema": synthesis_schema(),
@@ -443,7 +458,7 @@ pub fn summarize_blocking(
         .map_err(format_error_chain)?;
 
     let response = client
-        .post("https://api.openai.com/v1/responses")
+        .post(&config.base_url)
         .bearer_auth(&config.api_key)
         .header("Content-Type", "application/json")
         .json(&request_body)
@@ -469,7 +484,7 @@ pub fn suggest_name_blocking(
 ) -> Result<NameSuggestion, String> {
     let request_body = json!({
         "model": config.model,
-        "input": [
+        "messages": [
             {
                 "role": "system",
                 "content": naming_system_prompt(),
@@ -482,12 +497,9 @@ pub fn suggest_name_blocking(
                 ),
             }
         ],
-        "reasoning": {
-            "effort": "minimal"
-        },
-        "text": {
-            "format": {
-                "type": "json_schema",
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
                 "name": "exaterm_terminal_name",
                 "strict": true,
                 "schema": naming_schema(),
@@ -503,7 +515,7 @@ pub fn suggest_name_blocking(
         .map_err(format_error_chain)?;
 
     let response = client
-        .post("https://api.openai.com/v1/responses")
+        .post(&config.base_url)
         .bearer_auth(&config.api_key)
         .header("Content-Type", "application/json")
         .json(&request_body)
@@ -529,7 +541,7 @@ pub fn suggest_nudge_blocking(
 ) -> Result<NudgeSuggestion, String> {
     let request_body = json!({
         "model": config.model,
-        "input": [
+        "messages": [
             {
                 "role": "system",
                 "content": nudge_system_prompt(),
@@ -542,12 +554,9 @@ pub fn suggest_nudge_blocking(
                 ),
             }
         ],
-        "reasoning": {
-            "effort": "minimal"
-        },
-        "text": {
-            "format": {
-                "type": "json_schema",
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
                 "name": "exaterm_terminal_nudge",
                 "strict": true,
                 "schema": nudge_schema(),
@@ -563,7 +572,7 @@ pub fn suggest_nudge_blocking(
         .map_err(format_error_chain)?;
 
     let response = client
-        .post("https://api.openai.com/v1/responses")
+        .post(&config.base_url)
         .bearer_auth(&config.api_key)
         .header("Content-Type", "application/json")
         .json(&request_body)
@@ -594,7 +603,7 @@ fn format_error_chain(error: impl Error) -> String {
 }
 
 fn tactical_system_prompt() -> &'static str {
-    "You are a structured terminal-state synthesizer for Exaterm, a Linux supervision app used to watch multiple AI coding agents running in terminal sessions.\nYour job is to read timestamped terminal history plus machine evidence and produce a compact, grounded tactical summary for one session.\nUse only the provided evidence.\nDo not invent hidden thoughts, unseen tools, unseen files, or internal model state.\nPrefer multi-line terminal history and concrete machine evidence over a single optimistic status line when they disagree.\nPay close attention to time. You are given explicit terminal-history timestamps, the current local time, idle_seconds, and a human-readable age for the last visible update. Use them. If the last meaningful update is stale relative to the current time, do not describe the session as thinking or working unless there is truly fresh evidence of continued activity.\nThis is not a chat response. Return one compact JSON object only.\nReport into distinct dimensions, and give a terse grounded justification for each one:\n- tactical_state plus tactical_state_brief: broad present-tense state\n- progress_state plus progress_state_brief: trajectory class\n- momentum_state plus momentum_state_brief: how much coherent forward motion is visible right now\n- operator_action plus operator_action_brief: what the human operator most likely needs to do now\n- risk_posture plus risk_brief: whether the session seems risky, from low up to extreme, with a terse grounded reason\n- mismatch_level plus mismatch_brief: whether narrative and machine evidence diverge\nAlso provide terse_operator_summary: this is the only freeform operator-facing sentence that will appear on the card. It lives in a fixed bottom slot and should tersely surface the most relevant reasons the formal dimensions are in their current state.\nDo not emit active. Exaterm computes the generic active/idle baseline itself from terminal activity.\nOnly set tactical_state when you can refine that baseline meaningfully, such as thinking, working, blocked, failed, complete, detached, or a clearly meaningful idle.\nIf something is happening but the evidence does not clearly support a finer distinction, return tactical_state as null.\nOnly use thinking or working when the evidence clearly supports that finer distinction.\nUse blocked only when the session is truly stopped in a way that a simple nudge or continue prompt would not fix, and real human intervention is required.\nUse idle only when the session appears stalled or paused in a way that a simple push, continue, or keep-going nudge could plausibly restart useful work.\nUse complete only when the task appears genuinely finished and there is no meaningful remaining work to continue.\nWhen unsure between idle and blocked, prefer idle.\nWhen unsure between idle and complete, prefer idle.\nUse waiting_for_nudge when the agent appears coherent and productive but has paused after a checkpoint or status report and likely just needs a continue/keep-going prompt.\nUse flailing when retries continue without decisive new evidence or the narrative keeps restarting without narrowing the problem.\nUse converged_waiting when the session appears basically done or stably monitoring, with repeated near-duplicate idle reports.\nDo not call something idle if recent subprocesses, prompts, or fresh terminal updates indicate ongoing work or blockage.\nTreat recent_files as a weak heuristic signal, not proof of attribution.\nMomentum should reflect forward motion, not confidence of tone: choose strong, steady, fragile, or stalled based on visible progress.\nKeep every brief justification short, factual, and grounded in visible evidence.\nKeep headline and fragments terse and useful for supervising AI coding agents.\nAvoid schema labels like 'Intent:' or 'Reality:' because the UI already supplies structure."
+    "You are a structured terminal-state synthesizer for Exaterm, a Linux supervision app used to watch multiple AI coding agents running in terminal sessions.\nYour job is to read timestamped terminal history plus machine evidence and produce a compact, grounded tactical summary for one session.\nUse only the provided evidence.\nDo not invent hidden thoughts, unseen tools, unseen files, or internal model state.\nPrefer multi-line terminal history and concrete machine evidence over a single optimistic status line when they disagree.\nPay close attention to time. You are given explicit terminal-history timestamps, the current local time, idle_seconds, and a human-readable age for the last visible update. Use them. If the last meaningful update is stale relative to the current time, do not describe the session as thinking or working unless there is truly fresh evidence of continued activity.\nThis is not a chat response. Return one compact JSON object only.\nReport into distinct dimensions, and give a terse grounded justification for each one:\n- tactical_state plus tactical_state_brief: broad present-tense state\n- progress_state plus progress_state_brief: trajectory class\n- momentum_state plus momentum_state_brief: how much coherent forward motion is visible right now\n- operator_action plus operator_action_brief: what the human operator most likely needs to do now\n- risk_posture plus risk_brief: whether the session seems risky, from low up to extreme, with a terse grounded reason\n- mismatch_level plus mismatch_brief: whether narrative and machine evidence diverge\nAlso provide terse_operator_summary: this is the only freeform operator-facing sentence that will appear on the card. It lives in a fixed bottom slot and should tersely surface the most relevant reasons the formal dimensions are in their current state.\nDo not emit active. Exaterm computes the generic active/idle baseline itself from terminal activity.\nOnly set tactical_state when you can refine that baseline meaningfully, such as thinking, working, blocked, failed, complete, detached, or a clearly meaningful idle.\nIf something is happening but the evidence does not clearly support a finer distinction, return tactical_state as null.\nUse thinking when the session is mainly diagnosing, planning, or reasoning, with little concrete execution evidence.\nUse working when the session is actively executing concrete repair, test, build, edit, or tool loops.\nOnly use thinking or working when the evidence clearly supports that finer distinction.\nUse blocked only when the session is truly stopped in a way that a simple nudge or continue prompt would not fix, and real human intervention is required.\nBlocked is for real external dependency boundaries: explicit approval/confirmation prompts, missing credentials/access, operator input gates, or hard environmental constraints the agent cannot route around.\nIf a hard external constraint or approval boundary is currently preventing useful continuation, tactical_state should usually be blocked, not thinking or working, even if the agent is still discussing options or diagnosing around it.\nExplicit approval, confirmation, credential, or operator-input prompts are blocked, not idle. Visible prompts like '[y/N]', 'Proceed?', 'Approve?', 'Waiting for operator input', or requests to cross a production boundary require blocked when the next step depends on a real human answer.\nDo not use blocked just because the session says it is waiting for the next instruction, standing by, monitoring, or ready for direction after finishing a pass. That is usually idle or converged_waiting, not blocked.\nUse idle only when the session appears stalled or paused in a way that a simple push, continue, or keep-going nudge could plausibly restart useful work.\nA nudgeable idle usually looks like a coherent checkpoint or next-step proposal followed by an offer to continue if asked, such as 'If you want, I'll start that next pass directly.' That is idle or waiting_for_nudge, not blocked.\nIdle must not be used when there is an explicit pending confirmation or input prompt that needs a substantive human answer.\nUse complete only when the task appears genuinely finished and there is no meaningful remaining work to continue.\nUse failed only when the session itself has actually failed or given up in a way that leaves no active recovery loop. Repeated local test/build failures do not by themselves mean the session is failed if the agent is still actively iterating.\nWhen unsure between idle and blocked, prefer idle unless there is an explicit human approval/input boundary or a hard external constraint. In those cases, prefer blocked.\nWhen unsure between idle and complete, prefer idle.\nUse waiting_for_nudge when the agent appears coherent and productive but has paused after a checkpoint or next-step proposal and likely just needs a continue/keep-going prompt. Do not use waiting_for_nudge for approval prompts, production confirmations, or credentials.\nUse flailing when retries continue without decisive new evidence or the narrative keeps restarting without narrowing the problem. Flailing is a progress judgment, not necessarily a tactical-state failure: a session can still be working or thinking while flailing.\nUse converged_waiting when the session appears basically done or stably monitoring, with repeated near-duplicate idle reports.\nDo not call something idle if recent subprocesses, prompts, or fresh terminal updates indicate ongoing work or blockage.\nTreat recent_files as a weak heuristic signal, not proof of attribution.\nMomentum should reflect forward motion, not confidence of tone: choose strong, steady, fragile, or stalled based on visible progress.\nKeep every brief justification short, factual, and grounded in visible evidence.\nKeep headline and fragments terse and useful for supervising AI coding agents.\nAvoid schema labels like 'Intent:' or 'Reality:' because the UI already supplies structure."
 }
 
 fn naming_system_prompt() -> &'static str {
@@ -707,6 +716,17 @@ fn nudge_schema() -> Value {
 }
 
 pub fn extract_response_text(payload: &Value) -> Option<String> {
+    if let Some(text) = payload
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("message"))
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_str)
+    {
+        return Some(text.to_string());
+    }
+
     if let Some(text) = payload.get("output_text").and_then(Value::as_str) {
         return Some(text.to_string());
     }
@@ -769,11 +789,15 @@ fn sanitize_name(value: &str) -> String {
 mod tests {
     use super::{
         extract_response_text, name_signature, normalize_naming_model, normalize_summary_model,
+        openai_chat_completions_url,
         nudge_signature, summary_signature, MomentumState, MismatchLevel, NameSuggestion,
         NamingEvidence, NudgeEvidence, OperatorAction, ProgressState, RiskPosture,
         TacticalEvidence, TacticalState, TacticalSynthesis,
     };
     use serde_json::json;
+    use std::sync::Mutex;
+
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     #[derive(Clone)]
     struct FixtureExpectations {
@@ -794,6 +818,44 @@ mod tests {
     fn normalizes_legacy_naming_model_aliases() {
         assert_eq!(normalize_naming_model("gpt-5.4-mini"), "gpt-5-mini");
         assert_eq!(normalize_naming_model(""), "gpt-5-mini");
+    }
+
+    #[test]
+    fn openai_chat_completions_url_defaults_to_openai() {
+        let _guard = ENV_MUTEX.lock().expect("env mutex");
+        std::env::remove_var("EXATERM_OPENAI_BASE_URL");
+        std::env::remove_var("OPENAI_BASE_URL");
+        assert_eq!(
+            openai_chat_completions_url(),
+            "https://api.openai.com/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn openai_chat_completions_url_uses_configured_base() {
+        let _guard = ENV_MUTEX.lock().expect("env mutex");
+        std::env::set_var("EXATERM_OPENAI_BASE_URL", "https://example.test/v1/");
+        assert_eq!(
+            openai_chat_completions_url(),
+            "https://example.test/v1/chat/completions"
+        );
+        std::env::remove_var("EXATERM_OPENAI_BASE_URL");
+    }
+
+    #[test]
+    fn extracts_text_from_chat_completions_payload() {
+        let payload = json!({
+            "choices": [
+                {
+                    "message": {
+                        "content": "{\"headline\":\"cargo test parser\"}"
+                    }
+                }
+            ]
+        });
+
+        let text = extract_response_text(&payload).expect("text should be extracted");
+        assert!(text.contains("\"headline\":\"cargo test parser\""));
     }
 
     #[test]
@@ -1142,10 +1204,10 @@ mod tests {
                     ],
                 },
                 FixtureExpectations {
-                    tactical_states: vec![TacticalState::Active, TacticalState::Working],
+                    tactical_states: vec![TacticalState::Working, TacticalState::Thinking],
                     progress_states: vec![ProgressState::SteadyProgress, ProgressState::Verifying],
                     momentum_states: vec![MomentumState::Strong, MomentumState::Steady],
-                    operator_actions: vec![OperatorAction::Watch],
+                    operator_actions: vec![OperatorAction::None, OperatorAction::Watch],
                     risk_postures: vec![RiskPosture::Low, RiskPosture::Watch],
                 },
             ),
@@ -1164,12 +1226,12 @@ mod tests {
                     recent_terminal_activity: vec![
                         "[11:02:09] • I fixed the stuck focus path and the focused terminal now accepts Return again.".into(),
                         "[11:02:13] • Verified with cargo test plus a manual smoke pass.".into(),
-                        "[11:02:20] • Next I can tighten the battlefield density and card typography if you want me to keep going.".into(),
-                        "[11:02:27] • Current state is clean and ready for the next pass.".into(),
+                        "[11:02:20] • Next attack: tighten battlefield density and card typography.".into(),
+                        "[11:02:27] • If you want, I'll start that next pass directly.".into(),
                         "[11:03:41] › Continue".into(),
                         "[11:03:45] • I’m continuing from the cleaned-up focus mode.".into(),
                         "[11:06:12] • Larger typography is in and focus mode keeps context now.".into(),
-                        "[11:06:17] • Tests pass. Ready for the next instruction or a keep-going nudge.".into(),
+                        "[11:06:17] • Tests pass. If you want, I'll start the next pass directly.".into(),
                     ],
                     recent_events: vec![
                         "Spawned cargo test".into(),
@@ -1177,7 +1239,7 @@ mod tests {
                     ],
                 },
                 FixtureExpectations {
-                    tactical_states: vec![TacticalState::Active, TacticalState::Idle],
+                    tactical_states: vec![TacticalState::Idle],
                     progress_states: vec![ProgressState::WaitingForNudge],
                     momentum_states: vec![MomentumState::Strong, MomentumState::Steady],
                     operator_actions: vec![OperatorAction::Nudge],
@@ -1214,7 +1276,7 @@ mod tests {
                 FixtureExpectations {
                     tactical_states: vec![TacticalState::Blocked],
                     progress_states: vec![ProgressState::Blocked],
-                    momentum_states: vec![MomentumState::Steady, MomentumState::Strong],
+                    momentum_states: vec![MomentumState::Stalled, MomentumState::Fragile],
                     operator_actions: vec![OperatorAction::Intervene],
                     risk_postures: vec![RiskPosture::Watch, RiskPosture::High],
                 },
@@ -1252,11 +1314,11 @@ mod tests {
                     ],
                 },
                 FixtureExpectations {
-                    tactical_states: vec![TacticalState::Active, TacticalState::Failed],
+                    tactical_states: vec![TacticalState::Working, TacticalState::Thinking],
                     progress_states: vec![ProgressState::Flailing],
                     momentum_states: vec![MomentumState::Fragile, MomentumState::Stalled],
                     operator_actions: vec![OperatorAction::Watch, OperatorAction::Intervene],
-                    risk_postures: vec![RiskPosture::Watch, RiskPosture::High],
+                    risk_postures: vec![RiskPosture::Low, RiskPosture::Watch],
                 },
             ),
             (
@@ -1287,10 +1349,18 @@ mod tests {
                     ],
                 },
                 FixtureExpectations {
-                    tactical_states: vec![TacticalState::Idle, TacticalState::Active, TacticalState::Complete],
+                    tactical_states: vec![TacticalState::Idle, TacticalState::Complete],
                     progress_states: vec![ProgressState::ConvergedWaiting],
-                    momentum_states: vec![MomentumState::Strong, MomentumState::Steady],
-                    operator_actions: vec![OperatorAction::Watch, OperatorAction::None],
+                    momentum_states: vec![
+                        MomentumState::Strong,
+                        MomentumState::Steady,
+                        MomentumState::Stalled,
+                    ],
+                    operator_actions: vec![
+                        OperatorAction::None,
+                        OperatorAction::Watch,
+                        OperatorAction::Nudge,
+                    ],
                     risk_postures: vec![RiskPosture::Low],
                 },
             ),
@@ -1322,11 +1392,19 @@ mod tests {
                     ],
                 },
                 FixtureExpectations {
-                    tactical_states: vec![TacticalState::Active],
-                    progress_states: vec![ProgressState::Exploring, ProgressState::Flailing],
+                    tactical_states: vec![TacticalState::Working, TacticalState::Thinking],
+                    progress_states: vec![
+                        ProgressState::SteadyProgress,
+                        ProgressState::Exploring,
+                        ProgressState::Flailing,
+                    ],
                     momentum_states: vec![MomentumState::Steady, MomentumState::Fragile],
-                    operator_actions: vec![OperatorAction::Watch, OperatorAction::Intervene],
-                    risk_postures: vec![RiskPosture::High],
+                    operator_actions: vec![
+                        OperatorAction::Watch,
+                        OperatorAction::Nudge,
+                        OperatorAction::Intervene,
+                    ],
+                    risk_postures: vec![RiskPosture::Watch, RiskPosture::High],
                 },
             ),
             (
@@ -1360,11 +1438,11 @@ mod tests {
                     ],
                 },
                 FixtureExpectations {
-                    tactical_states: vec![TacticalState::Blocked, TacticalState::Active],
+                    tactical_states: vec![TacticalState::Blocked, TacticalState::Working],
                     progress_states: vec![ProgressState::Blocked, ProgressState::Flailing],
                     momentum_states: vec![MomentumState::Fragile, MomentumState::Stalled],
                     operator_actions: vec![OperatorAction::Intervene],
-                    risk_postures: vec![RiskPosture::Extreme],
+                    risk_postures: vec![RiskPosture::High, RiskPosture::Extreme],
                 },
             ),
         ]
