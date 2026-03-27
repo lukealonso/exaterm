@@ -188,7 +188,7 @@ pub fn derive_battle_card_status(
         || observed.work_output_excerpt.is_some()
         || !observed.recent_files.is_empty();
     match session_status {
-        SessionStatus::Blocked => BattleCardStatus::Blocked,
+        SessionStatus::Blocked => BattleCardStatus::Active,
         SessionStatus::Failed(_) => BattleCardStatus::Failed,
         SessionStatus::Complete => BattleCardStatus::Complete,
         SessionStatus::Detached => BattleCardStatus::Detached,
@@ -735,10 +735,10 @@ mod tests {
     }
 
     #[test]
-    fn battle_card_status_marks_blocked_and_failed_directly() {
+    fn battle_card_status_keeps_blocked_sessions_generic_until_llm_refines_them() {
         assert_eq!(
             derive_battle_card_status(SessionStatus::Blocked, &ObservedActivity::default(), None),
-            BattleCardStatus::Blocked
+            BattleCardStatus::Active
         );
         assert_eq!(
             derive_battle_card_status(

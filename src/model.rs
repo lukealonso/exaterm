@@ -18,7 +18,7 @@ impl SessionKind {
             SessionKind::WaitingShell => SessionStatus::Waiting,
             SessionKind::PlanningStream => SessionStatus::Running,
             SessionKind::RunningStream => SessionStatus::Running,
-            SessionKind::BlockingPrompt => SessionStatus::Blocked,
+            SessionKind::BlockingPrompt => SessionStatus::Running,
             SessionKind::FailingTask => SessionStatus::Running,
         }
     }
@@ -206,7 +206,7 @@ impl SessionLaunch {
                 _ => "Actively producing terminal activity".into(),
             },
             SessionStatus::Waiting => "Interactive shell ready".into(),
-            SessionStatus::Blocked => "Waiting for operator input".into(),
+            SessionStatus::Blocked => "Session stopped pending human intervention".into(),
             SessionStatus::Failed(code) => format!("Exited with code {code}"),
             SessionStatus::Complete => "Process exited cleanly".into(),
             SessionStatus::Detached => "Runtime disconnected".into(),
@@ -629,7 +629,7 @@ mod tests {
         state.mark_spawned(blocked, 4343);
 
         assert_eq!(state.sessions()[0].status, SessionStatus::Waiting);
-        assert_eq!(state.sessions()[1].status, SessionStatus::Blocked);
+        assert_eq!(state.sessions()[1].status, SessionStatus::Running);
     }
 
     #[test]
@@ -656,7 +656,7 @@ mod tests {
 
         assert_eq!(
             prompt.status_hint(SessionStatus::Blocked),
-            "Waiting for operator input"
+            "Session stopped pending human intervention"
         );
         assert_eq!(
             failed.status_hint(SessionStatus::Failed(9)),

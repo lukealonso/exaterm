@@ -8,6 +8,7 @@ use std::path::Path;
 
 const DEFAULT_SUMMARY_MODEL: &str = "gpt-5-mini";
 const DEFAULT_NAMING_MODEL: &str = "gpt-5-mini";
+const DEFAULT_NUDGE_MODEL: &str = "gpt-5-mini";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -91,7 +92,6 @@ pub struct TacticalSynthesis {
     pub mismatch_level: MismatchLevel,
     pub mismatch_brief: Option<String>,
     pub intervention_warranted: bool,
-    pub momentum: f32,
 }
 
 impl TacticalSynthesis {
@@ -112,7 +112,6 @@ impl TacticalSynthesis {
             .filter_map(|fragment| sanitize_optional(Some(fragment)))
             .take(2)
             .collect();
-        self.momentum = self.momentum.clamp(0.0, 1.0);
         self
     }
 
@@ -133,7 +132,9 @@ pub struct TacticalEvidence {
     pub process_tree_excerpt: Option<String>,
     pub recent_files: Vec<String>,
     pub work_output_excerpt: Option<String>,
+    pub current_time: Option<String>,
     pub idle_seconds: Option<u64>,
+    pub last_update_age: Option<String>,
     pub recent_terminal_activity: Vec<String>,
     pub recent_events: Vec<String>,
 }
@@ -141,6 +142,18 @@ pub struct TacticalEvidence {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct NamingEvidence {
     pub current_name: String,
+    pub recent_terminal_history: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct NudgeEvidence {
+    pub session_name: String,
+    pub shell_child_command: Option<String>,
+    pub idle_seconds: Option<u64>,
+    pub tactical_state_brief: Option<String>,
+    pub progress_state_brief: Option<String>,
+    pub momentum_state_brief: Option<String>,
+    pub terse_operator_summary: Option<String>,
     pub recent_terminal_history: Vec<String>,
 }
 
@@ -152,6 +165,22 @@ pub struct NameSuggestion {
 impl NameSuggestion {
     pub fn sanitize(mut self) -> Self {
         self.name = sanitize_name(&self.name);
+        self
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NudgeSuggestion {
+    pub text: String,
+}
+
+impl NudgeSuggestion {
+    pub fn sanitize(mut self) -> Self {
+        self.text = sanitize_optional(Some(self.text))
+            .unwrap_or_default()
+            .chars()
+            .take(120)
+            .collect();
         self
     }
 }
@@ -202,6 +231,29 @@ impl OpenAiNamingConfig {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct OpenAiNudgeConfig {
+    pub api_key: String,
+    pub model: String,
+}
+
+impl OpenAiNudgeConfig {
+    pub fn from_env() -> Option<Self> {
+        load_dotenv_file();
+
+        let api_key = env::var("OPENAI_API_KEY").ok()?.trim().to_string();
+        if api_key.is_empty() {
+            return None;
+        }
+
+        let requested_model = env::var("EXATERM_NUDGE_MODEL").unwrap_or_default();
+        Some(Self {
+            api_key,
+            model: normalize_nudge_model(&requested_model),
+        })
+    }
+}
+
 pub fn load_dotenv_file() {
     let Ok(raw) = fs::read_to_string(Path::new(".env")) else {
         return;
@@ -244,6 +296,15 @@ pub fn normalize_naming_model(model: &str) -> String {
     }
 }
 
+pub fn normalize_nudge_model(model: &str) -> String {
+    match model.trim() {
+        "" => DEFAULT_NUDGE_MODEL.into(),
+        "gpt-5.4-mini" => DEFAULT_NUDGE_MODEL.into(),
+        "gpt-5.4" => "gpt-5".into(),
+        other => other.into(),
+    }
+}
+
 pub fn summary_signature(evidence: &TacticalEvidence) -> String {
     json!({
         "session_name": evidence.session_name,
@@ -252,18 +313,94 @@ pub fn summary_signature(evidence: &TacticalEvidence) -> String {
         "process_tree_excerpt": evidence.process_tree_excerpt,
         "recent_files": evidence.recent_files,
         "work_output_excerpt": evidence.work_output_excerpt,
-        "recent_terminal_activity": evidence.recent_terminal_activity,
+        "idle_bucket": idle_bucket(evidence.idle_seconds),
+        "last_update_age_bucket": relative_age_bucket(evidence.last_update_age.as_deref()),
+        "recent_terminal_activity": normalize_time_annotated_lines(&evidence.recent_terminal_activity),
         "recent_events": evidence.recent_events,
     })
     .to_string()
 }
 
+fn idle_bucket(idle_seconds: Option<u64>) -> Option<&'static str> {
+    match idle_seconds? {
+        0..=4 => Some("0-4s"),
+        5..=14 => Some("5-14s"),
+        15..=29 => Some("15-29s"),
+        30..=59 => Some("30-59s"),
+        60..=119 => Some("60-119s"),
+        _ => Some("120s+"),
+    }
+}
+
 pub fn name_signature(evidence: &NamingEvidence) -> String {
     json!({
         "current_name": evidence.current_name,
-        "recent_terminal_history": evidence.recent_terminal_history,
+        "recent_terminal_history": normalize_time_annotated_lines(&evidence.recent_terminal_history),
     })
     .to_string()
+}
+
+pub fn nudge_signature(evidence: &NudgeEvidence) -> String {
+    json!({
+        "session_name": evidence.session_name,
+        "shell_child_command": evidence.shell_child_command,
+        "idle_bucket": idle_bucket(evidence.idle_seconds),
+        "tactical_state_brief": evidence.tactical_state_brief,
+        "progress_state_brief": evidence.progress_state_brief,
+        "momentum_state_brief": evidence.momentum_state_brief,
+        "terse_operator_summary": evidence.terse_operator_summary,
+        "recent_terminal_history": normalize_time_annotated_lines(&evidence.recent_terminal_history),
+    })
+    .to_string()
+}
+
+fn normalize_time_annotated_lines(lines: &[String]) -> Vec<String> {
+    lines.iter()
+        .map(|line| normalize_time_annotated_line(line))
+        .collect()
+}
+
+fn normalize_time_annotated_line(line: &str) -> String {
+    let Some((prefix, payload)) = line.split_once("] ") else {
+        return line.to_string();
+    };
+    let Some(label) = prefix.strip_prefix('[') else {
+        return line.to_string();
+    };
+    let Some(bucket) = relative_age_bucket(Some(label)) else {
+        return line.to_string();
+    };
+    format!("[{bucket}] {payload}")
+}
+
+fn relative_age_bucket(label: Option<&str>) -> Option<&'static str> {
+    let label = label?.trim();
+    if label == "now" {
+        return Some("now");
+    }
+    if let Some(value) = label.strip_suffix("s ago").and_then(|value| value.trim().parse::<u64>().ok()) {
+        return bucket_duration_seconds(value);
+    }
+    if let Some(value) = label.strip_suffix("m ago").and_then(|value| value.trim().parse::<u64>().ok()) {
+        return bucket_duration_seconds(value.saturating_mul(60));
+    }
+    if let Some(value) = label.strip_suffix("h ago").and_then(|value| value.trim().parse::<u64>().ok()) {
+        return bucket_duration_seconds(value.saturating_mul(3600));
+    }
+    None
+}
+
+fn bucket_duration_seconds(seconds: u64) -> Option<&'static str> {
+    Some(match seconds {
+        0..=4 => "0-4s",
+        5..=14 => "5-14s",
+        15..=29 => "15-29s",
+        30..=59 => "30-59s",
+        60..=299 => "1-4m",
+        300..=899 => "5-14m",
+        900..=3599 => "15-59m",
+        _ => "60m+",
+    })
 }
 
 pub fn summarize_blocking(
@@ -386,6 +523,66 @@ pub fn suggest_name_blocking(
         .map_err(|error| format!("failed to parse model naming response: {error}; payload={text}"))
 }
 
+pub fn suggest_nudge_blocking(
+    config: &OpenAiNudgeConfig,
+    evidence: &NudgeEvidence,
+) -> Result<NudgeSuggestion, String> {
+    let request_body = json!({
+        "model": config.model,
+        "input": [
+            {
+                "role": "system",
+                "content": nudge_system_prompt(),
+            },
+            {
+                "role": "user",
+                "content": format!(
+                    "Write one short contextual nudge for this idle terminal session. Return empty string if no safe, useful nudge is warranted:\n{}",
+                    serde_json::to_string_pretty(evidence).map_err(|error| error.to_string())?
+                ),
+            }
+        ],
+        "reasoning": {
+            "effort": "minimal"
+        },
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "exaterm_terminal_nudge",
+                "strict": true,
+                "schema": nudge_schema(),
+            }
+        }
+    });
+
+    let client = reqwest::blocking::Client::builder()
+        .http1_only()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(90))
+        .build()
+        .map_err(format_error_chain)?;
+
+    let response = client
+        .post("https://api.openai.com/v1/responses")
+        .bearer_auth(&config.api_key)
+        .header("Content-Type", "application/json")
+        .json(&request_body)
+        .send()
+        .map_err(format_error_chain)?;
+
+    let status = response.status();
+    let payload: Value = response.json().map_err(format_error_chain)?;
+    if !status.is_success() {
+        return Err(payload.to_string());
+    }
+
+    let text = extract_response_text(&payload)
+        .ok_or_else(|| format!("response did not include parseable text: {payload}"))?;
+    serde_json::from_str::<NudgeSuggestion>(&text)
+        .map(NudgeSuggestion::sanitize)
+        .map_err(|error| format!("failed to parse model nudge response: {error}; payload={text}"))
+}
+
 fn format_error_chain(error: impl Error) -> String {
     let mut parts = vec![error.to_string()];
     let mut source = error.source();
@@ -397,11 +594,15 @@ fn format_error_chain(error: impl Error) -> String {
 }
 
 fn tactical_system_prompt() -> &'static str {
-    "You are a structured terminal-state synthesizer for Exaterm, a Linux supervision app used to watch multiple AI coding agents running in terminal sessions.\nYour job is to read timestamped terminal history plus machine evidence and produce a compact, grounded tactical summary for one session.\nUse only the provided evidence.\nDo not invent hidden thoughts, unseen tools, unseen files, or internal model state.\nPrefer multi-line terminal history and concrete machine evidence over a single optimistic status line when they disagree.\nThis is not a chat response. Return one compact JSON object only.\nReport into distinct dimensions, and give a terse grounded justification for each one:\n- tactical_state plus tactical_state_brief: broad present-tense state\n- progress_state plus progress_state_brief: trajectory class\n- momentum_state plus momentum_state_brief: how much coherent forward motion is visible right now\n- operator_action plus operator_action_brief: what the human operator most likely needs to do now\n- risk_posture plus risk_brief: whether the session seems risky, from low up to extreme, with a terse grounded reason\n- mismatch_level plus mismatch_brief: whether narrative and machine evidence diverge\nAlso provide terse_operator_summary: this is the only freeform operator-facing sentence that will appear on the card. It lives in a fixed bottom slot and should tersely surface the most relevant reasons the formal dimensions are in their current state.\nDo not emit active. Exaterm computes the generic active/idle baseline itself from terminal activity.\nOnly set tactical_state when you can refine that baseline meaningfully, such as thinking, working, blocked, failed, complete, detached, or a clearly meaningful idle.\nIf something is happening but the evidence does not clearly support a finer distinction, return tactical_state as null.\nOnly use thinking or working when the evidence clearly supports that finer distinction.\nUse waiting_for_nudge when the agent appears coherent and productive but has paused after a checkpoint or status report and likely just needs a continue/keep-going prompt.\nUse flailing when retries continue without decisive new evidence or the narrative keeps restarting without narrowing the problem.\nUse converged_waiting when the session appears basically done or stably monitoring, with repeated near-duplicate idle reports.\nDo not call something idle if recent subprocesses, prompts, or fresh terminal updates indicate ongoing work or blockage.\nTreat recent_files as a weak heuristic signal, not proof of attribution.\nMomentum should reflect forward motion, not confidence of tone: choose strong, steady, fragile, or stalled based on visible progress.\nKeep every brief justification short, factual, and grounded in visible evidence.\nKeep headline and fragments terse and useful for supervising AI coding agents.\nAvoid schema labels like 'Intent:' or 'Reality:' because the UI already supplies structure."
+    "You are a structured terminal-state synthesizer for Exaterm, a Linux supervision app used to watch multiple AI coding agents running in terminal sessions.\nYour job is to read timestamped terminal history plus machine evidence and produce a compact, grounded tactical summary for one session.\nUse only the provided evidence.\nDo not invent hidden thoughts, unseen tools, unseen files, or internal model state.\nPrefer multi-line terminal history and concrete machine evidence over a single optimistic status line when they disagree.\nPay close attention to time. You are given explicit terminal-history timestamps, the current local time, idle_seconds, and a human-readable age for the last visible update. Use them. If the last meaningful update is stale relative to the current time, do not describe the session as thinking or working unless there is truly fresh evidence of continued activity.\nThis is not a chat response. Return one compact JSON object only.\nReport into distinct dimensions, and give a terse grounded justification for each one:\n- tactical_state plus tactical_state_brief: broad present-tense state\n- progress_state plus progress_state_brief: trajectory class\n- momentum_state plus momentum_state_brief: how much coherent forward motion is visible right now\n- operator_action plus operator_action_brief: what the human operator most likely needs to do now\n- risk_posture plus risk_brief: whether the session seems risky, from low up to extreme, with a terse grounded reason\n- mismatch_level plus mismatch_brief: whether narrative and machine evidence diverge\nAlso provide terse_operator_summary: this is the only freeform operator-facing sentence that will appear on the card. It lives in a fixed bottom slot and should tersely surface the most relevant reasons the formal dimensions are in their current state.\nDo not emit active. Exaterm computes the generic active/idle baseline itself from terminal activity.\nOnly set tactical_state when you can refine that baseline meaningfully, such as thinking, working, blocked, failed, complete, detached, or a clearly meaningful idle.\nIf something is happening but the evidence does not clearly support a finer distinction, return tactical_state as null.\nOnly use thinking or working when the evidence clearly supports that finer distinction.\nUse blocked only when the session is truly stopped in a way that a simple nudge or continue prompt would not fix, and real human intervention is required.\nUse idle only when the session appears stalled or paused in a way that a simple push, continue, or keep-going nudge could plausibly restart useful work.\nUse complete only when the task appears genuinely finished and there is no meaningful remaining work to continue.\nWhen unsure between idle and blocked, prefer idle.\nWhen unsure between idle and complete, prefer idle.\nUse waiting_for_nudge when the agent appears coherent and productive but has paused after a checkpoint or status report and likely just needs a continue/keep-going prompt.\nUse flailing when retries continue without decisive new evidence or the narrative keeps restarting without narrowing the problem.\nUse converged_waiting when the session appears basically done or stably monitoring, with repeated near-duplicate idle reports.\nDo not call something idle if recent subprocesses, prompts, or fresh terminal updates indicate ongoing work or blockage.\nTreat recent_files as a weak heuristic signal, not proof of attribution.\nMomentum should reflect forward motion, not confidence of tone: choose strong, steady, fragile, or stalled based on visible progress.\nKeep every brief justification short, factual, and grounded in visible evidence.\nKeep headline and fragments terse and useful for supervising AI coding agents.\nAvoid schema labels like 'Intent:' or 'Reality:' because the UI already supplies structure."
 }
 
 fn naming_system_prompt() -> &'static str {
     "You are a terminal session naming system for Exaterm, a Linux app used to supervise AI coding agents running in terminal sessions.\nYou receive a current operator-facing name, which may be empty, plus a long terminal-history window.\nReturn one compact JSON object only.\nChoose a short, stable, operator-scannable name that reflects what this session is actually working on.\nDefer strongly to stable names: if the current name is still good, keep it or make only a very small refinement.\nDo not rename eagerly based on one transient command, one tool invocation, or one narrow substep.\nPrefer names that will still make sense a few minutes later.\nUse the terminal history, not hidden assumptions.\nDo not mention model names, terminals, or generic labels like 'Agent' or 'Shell' unless the history truly gives you nothing better.\nIf the history is still too thin, too generic, or too ambiguous to choose a good stable name, return an empty string.\nKeep the name concise, ideally 2 to 5 words and at most 40 characters.\nReturn JSON only."
+}
+
+fn nudge_system_prompt() -> &'static str {
+    "You write one short terminal nudge for an AI coding agent session in Exaterm.\nThe session has already been classified as idle rather than blocked or complete.\nYou are also given the current executing command directly under the shell.\nIf there is no current direct shell child command, or it does not look like a coding agent, return an empty string.\nYour job is to write a brief, context-aware push that can help the agent resume useful work.\nUse only the provided evidence.\nDo not ask questions unless absolutely necessary.\nDo not mention Exaterm, JSON, or that you are an AI.\nDo not explain your reasoning.\nDo not be verbose.\nPrefer simple concrete nudges like continue, keep going, focus on the next failing step, rerun the relevant test, or finish the in-progress repair.\nDo not suggest risky or destructive actions unless the evidence strongly and explicitly supports them.\nIf there is no safe, useful nudge, return an empty string.\nReturn JSON only."
 }
 
 fn synthesis_schema() -> Value {
@@ -457,8 +658,7 @@ fn synthesis_schema() -> Value {
                 "enum": ["low", "watch", "high"]
             },
             "mismatch_brief": { "type": ["string", "null"] },
-            "intervention_warranted": { "type": "boolean" },
-            "momentum": { "type": "number" }
+            "intervention_warranted": { "type": "boolean" }
         },
         "required": [
             "tactical_state",
@@ -478,8 +678,7 @@ fn synthesis_schema() -> Value {
             "risk_brief",
             "mismatch_level",
             "mismatch_brief",
-            "intervention_warranted",
-            "momentum"
+            "intervention_warranted"
         ],
         "additionalProperties": false
     })
@@ -492,6 +691,17 @@ fn naming_schema() -> Value {
             "name": { "type": "string" }
         },
         "required": ["name"],
+        "additionalProperties": false
+    })
+}
+
+fn nudge_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "text": { "type": "string" }
+        },
+        "required": ["text"],
         "additionalProperties": false
     })
 }
@@ -559,9 +769,9 @@ fn sanitize_name(value: &str) -> String {
 mod tests {
     use super::{
         extract_response_text, name_signature, normalize_naming_model, normalize_summary_model,
-        summary_signature, MomentumState, MismatchLevel, NameSuggestion, NamingEvidence,
-        OperatorAction, ProgressState, RiskPosture, TacticalEvidence, TacticalState,
-        TacticalSynthesis,
+        nudge_signature, summary_signature, MomentumState, MismatchLevel, NameSuggestion,
+        NamingEvidence, NudgeEvidence, OperatorAction, ProgressState, RiskPosture,
+        TacticalEvidence, TacticalState, TacticalSynthesis,
     };
     use serde_json::json;
 
@@ -594,7 +804,7 @@ mod tests {
                     "content": [
                         {
                             "type": "output_text",
-                            "text": "{\"tactical_state\":\"working\",\"tactical_state_brief\":\"tests are running\",\"progress_state\":\"steady_progress\",\"progress_state_brief\":\"failures are narrowing\",\"momentum_state\":\"steady\",\"momentum_state_brief\":\"reruns keep moving the issue forward\",\"operator_action\":\"watch\",\"operator_action_brief\":\"let the loop continue\",\"terse_operator_summary\":\"Targeted parser reruns are still failing, but the loop is narrowing the issue.\",\"headline\":\"cargo test parser\",\"primary_fragment\":null,\"supporting_fragments\":[],\"alignment_fragment\":null,\"risk_posture\":\"low\",\"risk_brief\":\"normal edit-test loop\",\"mismatch_level\":\"low\",\"mismatch_brief\":\"narrative matches terminal activity\",\"intervention_warranted\":false,\"momentum\":0.72}"
+                            "text": "{\"tactical_state\":\"working\",\"tactical_state_brief\":\"tests are running\",\"progress_state\":\"steady_progress\",\"progress_state_brief\":\"failures are narrowing\",\"momentum_state\":\"steady\",\"momentum_state_brief\":\"reruns keep moving the issue forward\",\"operator_action\":\"watch\",\"operator_action_brief\":\"let the loop continue\",\"terse_operator_summary\":\"Targeted parser reruns are still failing, but the loop is narrowing the issue.\",\"headline\":\"cargo test parser\",\"primary_fragment\":null,\"supporting_fragments\":[],\"alignment_fragment\":null,\"risk_posture\":\"low\",\"risk_brief\":\"normal edit-test loop\",\"mismatch_level\":\"low\",\"mismatch_brief\":\"narrative matches terminal activity\",\"intervention_warranted\":false}"
                         }
                     ]
                 }
@@ -614,17 +824,47 @@ mod tests {
             process_tree_excerpt: None,
             recent_files: vec!["src/parser.rs".into()],
             work_output_excerpt: Some("3 parser failures remain".into()),
+            current_time: Some("now".into()),
             idle_seconds: Some(46),
+            last_update_age: Some("46s ago".into()),
             recent_terminal_activity: vec![
-                "[14:22:01] Now rerunning the parser tests.".into(),
-                "[14:22:03] 3 parser failures remain".into(),
+                "[46s ago] Now rerunning the parser tests.".into(),
+                "[43s ago] 3 parser failures remain".into(),
             ],
             recent_events: vec!["Spawned process 303".into()],
         };
 
         let first = summary_signature(&evidence);
         evidence.idle_seconds = Some(49);
+        evidence.last_update_age = Some("49s ago".into());
+        evidence.recent_terminal_activity = vec![
+            "[49s ago] Now rerunning the parser tests.".into(),
+            "[46s ago] 3 parser failures remain".into(),
+        ];
         assert_eq!(summary_signature(&evidence), first);
+    }
+
+    #[test]
+    fn summary_signature_changes_when_idle_bucket_crosses_threshold() {
+        let mut evidence = TacticalEvidence {
+            session_name: "Parser".into(),
+            task_label: "Fix".into(),
+            dominant_process: None,
+            process_tree_excerpt: None,
+            recent_files: vec![],
+            work_output_excerpt: Some("Quiet after last rerun".into()),
+            current_time: Some("now".into()),
+            idle_seconds: Some(29),
+            last_update_age: Some("29s ago".into()),
+            recent_terminal_activity: vec!["[29s ago] Quiet after last rerun".into()],
+            recent_events: vec![],
+        };
+
+        let first = summary_signature(&evidence);
+        evidence.idle_seconds = Some(30);
+        evidence.last_update_age = Some("30s ago".into());
+        evidence.recent_terminal_activity = vec!["[30s ago] Quiet after last rerun".into()];
+        assert_ne!(summary_signature(&evidence), first);
     }
 
     #[test]
@@ -632,14 +872,57 @@ mod tests {
         let mut evidence = NamingEvidence {
             current_name: "Parser".into(),
             recent_terminal_history: vec![
-                "[09:41:02] • Investigating parser recovery.".into(),
-                "[09:41:18] test parser::recovery::keeps_trailing_tokens ... FAILED".into(),
+                "[46s ago] • Investigating parser recovery.".into(),
+                "[30s ago] test parser::recovery::keeps_trailing_tokens ... FAILED".into(),
             ],
         };
 
         let first = name_signature(&evidence);
         evidence.current_name = "Parser Fix".into();
         assert_ne!(name_signature(&evidence), first);
+    }
+
+    #[test]
+    fn name_signature_ignores_small_relative_timestamp_drift() {
+        let mut evidence = NamingEvidence {
+            current_name: "Parser".into(),
+            recent_terminal_history: vec![
+                "[46s ago] • Investigating parser recovery.".into(),
+                "[30s ago] test parser::recovery::keeps_trailing_tokens ... FAILED".into(),
+            ],
+        };
+
+        let first = name_signature(&evidence);
+        evidence.recent_terminal_history = vec![
+            "[49s ago] • Investigating parser recovery.".into(),
+            "[33s ago] test parser::recovery::keeps_trailing_tokens ... FAILED".into(),
+        ];
+        assert_eq!(name_signature(&evidence), first);
+    }
+
+    #[test]
+    fn nudge_signature_ignores_small_relative_timestamp_drift() {
+        let mut evidence = NudgeEvidence {
+            session_name: "Parser".into(),
+            shell_child_command: Some("codex".into()),
+            idle_seconds: Some(46),
+            tactical_state_brief: Some("Paused after a checkpoint".into()),
+            progress_state_brief: Some("Waiting for a keep-going push".into()),
+            momentum_state_brief: Some("Momentum was good before the pause".into()),
+            terse_operator_summary: Some("Looks paused after a clean checkpoint.".into()),
+            recent_terminal_history: vec![
+                "[46s ago] • Checkpoint complete; ready for the next pass.".into(),
+                "[44s ago] • Waiting for the next instruction.".into(),
+            ],
+        };
+
+        let first = nudge_signature(&evidence);
+        evidence.idle_seconds = Some(49);
+        evidence.recent_terminal_history = vec![
+            "[49s ago] • Checkpoint complete; ready for the next pass.".into(),
+            "[47s ago] • Waiting for the next instruction.".into(),
+        ];
+        assert_eq!(nudge_signature(&evidence), first);
     }
 
     #[test]
@@ -667,7 +950,6 @@ mod tests {
             mismatch_level: MismatchLevel::Low,
             mismatch_brief: Some(" terminal matches plan ".into()),
             intervention_warranted: false,
-            momentum: 4.2,
         }
         .sanitize();
 
@@ -679,7 +961,6 @@ mod tests {
             Some("still narrowing parser failures")
         );
         assert_eq!(summary.supporting_fragments.len(), 2);
-        assert_eq!(summary.momentum, 1.0);
     }
 
     #[test]
@@ -842,7 +1123,9 @@ mod tests {
                     ),
                     recent_files: vec!["src/parser.rs".into(), "tests/parser.rs".into()],
                     work_output_excerpt: Some("2 parser tests still failing".into()),
+                    current_time: Some("now".into()),
                     idle_seconds: Some(3),
+                    last_update_age: Some("3s ago".into()),
                     recent_terminal_activity: vec![
                         "[09:41:02] • I found the next parser breakage: trailing tokens drop after the recovery path.".into(),
                         "[09:41:06] • I’m patching src/parser.rs first, then rerunning the focused parser suite.".into(),
@@ -875,7 +1158,9 @@ mod tests {
                     process_tree_excerpt: Some("bash [S] pid=510 | claude [S] pid=522".into()),
                     recent_files: vec!["src/ui/focus.rs".into(), "tests/focus_mode.rs".into()],
                     work_output_excerpt: Some("Checkpoint complete; ready to continue with the next pass".into()),
+                    current_time: Some("now".into()),
                     idle_seconds: Some(84),
+                    last_update_age: Some("84s ago".into()),
                     recent_terminal_activity: vec![
                         "[11:02:09] • I fixed the stuck focus path and the focused terminal now accepts Return again.".into(),
                         "[11:02:13] • Verified with cargo test plus a manual smoke pass.".into(),
@@ -910,7 +1195,9 @@ mod tests {
                     ),
                     recent_files: vec![],
                     work_output_excerpt: Some("Proceed with deploy? [y/N]".into()),
+                    current_time: Some("now".into()),
                     idle_seconds: Some(18),
+                    last_update_age: Some("18s ago".into()),
                     recent_terminal_activity: vec![
                         "[10:04:52] • I finished the deploy dry run and the next step would update production.".into(),
                         "[10:04:58] • I’m checking whether you want me to cross that boundary now.".into(),
@@ -943,7 +1230,9 @@ mod tests {
                     ),
                     recent_files: vec!["src/ui.rs".into()],
                     work_output_excerpt: Some("error[E0599]: no method named present on FocusHandle".into()),
+                    current_time: Some("now".into()),
                     idle_seconds: Some(4),
+                    last_update_age: Some("4s ago".into()),
                     recent_terminal_activity: vec![
                         "[13:04:11] • I think the next failure is still the focus handoff, so I’m trying another narrow fix.".into(),
                         "[13:04:17] $ cargo test focus_mode -- --nocapture".into(),
@@ -979,7 +1268,9 @@ mod tests {
                     process_tree_excerpt: Some("bash [S] pid=801 | codex [S] pid=802".into()),
                     recent_files: vec!["src/config.rs".into(), "tests/config.rs".into()],
                     work_output_excerpt: Some("Stable. Standing by.".into()),
+                    current_time: Some("now".into()),
                     idle_seconds: Some(97),
+                    last_update_age: Some("97s ago".into()),
                     recent_terminal_activity: vec![
                         "[14:21:02] • I reran the last validation pass and it stayed green.".into(),
                         "[14:21:08] • Stable. Standing by.".into(),
@@ -1014,7 +1305,9 @@ mod tests {
                     ),
                     recent_files: vec!["src/ui.rs".into(), "src/model.rs".into()],
                     work_output_excerpt: Some("I can keep going with blind edits if you want".into()),
+                    current_time: Some("now".into()),
                     idle_seconds: Some(11),
+                    last_update_age: Some("11s ago".into()),
                     recent_terminal_activity: vec![
                         "[12:44:01] • I haven’t fully verified the failure path yet.".into(),
                         "[12:44:08] • I can keep going with blind edits, but take the current state with a grain of salt.".into(),
@@ -1047,7 +1340,9 @@ mod tests {
                     ),
                     recent_files: vec![],
                     work_output_excerpt: Some("No space left on device".into()),
+                    current_time: Some("now".into()),
                     idle_seconds: Some(7),
+                    last_update_age: Some("7s ago".into()),
                     recent_terminal_activity: vec![
                         "[15:18:01] npm ERR! nospc ENOSPC: no space left on device".into(),
                         "[15:18:08] • I’m blocked on disk space and the build keeps failing immediately.".into(),

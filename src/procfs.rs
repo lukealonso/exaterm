@@ -35,6 +35,11 @@ pub fn dominant_child_command(root_pid: u32) -> io::Result<Option<String>> {
     Ok(dominant_child_command_from_entries(&entries, root_pid))
 }
 
+pub fn direct_child_command(root_pid: u32) -> io::Result<Option<String>> {
+    let entries = read_process_table("/proc")?;
+    Ok(direct_child_command_from_entries(&entries, root_pid))
+}
+
 fn dominant_child_command_from_entries(
     entries: &BTreeMap<u32, ProcessEntry>,
     root_pid: u32,
@@ -63,6 +68,33 @@ fn dominant_child_command_from_entries(
             for child in child_pids.iter().rev() {
                 stack.push(*child);
             }
+        }
+    }
+
+    None
+}
+
+fn direct_child_command_from_entries(
+    entries: &BTreeMap<u32, ProcessEntry>,
+    root_pid: u32,
+) -> Option<String> {
+    let Some(root) = entries.get(&root_pid) else {
+        return None;
+    };
+
+    let mut child_pids = entries
+        .values()
+        .filter(|entry| entry.ppid == root.pid)
+        .map(|entry| entry.pid)
+        .collect::<Vec<_>>();
+    child_pids.sort_unstable();
+
+    for pid in child_pids {
+        let Some(entry) = entries.get(&pid) else {
+            continue;
+        };
+        if is_significant_command(&entry.command) {
+            return Some(entry.command.clone());
         }
     }
 
@@ -150,7 +182,8 @@ fn is_significant_command(command: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        dominant_child_command_from_entries, format_process_tree, parse_stat_line, ProcessEntry,
+        direct_child_command_from_entries, dominant_child_command_from_entries, format_process_tree,
+        parse_stat_line, ProcessEntry,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -254,6 +287,44 @@ mod tests {
         assert_eq!(
             dominant_child_command_from_entries(&entries, 101),
             Some("cargo".into())
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn picks_first_significant_direct_child_command() {
+        let root = tempdir_path("exaterm-procfs-direct");
+        fs::create_dir_all(root.join("101")).expect("root proc dir");
+        fs::create_dir_all(root.join("202")).expect("wrapper child dir");
+        fs::create_dir_all(root.join("303")).expect("agent child dir");
+        fs::create_dir_all(root.join("404")).expect("nested tool dir");
+        fs::write(
+            root.join("101").join("stat"),
+            "101 (bash) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 1 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0",
+        )
+        .expect("write root stat");
+        fs::write(
+            root.join("202").join("stat"),
+            "202 (bash) S 101 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 1 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0",
+        )
+        .expect("write wrapper stat");
+        fs::write(
+            root.join("303").join("stat"),
+            "303 (codex) S 101 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 1 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0",
+        )
+        .expect("write direct agent stat");
+        fs::write(
+            root.join("404").join("stat"),
+            "404 (cargo) R 202 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 1 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0",
+        )
+        .expect("write nested tool stat");
+
+        let entries = super::read_process_table(root.to_str().expect("utf8 path"))
+            .expect("table should read");
+        assert_eq!(
+            direct_child_command_from_entries(&entries, 101),
+            Some("codex".into())
         );
 
         let _ = fs::remove_dir_all(root);

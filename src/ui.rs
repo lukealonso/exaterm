@@ -1,6 +1,12 @@
 use crate::model::{
-    SessionId, SessionKind, SessionLaunch, WorkspaceState,
+    SessionId, SessionLaunch, WorkspaceState,
 };
+use crate::observation::{
+    apply_stream_update, build_naming_evidence, build_nudge_evidence, build_tactical_evidence,
+    effective_display_name, refresh_observation as refresh_session_observation,
+    scrollback_fragments, SessionObservation,
+};
+use crate::runtime::{spawn_runtime, terminal_size_hint, RuntimeEvent, SessionRuntime};
 use crate::synthesis::{
     name_signature, nudge_signature, suggest_name_blocking, suggest_nudge_blocking,
     summary_signature, summarize_blocking, MismatchLevel, MomentumState, NameSuggestion,
@@ -11,20 +17,16 @@ use crate::synthesis::{
 use crate::supervision::{
     build_battle_card, BattleCardStatus, DeterministicIntentEngine, ObservedActivity, SignalTone,
 };
-use crate::terminal_stream::TerminalStreamProcessor;
 use gtk::gdk;
 use gtk::prelude::*;
 use libadwaita as adw;
-use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
+use portable_pty::PtySize;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::fs;
-use std::io::{Read, Write};
 use std::fs::File;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::path::{Path, PathBuf};
+use std::io::Write;
+use std::os::fd::AsRawFd;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -33,8 +35,6 @@ use vte4 as vte;
 
 const APP_ID: &str = "io.exaterm.Exaterm";
 
-const DEFAULT_PROXY_ROWS: u16 = 40;
-const DEFAULT_PROXY_COLS: u16 = 160;
 const ESTIMATED_TERMINAL_CELL_WIDTH: i32 = 8;
 const ESTIMATED_TERMINAL_CELL_HEIGHT: i32 = 18;
 const MIN_EMBEDDED_TERMINAL_COLS: i32 = 80;
@@ -72,45 +72,6 @@ struct SessionCardWidgets {
     risk_bar: SegmentedBarWidgets,
     terminal_view: gtk::ScrolledWindow,
     terminal: vte::Terminal,
-}
-
-struct SessionObservation {
-    last_change: Instant,
-    recent_lines: Vec<String>,
-    terminal_activity: Vec<TerminalActivityEntry>,
-    painted_line: Option<String>,
-    shell_child_command: Option<String>,
-    active_command: Option<String>,
-    dominant_process: Option<String>,
-    process_tree_excerpt: Option<String>,
-    recent_files: Vec<String>,
-    recent_file_activity: BTreeMap<String, Instant>,
-    work_output_excerpt: Option<String>,
-    file_fingerprints: BTreeMap<PathBuf, (u64, u64)>,
-}
-
-struct TerminalActivityEntry {
-    at: Instant,
-    text: String,
-}
-
-impl SessionObservation {
-    fn new() -> Self {
-        Self {
-            last_change: Instant::now(),
-            recent_lines: Vec::new(),
-            terminal_activity: Vec::new(),
-            painted_line: None,
-            shell_child_command: None,
-            active_command: None,
-            dominant_process: None,
-            process_tree_excerpt: None,
-            recent_files: Vec::new(),
-            recent_file_activity: BTreeMap::new(),
-            work_output_excerpt: None,
-            file_fingerprints: BTreeMap::new(),
-        }
-    }
 }
 
 struct SummaryWorker {
@@ -192,24 +153,6 @@ struct NudgeCacheEntry {
     last_attempt: Option<Instant>,
     last_sent: Option<Instant>,
     in_flight: bool,
-}
-
-struct SessionRuntime {
-    resize_target: Arc<Mutex<Box<dyn MasterPty + Send>>>,
-    display_resize_target: Option<Arc<Mutex<File>>>,
-    input_writer: Option<Arc<Mutex<File>>>,
-    events: mpsc::Receiver<RuntimeEvent>,
-    last_size: Option<(u16, u16)>,
-}
-
-enum RuntimeEvent {
-    Stream(StreamRuntimeUpdate),
-    Exited(i32),
-}
-
-struct StreamRuntimeUpdate {
-    semantic_lines: Vec<String>,
-    painted_line: Option<String>,
 }
 
 impl SummaryCacheEntry {
@@ -1365,11 +1308,7 @@ fn spawn_session(
     terminal: &vte::Terminal,
 ) {
     let size = terminal_size_hint(terminal);
-    let runtime = match if direct_pty_mode_enabled() {
-        spawn_direct_runtime(terminal, launch, size)
-    } else {
-        spawn_proxy_runtime(terminal, launch, size)
-    } {
+    let runtime = match spawn_runtime(terminal, launch, size) {
         Ok(runtime) => runtime,
         Err(error) => {
             eprintln!("failed to spawn session {session_id:?}: {error}");
@@ -1389,437 +1328,6 @@ fn spawn_session(
         .borrow_mut()
         .insert(session_id, runtime.session_runtime);
     refresh_runtime_and_cards(context);
-}
-
-struct ProxySpawnResult {
-    pid: Option<u32>,
-    session_runtime: SessionRuntime,
-}
-
-fn direct_pty_mode_enabled() -> bool {
-    std::env::var("EXATERM_DIRECT_PTY")
-        .ok()
-        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes"))
-}
-
-fn spawn_direct_runtime(
-    terminal: &vte::Terminal,
-    launch: &SessionLaunch,
-    size: PtySize,
-) -> Result<ProxySpawnResult, String> {
-    let pty_system = native_pty_system();
-    let pair = pty_system
-        .openpty(size)
-        .map_err(|error| format!("failed to create agent pty: {error}"))?;
-
-    let argv_owned = launch.argv();
-    let mut builder = CommandBuilder::new(&argv_owned[0]);
-    for arg in argv_owned.iter().skip(1) {
-        builder.arg(arg);
-    }
-    if let Some(cwd) = launch.cwd.as_ref() {
-        builder.cwd(cwd);
-    }
-
-    let child = pair
-        .slave
-        .spawn_command(builder)
-        .map_err(|error| format!("failed to spawn command: {error}"))?;
-    drop(pair.slave);
-
-    let pid = child.process_id();
-    let Some(master_fd) = pair.master.as_raw_fd() else {
-        return Err("agent pty master did not expose a file descriptor".into());
-    };
-    let foreign_fd = unsafe { libc::dup(master_fd) };
-    let input_fd = unsafe { libc::dup(master_fd) };
-    if foreign_fd < 0 || input_fd < 0 {
-        unsafe {
-            if foreign_fd >= 0 {
-                libc::close(foreign_fd);
-            }
-            if input_fd >= 0 {
-                libc::close(input_fd);
-            }
-        }
-        return Err(std::io::Error::last_os_error().to_string());
-    }
-    let master = unsafe { OwnedFd::from_raw_fd(foreign_fd) };
-    let input_writer = unsafe { File::from_raw_fd(input_fd) };
-    let pty = vte::Pty::foreign_sync(master, None::<&gio::Cancellable>)
-        .map_err(|error| error.to_string())?;
-    terminal.set_pty(Some(&pty));
-
-    let resize_target = Arc::new(Mutex::new(pair.master));
-    let (event_tx, event_rx) = mpsc::channel::<RuntimeEvent>();
-    let stop_flag = Arc::new(AtomicBool::new(false));
-    spawn_wait_thread(child, event_tx, stop_flag);
-
-    Ok(ProxySpawnResult {
-        pid,
-        session_runtime: SessionRuntime {
-            resize_target,
-            display_resize_target: None,
-            input_writer: Some(Arc::new(Mutex::new(input_writer))),
-            events: event_rx,
-            last_size: Some((size.rows, size.cols)),
-        },
-    })
-}
-
-fn spawn_proxy_runtime(
-    terminal: &vte::Terminal,
-    launch: &SessionLaunch,
-    size: PtySize,
-) -> Result<ProxySpawnResult, String> {
-    let pty_system = native_pty_system();
-    let pair = pty_system
-        .openpty(size)
-        .map_err(|error| format!("failed to create agent pty: {error}"))?;
-
-    let argv_owned = launch.argv();
-    let mut builder = CommandBuilder::new(&argv_owned[0]);
-    for arg in argv_owned.iter().skip(1) {
-        builder.arg(arg);
-    }
-    if let Some(cwd) = launch.cwd.as_ref() {
-        builder.cwd(cwd);
-    }
-
-    let child = pair
-        .slave
-        .spawn_command(builder)
-        .map_err(|error| format!("failed to spawn command: {error}"))?;
-    drop(pair.slave);
-
-    let pid = child.process_id();
-    let Some(agent_master_fd) = pair.master.as_raw_fd() else {
-        return Err("agent pty master did not expose a file descriptor".into());
-    };
-    let agent_reader_fd = unsafe { libc::dup(agent_master_fd) };
-    let agent_writer_fd = unsafe { libc::dup(agent_master_fd) };
-    let input_writer_fd = unsafe { libc::dup(agent_master_fd) };
-    if agent_reader_fd < 0 || agent_writer_fd < 0 || input_writer_fd < 0 {
-        unsafe {
-            if agent_reader_fd >= 0 {
-                libc::close(agent_reader_fd);
-            }
-            if agent_writer_fd >= 0 {
-                libc::close(agent_writer_fd);
-            }
-            if input_writer_fd >= 0 {
-                libc::close(input_writer_fd);
-            }
-        }
-        return Err(std::io::Error::last_os_error().to_string());
-    }
-    let mut agent_reader = unsafe { File::from_raw_fd(agent_reader_fd) };
-    let mut agent_writer = unsafe { File::from_raw_fd(agent_writer_fd) };
-    let input_writer = unsafe { File::from_raw_fd(input_writer_fd) };
-    let resize_target = Arc::new(Mutex::new(pair.master));
-    let (display_pty, mut display_reader, mut display_writer, display_resizer) =
-        create_display_pty(size)?;
-    terminal.set_pty(Some(&display_pty));
-
-    let (event_tx, event_rx) = mpsc::channel::<RuntimeEvent>();
-    let stop_flag = Arc::new(AtomicBool::new(false));
-
-    spawn_proxy_relay_thread(
-        &mut agent_reader,
-        &mut agent_writer,
-        &mut display_reader,
-        &mut display_writer,
-        event_tx.clone(),
-        stop_flag.clone(),
-    );
-    spawn_wait_thread(child, event_tx, stop_flag);
-
-    Ok(ProxySpawnResult {
-        pid,
-        session_runtime: SessionRuntime {
-            resize_target,
-            display_resize_target: Some(Arc::new(Mutex::new(display_resizer))),
-            input_writer: Some(Arc::new(Mutex::new(input_writer))),
-            events: event_rx,
-            last_size: Some((size.rows, size.cols)),
-        },
-    })
-}
-
-fn spawn_proxy_relay_thread(
-    agent_reader: &mut File,
-    agent_writer: &mut File,
-    display_reader: &mut File,
-    display_writer: &mut File,
-    event_tx: mpsc::Sender<RuntimeEvent>,
-    stop_flag: Arc<AtomicBool>,
-) {
-    const RELAY_BUF_SIZE: usize = 16 * 1024;
-    let mut agent_reader = agent_reader
-        .try_clone()
-        .expect("agent reader clone should succeed");
-    let mut agent_writer = agent_writer
-        .try_clone()
-        .expect("agent writer clone should succeed");
-    let mut display_reader = display_reader
-        .try_clone()
-        .expect("display reader clone should succeed");
-    let mut display_writer = display_writer
-        .try_clone()
-        .expect("display slave writer clone should succeed");
-
-    set_nonblocking(agent_reader.as_raw_fd()).expect("agent reader should support nonblocking");
-    set_nonblocking(agent_writer.as_raw_fd()).expect("agent writer should support nonblocking");
-    set_nonblocking(display_reader.as_raw_fd()).expect("display reader should support nonblocking");
-    set_nonblocking(display_writer.as_raw_fd()).expect("display writer should support nonblocking");
-
-    thread::spawn(move || {
-        let mut processor = TerminalStreamProcessor::default();
-        let mut to_display = Vec::<u8>::with_capacity(RELAY_BUF_SIZE);
-        let mut to_agent = Vec::<u8>::with_capacity(RELAY_BUF_SIZE);
-        let mut scratch = [0u8; 8192];
-
-        loop {
-            let mut fds = [
-                libc::pollfd {
-                    fd: display_reader.as_raw_fd(),
-                    events: if to_agent.len() < RELAY_BUF_SIZE {
-                        libc::POLLIN
-                    } else {
-                        0
-                    },
-                    revents: 0,
-                },
-                libc::pollfd {
-                    fd: display_writer.as_raw_fd(),
-                    events: if to_display.is_empty() {
-                        0
-                    } else {
-                        libc::POLLOUT
-                    },
-                    revents: 0,
-                },
-                libc::pollfd {
-                    fd: agent_reader.as_raw_fd(),
-                    events: if to_display.len() < RELAY_BUF_SIZE {
-                        libc::POLLIN
-                    } else {
-                        0
-                    },
-                    revents: 0,
-                },
-                libc::pollfd {
-                    fd: agent_writer.as_raw_fd(),
-                    events: if to_agent.is_empty() {
-                        0
-                    } else {
-                        libc::POLLOUT
-                    },
-                    revents: 0,
-                },
-            ];
-
-            let poll_result = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
-            if poll_result < 0 {
-                let error = std::io::Error::last_os_error();
-                if error.kind() == std::io::ErrorKind::Interrupted {
-                    continue;
-                }
-                break;
-            }
-
-            if (fds[0].revents | fds[1].revents | fds[2].revents | fds[3].revents)
-                & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)
-                != 0
-            {
-                break;
-            }
-
-            if fds[0].revents & libc::POLLIN != 0 {
-                let remaining = RELAY_BUF_SIZE.saturating_sub(to_agent.len());
-                let read_len = remaining.min(scratch.len());
-                match display_reader.read(&mut scratch[..read_len]) {
-                    Ok(0) => break,
-                    Ok(n) => to_agent.extend_from_slice(&scratch[..n]),
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                    Err(_) => break,
-                }
-            }
-
-            if fds[2].revents & libc::POLLIN != 0 {
-                let remaining = RELAY_BUF_SIZE.saturating_sub(to_display.len());
-                let read_len = remaining.min(scratch.len());
-                match agent_reader.read(&mut scratch[..read_len]) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        let chunk = &scratch[..n];
-                        to_display.extend_from_slice(chunk);
-                        let update = processor.ingest(chunk);
-                        if !update.is_empty() || !chunk.is_empty() {
-                            let _ = event_tx.send(RuntimeEvent::Stream(StreamRuntimeUpdate {
-                                semantic_lines: update.semantic_lines,
-                                painted_line: update.painted_line,
-                            }));
-                        }
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                    Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
-                    Err(_) => break,
-                }
-            }
-
-            if fds[1].revents & libc::POLLOUT != 0 && !to_display.is_empty() {
-                match display_writer.write(&to_display) {
-                    Ok(0) => break,
-                    Ok(n) => consume_relay_buffer(&mut to_display, n),
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                    Err(_) => break,
-                }
-            }
-
-            if fds[3].revents & libc::POLLOUT != 0 && !to_agent.is_empty() {
-                match agent_writer.write(&to_agent) {
-                    Ok(0) => break,
-                    Ok(n) => consume_relay_buffer(&mut to_agent, n),
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                    Err(_) => break,
-                }
-            }
-        }
-        stop_flag.store(true, Ordering::Relaxed);
-    });
-}
-
-fn consume_relay_buffer(buffer: &mut Vec<u8>, amount: usize) {
-    if amount == 0 || amount > buffer.len() {
-        return;
-    }
-    buffer.drain(0..amount);
-}
-
-fn create_display_pty(size: PtySize) -> Result<(vte::Pty, File, File, File), String> {
-    let mut master_fd = -1;
-    let mut slave_fd = -1;
-    let mut winsize = libc::winsize {
-        ws_row: size.rows,
-        ws_col: size.cols,
-        ws_xpixel: size.pixel_width,
-        ws_ypixel: size.pixel_height,
-    };
-    let result = unsafe {
-        libc::openpty(
-            &mut master_fd,
-            &mut slave_fd,
-            std::ptr::null_mut(),
-            std::ptr::null(),
-            &mut winsize,
-        )
-    };
-    if result != 0 {
-        return Err(format!(
-            "failed to create display pty: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-
-    if let Err(error) = set_raw_display_slave(slave_fd) {
-        unsafe {
-            libc::close(master_fd);
-            libc::close(slave_fd);
-        }
-        return Err(format!("failed to configure display pty: {error}"));
-    }
-
-    let reader_fd = unsafe { libc::dup(slave_fd) };
-    let writer_fd = unsafe { libc::dup(slave_fd) };
-    let resize_fd = unsafe { libc::dup(master_fd) };
-    if reader_fd < 0 || writer_fd < 0 || resize_fd < 0 {
-        unsafe {
-            if reader_fd >= 0 {
-                libc::close(reader_fd);
-            }
-            if writer_fd >= 0 {
-                libc::close(writer_fd);
-            }
-            if resize_fd >= 0 {
-                libc::close(resize_fd);
-            }
-            libc::close(master_fd);
-            libc::close(slave_fd);
-        }
-        return Err(std::io::Error::last_os_error().to_string());
-    }
-
-    unsafe {
-        libc::close(slave_fd);
-    }
-
-    let master = unsafe { OwnedFd::from_raw_fd(master_fd) };
-    let reader = unsafe { File::from_raw_fd(reader_fd) };
-    let writer = unsafe { File::from_raw_fd(writer_fd) };
-    let resizer = unsafe { File::from_raw_fd(resize_fd) };
-    let pty = vte::Pty::foreign_sync(master, None::<&gio::Cancellable>)
-        .map_err(|error| error.to_string())?;
-    Ok((pty, reader, writer, resizer))
-}
-
-fn set_raw_display_slave(fd: i32) -> std::io::Result<()> {
-    let mut termios = unsafe { std::mem::zeroed::<libc::termios>() };
-    if unsafe { libc::tcgetattr(fd, &mut termios) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    unsafe {
-        libc::cfmakeraw(&mut termios);
-    }
-    termios.c_cc[libc::VMIN] = 1;
-    termios.c_cc[libc::VTIME] = 0;
-    if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &termios) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-fn set_nonblocking(fd: i32) -> std::io::Result<()> {
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-fn spawn_wait_thread(
-    mut child: Box<dyn portable_pty::Child + Send + Sync>,
-    event_tx: mpsc::Sender<RuntimeEvent>,
-    stop_flag: Arc<AtomicBool>,
-) {
-    thread::spawn(move || {
-        let exit_code = child
-            .wait()
-            .map(|status| status.exit_code() as i32)
-            .unwrap_or(-1);
-        stop_flag.store(true, Ordering::Relaxed);
-        let _ = event_tx.send(RuntimeEvent::Exited(exit_code));
-    });
-}
-
-fn terminal_size_hint(terminal: &vte::Terminal) -> PtySize {
-    let rows = match terminal.row_count() {
-        rows if rows > 0 => rows as u16,
-        _ => DEFAULT_PROXY_ROWS,
-    };
-    let cols = match terminal.column_count() {
-        cols if cols > 0 => cols as u16,
-        _ => DEFAULT_PROXY_COLS,
-    };
-    PtySize {
-        rows,
-        cols,
-        pixel_width: 0,
-        pixel_height: 0,
-    }
 }
 
 fn spawn_summary_worker() -> Option<SummaryWorker> {
@@ -1989,17 +1497,7 @@ fn drain_runtime_events(context: &Rc<AppContext>) {
                 let observation = observations
                     .entry(session_id)
                     .or_insert_with(SessionObservation::new);
-                append_recent_lines(&mut observation.recent_lines, &update.semantic_lines);
-                append_terminal_activity(&mut observation.terminal_activity, &update.semantic_lines);
-                if let Some(painted_line) = update.painted_line {
-                    let changed = observation.painted_line.as_ref() != Some(&painted_line);
-                    observation.painted_line = Some(painted_line);
-                    if changed {
-                        observation.last_change = Instant::now();
-                    }
-                } else if !update.semantic_lines.is_empty() && observation.painted_line.is_none() {
-                    observation.last_change = Instant::now();
-                }
+                apply_stream_update(observation, update);
             }
             RuntimeEvent::Exited(exit_code) => {
                 context.state.borrow_mut().mark_exited(session_id, exit_code);
@@ -2141,70 +1639,11 @@ fn drain_summary_results(context: &Rc<AppContext>) {
 
 fn refresh_observation(context: &Rc<AppContext>, session: &crate::model::SessionRecord) {
     let remote_mode = matches!(context.mode, RunMode::Ssh { .. });
-    let shell_child_command = if remote_mode {
-        None
-    } else {
-        session.pid.and_then(read_shell_child_command)
-    };
-    let dominant_process = if remote_mode {
-        None
-    } else {
-        session.pid.and_then(read_dominant_process_hint)
-    };
-    let process_tree_excerpt = if remote_mode {
-        None
-    } else {
-        session.pid.and_then(read_process_tree_hint)
-    };
-
     let mut observations = context.observations.borrow_mut();
     let observation = observations
         .entry(session.id)
         .or_insert_with(SessionObservation::new);
-    let active_command = infer_active_command_from_lines(&observation.recent_lines)
-        .or(shell_child_command.clone())
-        .or(dominant_process.clone())
-        .or_else(|| launch_command_hint(&session.launch));
-    observation.shell_child_command = shell_child_command;
-    observation.dominant_process = dominant_process;
-    observation.active_command = active_command;
-    observation.process_tree_excerpt = process_tree_excerpt;
-    observation.work_output_excerpt = observation.painted_line.clone().or_else(|| {
-        observation
-            .recent_lines
-            .iter()
-            .rev()
-            .find(|line| is_meaningful_output_line(line))
-            .cloned()
-    });
-    let changed_files = if remote_mode {
-        Vec::new()
-    } else {
-        session
-            .launch
-            .cwd
-            .as_deref()
-            .map(|cwd| scan_recent_files(cwd, &mut observation.file_fingerprints))
-            .unwrap_or_default()
-    };
-    let now = Instant::now();
-    for file in changed_files {
-        observation.recent_file_activity.insert(file, now);
-    }
-    observation
-        .recent_file_activity
-        .retain(|_, seen_at| seen_at.elapsed() <= Duration::from_secs(12));
-    let mut recent_files = observation
-        .recent_file_activity
-        .iter()
-        .map(|(path, seen_at)| (path.clone(), *seen_at))
-        .collect::<Vec<_>>();
-    recent_files.sort_by_key(|(_, seen_at)| std::cmp::Reverse(*seen_at));
-    observation.recent_files = recent_files
-        .into_iter()
-        .map(|(path, _)| path)
-        .take(2)
-        .collect();
+    refresh_session_observation(observation, session, remote_mode);
 }
 
 fn update_battle_card_widgets(context: &Rc<AppContext>, session: &crate::model::SessionRecord) {
@@ -2229,7 +1668,7 @@ fn update_battle_card_widgets(context: &Rc<AppContext>, session: &crate::model::
         &observation.recent_lines,
         &DeterministicIntentEngine,
     );
-    let evidence = build_tactical_evidence(session, observation, &card_model);
+    let evidence = build_tactical_evidence(session, observation);
     maybe_queue_summary(context, session.id, &evidence);
     let naming = build_naming_evidence(session, observation);
     maybe_queue_name(context, session.id, &naming);
@@ -2239,7 +1678,7 @@ fn update_battle_card_widgets(context: &Rc<AppContext>, session: &crate::model::
         card_model = apply_tactical_synthesis(card_model, summary);
     }
 
-    let display_name = effective_display_name(session, observation);
+    let display_name = effective_display_name(session);
     card.title.set_label(&display_name);
     apply_battle_status_style(&card.status, card_model.status);
     apply_battle_card_surface_style(&card.frame, card_model.status);
@@ -2279,133 +1718,6 @@ fn update_battle_card_widgets(context: &Rc<AppContext>, session: &crate::model::
     card.alert.set_visible(!operator_summary.is_empty());
     card.nudge_row.set_visible(true);
     apply_nudge_pill(&context.nudge_cache.borrow(), session.id, &card.nudge_state);
-}
-
-fn build_tactical_evidence(
-    session: &crate::model::SessionRecord,
-    observation: &SessionObservation,
-    _card_model: &crate::supervision::BattleCardViewModel,
-) -> TacticalEvidence {
-    TacticalEvidence {
-        session_name: effective_display_name(session, observation),
-        task_label: session.launch.subtitle.clone(),
-        dominant_process: observation.dominant_process.clone(),
-        process_tree_excerpt: observation.process_tree_excerpt.clone(),
-        recent_files: observation.recent_files.clone(),
-        work_output_excerpt: observation.painted_line.clone(),
-        current_time: Some(relative_now_label()),
-        idle_seconds: Some(observation.last_change.elapsed().as_secs()),
-        last_update_age: Some(relative_age_label(observation.last_change.elapsed())),
-        recent_terminal_activity: synthesis_terminal_activity(observation),
-        recent_events: session
-            .events
-            .iter()
-            .rev()
-            .filter(|event| is_runtime_event(&event.summary))
-            .take(4)
-            .map(|event| event.summary.clone())
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect(),
-    }
-}
-
-fn build_naming_evidence(
-    session: &crate::model::SessionRecord,
-    observation: &SessionObservation,
-) -> NamingEvidence {
-    NamingEvidence {
-        current_name: session.display_name.clone().unwrap_or_default(),
-        recent_terminal_history: naming_terminal_history(observation),
-    }
-}
-
-fn build_nudge_evidence(
-    session: &crate::model::SessionRecord,
-    observation: &SessionObservation,
-    summary: &TacticalSynthesis,
-) -> NudgeEvidence {
-    NudgeEvidence {
-        session_name: effective_display_name(session, observation),
-        shell_child_command: observation.shell_child_command.clone(),
-        idle_seconds: Some(observation.last_change.elapsed().as_secs()),
-        tactical_state_brief: summary.tactical_state_brief.clone(),
-        progress_state_brief: summary.progress_state_brief.clone(),
-        momentum_state_brief: summary.momentum_state_brief.clone(),
-        terse_operator_summary: summary.terse_operator_summary.clone(),
-        recent_terminal_history: nudge_terminal_history(observation),
-    }
-}
-
-fn synthesis_terminal_activity(observation: &SessionObservation) -> Vec<String> {
-    const SUMMARY_ACTIVITY_HISTORY_WINDOW: usize = 100;
-
-    let mut entries = Vec::new();
-    let now = Instant::now();
-
-    entries.extend(
-        observation
-            .terminal_activity
-            .iter()
-            .rev()
-            .take(SUMMARY_ACTIVITY_HISTORY_WINDOW)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .map(|entry| format_terminal_activity_entry(entry, now)),
-    );
-
-    if let Some(painted) = observation.painted_line.as_deref() {
-        let trimmed = painted.trim();
-        if !trimmed.is_empty() {
-            entries.push(format!("[most recent updated line] {trimmed}"));
-        }
-    }
-
-    entries
-}
-
-fn naming_terminal_history(observation: &SessionObservation) -> Vec<String> {
-    let now = Instant::now();
-    observation
-        .terminal_activity
-        .iter()
-        .rev()
-        .take(80)
-        .map(|entry| format_terminal_activity_entry(entry, now))
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect()
-}
-
-fn nudge_terminal_history(observation: &SessionObservation) -> Vec<String> {
-    let now = Instant::now();
-    observation
-        .terminal_activity
-        .iter()
-        .rev()
-        .take(120)
-        .map(|entry| format_terminal_activity_entry(entry, now))
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect()
-}
-
-fn scrollback_fragments(observation: &SessionObservation) -> Vec<String> {
-    observation
-        .recent_lines
-        .iter()
-        .rev()
-        .map(|line| line.trim().to_string())
-        .filter(|line| !line.is_empty())
-        .take(3)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect()
 }
 
 fn maybe_queue_summary(context: &Rc<AppContext>, session_id: SessionId, evidence: &TacticalEvidence) {
@@ -3048,7 +2360,7 @@ fn refresh_focus_panel(context: &Rc<AppContext>) {
         &observation.recent_lines,
         &DeterministicIntentEngine,
     );
-    let evidence = build_tactical_evidence(session, observation, &card_model);
+    let evidence = build_tactical_evidence(session, observation);
     let live_summary = current_summary(context, session_id, &evidence);
     if let Some(summary) = live_summary.clone() {
         card_model = apply_tactical_synthesis(card_model, summary);
@@ -3057,7 +2369,7 @@ fn refresh_focus_panel(context: &Rc<AppContext>) {
     context
         .focus
         .title
-        .set_label(&effective_display_name(session, observation));
+        .set_label(&effective_display_name(session));
     apply_battle_status_style(&context.focus.status, card_model.status);
     apply_battle_card_surface_style(&context.focus.frame, card_model.status);
     context
@@ -3262,206 +2574,6 @@ fn reparent_widget_to_box<W: IsA<gtk::Widget>>(widget: &W, target: &gtk::Box) {
         }
     }
     target.append(widget);
-}
-
-fn scan_recent_files(root: &Path, fingerprints: &mut BTreeMap<PathBuf, (u64, u64)>) -> Vec<String> {
-    let mut current = BTreeMap::new();
-    let mut changed = Vec::new();
-    collect_file_changes(root, root, fingerprints, &mut current, &mut changed);
-    *fingerprints = current;
-    changed.truncate(2);
-    changed
-}
-
-fn collect_file_changes(
-    root: &Path,
-    path: &Path,
-    previous: &BTreeMap<PathBuf, (u64, u64)>,
-    current: &mut BTreeMap<PathBuf, (u64, u64)>,
-    changed: &mut Vec<String>,
-) {
-    let Ok(entries) = fs::read_dir(path) else {
-        return;
-    };
-
-    for entry in entries.flatten() {
-        let entry_path = entry.path();
-        let Ok(metadata) = entry.metadata() else {
-            continue;
-        };
-
-        if metadata.is_dir() {
-            collect_file_changes(root, &entry_path, previous, current, changed);
-            continue;
-        }
-
-        let modified = metadata
-            .modified()
-            .ok()
-            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|duration| duration.as_secs())
-            .unwrap_or_default();
-        let signature = (modified, metadata.len());
-        current.insert(entry_path.clone(), signature);
-
-        let changed_now = previous
-            .get(&entry_path)
-            .map(|existing| *existing != signature)
-            .unwrap_or(true);
-
-        if changed_now {
-            if let Ok(relative) = entry_path.strip_prefix(root) {
-                changed.push(relative.display().to_string());
-            }
-        }
-    }
-}
-
-fn append_recent_lines(recent_lines: &mut Vec<String>, candidate_lines: &[String]) {
-    for line in candidate_lines {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if recent_lines
-            .last()
-            .is_some_and(|existing| existing == trimmed)
-        {
-            continue;
-        }
-        recent_lines.push(trimmed.to_string());
-    }
-
-    const MAX_RECENT_LINES_WINDOW: usize = 24;
-    if recent_lines.len() > MAX_RECENT_LINES_WINDOW {
-        let extra = recent_lines.len() - MAX_RECENT_LINES_WINDOW;
-        recent_lines.drain(0..extra);
-    }
-}
-
-fn append_terminal_activity(activity: &mut Vec<TerminalActivityEntry>, candidate_lines: &[String]) {
-    if candidate_lines.is_empty() {
-        return;
-    }
-
-    let trailing_payloads = activity
-        .iter()
-        .rev()
-        .take(candidate_lines.len())
-        .map(|entry| entry.text.clone())
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<Vec<_>>();
-
-    if trailing_payloads == candidate_lines {
-        return;
-    }
-
-    for line in candidate_lines {
-        activity.push(TerminalActivityEntry {
-            at: Instant::now(),
-            text: line.trim().to_string(),
-        });
-    }
-
-    const MAX_ACTIVITY_LINES: usize = 320;
-    if activity.len() > MAX_ACTIVITY_LINES {
-        let extra = activity.len() - MAX_ACTIVITY_LINES;
-        activity.drain(0..extra);
-    }
-}
-
-fn effective_display_name(
-    session: &crate::model::SessionRecord,
-    _observation: &SessionObservation,
-) -> String {
-    session
-        .display_name
-        .clone()
-        .unwrap_or_else(|| "New Session".into())
-}
-
-fn format_terminal_activity_entry(entry: &TerminalActivityEntry, now: Instant) -> String {
-    format!("[{}] {}", relative_age_label(now.duration_since(entry.at)), entry.text)
-}
-
-fn relative_age_label(duration: Duration) -> String {
-    let seconds = duration.as_secs();
-    match seconds {
-        0..=59 => format!("{seconds}s ago"),
-        60..=3599 => format!("{}m ago", seconds / 60),
-        _ => format!("{}h ago", seconds / 3600),
-    }
-}
-
-fn relative_now_label() -> String {
-    "now".into()
-}
-
-fn is_runtime_event(summary: &str) -> bool {
-    !matches!(
-        summary,
-        "Entered focused terminal view"
-            | "Returned to battlefield view"
-            | "Probe opened"
-            | "Probe closed"
-            | "Probe pinned for ongoing watch"
-            | "Probe returned to peek mode"
-    ) && !summary.starts_with("Probe switched to ")
-}
-
-fn launch_command_hint(launch: &SessionLaunch) -> Option<String> {
-    match launch.kind {
-        SessionKind::WaitingShell => Some("Interactive shell ready".into()),
-        SessionKind::PlanningStream => None,
-        SessionKind::BlockingPrompt => Some("Waiting on approval prompt".into()),
-        SessionKind::RunningStream => Some("cargo test parser".into()),
-        SessionKind::FailingTask => Some("Task exited after failure".into()),
-    }
-}
-
-fn infer_active_command_from_lines(lines: &[String]) -> Option<String> {
-    lines.iter().rev().find_map(|line| {
-        let trimmed = line.trim();
-        if let Some(command) = trimmed.strip_prefix("$ ") {
-            let command = command.trim();
-            return (!command.is_empty()).then(|| command.to_string());
-        }
-        None
-    })
-}
-
-fn read_dominant_process_hint(pid: u32) -> Option<String> {
-    crate::procfs::dominant_child_command(pid)
-        .ok()
-        .flatten()
-        .map(|command| command.replace("  ", " ").trim().to_string())
-}
-
-fn read_shell_child_command(pid: u32) -> Option<String> {
-    crate::procfs::direct_child_command(pid)
-        .ok()
-        .flatten()
-        .map(|command| command.replace("  ", " ").trim().to_string())
-}
-
-fn read_process_tree_hint(pid: u32) -> Option<String> {
-    crate::procfs::format_process_tree(pid).ok().map(|tree| {
-        tree.lines()
-            .take(4)
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .collect::<Vec<_>>()
-            .join(" | ")
-    }).filter(|tree| !tree.is_empty())
-}
-
-fn is_meaningful_output_line(line: &str) -> bool {
-    let lower = line.to_ascii_lowercase();
-    !line.starts_with("bash-")
-        && !line.starts_with('$')
-        && !lower.starts_with("intent:")
 }
 
 fn apply_battle_status_style(label: &gtk::Label, status: BattleCardStatus) {
@@ -3993,108 +3105,7 @@ fn load_css() {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        append_recent_lines, effective_display_name, naming_terminal_history, parse_run_mode,
-        synthesis_terminal_activity, RunMode, SessionObservation, TerminalActivityEntry,
-    };
-    use crate::model::{SessionId, SessionKind, SessionLaunch, SessionRecord, SessionStatus};
-    use std::time::{Duration, Instant};
-
-    #[test]
-    fn recent_lines_accumulate_semantic_output_without_duplicates() {
-        let mut recent = vec!["first".to_string()];
-        append_recent_lines(
-            &mut recent,
-            &["first".to_string(), "second".to_string(), "second".to_string()],
-        );
-        assert_eq!(recent, vec!["first".to_string(), "second".to_string()]);
-    }
-
-    #[test]
-    fn synthesis_activity_contains_terminal_history_and_most_recent_updated_line() {
-        let mut observation = SessionObservation::new();
-        let now = Instant::now();
-        observation.terminal_activity = vec![
-            TerminalActivityEntry {
-                at: now - Duration::from_secs(2),
-                text: "• Ran cargo test".to_string(),
-            },
-            TerminalActivityEntry {
-                at: now - Duration::from_secs(1),
-                text: "test result: ok".to_string(),
-            },
-        ];
-        observation.painted_line = Some("Working 7".to_string());
-
-        let history = synthesis_terminal_activity(&observation);
-        assert_eq!(history.len(), 3);
-        assert!(history[0].ends_with("• Ran cargo test"));
-        assert!(history[1].ends_with("test result: ok"));
-        assert_eq!(history[2], "[most recent updated line] Working 7");
-    }
-
-    #[test]
-    fn synthesis_activity_uses_large_history_window() {
-        let mut observation = SessionObservation::new();
-        let now = Instant::now();
-        observation.terminal_activity = (0..120)
-            .map(|index| TerminalActivityEntry {
-                at: now - Duration::from_secs((120 - index) as u64),
-                text: format!("line {index}"),
-            })
-            .collect();
-
-        let history = synthesis_terminal_activity(&observation);
-        assert_eq!(history.len(), 100);
-        assert!(history.first().is_some_and(|line| line.ends_with("line 20")));
-        assert!(history.last().is_some_and(|line| line.ends_with("line 119")));
-    }
-
-    #[test]
-    fn naming_history_uses_large_timestamped_window() {
-        let mut observation = SessionObservation::new();
-        let now = Instant::now();
-        observation.terminal_activity = (0..100)
-            .map(|index| TerminalActivityEntry {
-                at: now - Duration::from_secs((100 - index) as u64),
-                text: format!("line {index}"),
-            })
-            .collect();
-
-        let history = naming_terminal_history(&observation);
-        assert_eq!(history.len(), 80);
-        assert!(history.first().is_some_and(|line| line.ends_with("line 20")));
-        assert!(history.last().is_some_and(|line| line.ends_with("line 99")));
-    }
-
-    #[test]
-    fn effective_display_name_prefers_override_then_new_session() {
-        let launch = SessionLaunch {
-            name: "Shell 1".into(),
-            subtitle: "Generic command session".into(),
-            program: "/bin/bash".into(),
-            args: vec!["-il".into()],
-            cwd: None,
-            kind: SessionKind::WaitingShell,
-        };
-        let session = SessionRecord {
-            id: SessionId(1),
-            launch,
-            display_name: None,
-            status: SessionStatus::Launching,
-            pid: None,
-            events: Vec::new(),
-        };
-        let observation = SessionObservation::new();
-        assert_eq!(effective_display_name(&session, &observation), "New Session");
-
-        let mut named_session = session.clone();
-        named_session.display_name = Some("Parser Review".into());
-        assert_eq!(
-            effective_display_name(&named_session, &observation),
-            "Parser Review"
-        );
-    }
+    use super::{parse_run_mode, RunMode};
 
     #[test]
     fn parses_ssh_run_mode() {

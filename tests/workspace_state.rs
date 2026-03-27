@@ -38,7 +38,7 @@ fn workspace_state_tracks_focus_separately_from_selection() {
     assert_eq!(state.selected_session(), Some(b));
     assert_eq!(state.focused_terminal(), Some(a));
     assert_eq!(state.sessions()[0].status, SessionStatus::Waiting);
-    assert_eq!(state.sessions()[1].status, SessionStatus::Blocked);
+    assert_eq!(state.sessions()[1].status, SessionStatus::Running);
 }
 
 #[test]
