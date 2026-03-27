@@ -65,6 +65,19 @@ pub fn terminal_size_hint(terminal: &vte::Terminal) -> PtySize {
     }
 }
 
+pub fn measured_terminal_size_hint(terminal: &vte::Terminal) -> Option<PtySize> {
+    measured_terminal_size(terminal.row_count(), terminal.column_count())
+}
+
+fn measured_terminal_size(rows: i64, cols: i64) -> Option<PtySize> {
+    (rows > 0 && cols > 0).then_some(PtySize {
+        rows: rows as u16,
+        cols: cols as u16,
+        pixel_width: 0,
+        pixel_height: 0,
+    })
+}
+
 fn direct_pty_mode_enabled() -> bool {
     std::env::var("EXATERM_DIRECT_PTY")
         .ok()
@@ -369,7 +382,7 @@ fn consume_relay_buffer(buffer: &mut Vec<u8>, amount: usize) {
 fn create_display_pty(size: PtySize) -> Result<(vte::Pty, File, File, File), String> {
     let mut master_fd = -1;
     let mut slave_fd = -1;
-    let mut winsize = libc::winsize {
+    let winsize = libc::winsize {
         ws_row: size.rows,
         ws_col: size.cols,
         ws_xpixel: size.pixel_width,
@@ -381,7 +394,7 @@ fn create_display_pty(size: PtySize) -> Result<(vte::Pty, File, File, File), Str
             &mut slave_fd,
             std::ptr::null_mut(),
             std::ptr::null(),
-            &mut winsize,
+            &winsize,
         )
     };
     if result != 0 {
@@ -430,6 +443,20 @@ fn create_display_pty(size: PtySize) -> Result<(vte::Pty, File, File, File), Str
     let pty = vte::Pty::foreign_sync(master, None::<&gio::Cancellable>)
         .map_err(|error| error.to_string())?;
     Ok((pty, reader, writer, resizer))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::measured_terminal_size;
+
+    #[test]
+    fn measured_terminal_size_requires_positive_dimensions() {
+        assert!(measured_terminal_size(0, 80).is_none());
+        assert!(measured_terminal_size(24, 0).is_none());
+        let size = measured_terminal_size(24, 80).expect("size should exist");
+        assert_eq!(size.rows, 24);
+        assert_eq!(size.cols, 80);
+    }
 }
 
 fn set_raw_display_slave(fd: i32) -> std::io::Result<()> {

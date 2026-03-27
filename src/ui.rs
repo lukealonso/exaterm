@@ -7,6 +7,7 @@ use crate::observation::{
     scrollback_fragments, SessionObservation,
 };
 use crate::runtime::{spawn_runtime, terminal_size_hint, RuntimeEvent, SessionRuntime};
+use crate::runtime::measured_terminal_size_hint;
 use crate::synthesis::{
     name_signature, nudge_signature, suggest_name_blocking, suggest_nudge_blocking,
     summary_signature, summarize_blocking, MismatchLevel, MomentumState, NameSuggestion,
@@ -1507,15 +1508,28 @@ fn drain_runtime_events(context: &Rc<AppContext>) {
 }
 
 fn sync_runtime_sizes(context: &Rc<AppContext>) {
+    let focused_size = predicted_focus_terminal_size(context);
     let sizes = context
         .session_cards
         .borrow()
         .iter()
-        .map(|(session_id, card)| (*session_id, terminal_size_hint(&card.terminal)))
+        .map(|(session_id, card)| {
+            let size = if context.state.borrow().focused_session() == Some(*session_id)
+                || battlefield_embeds_terminal(context, *session_id)
+            {
+                measured_terminal_size_hint(&card.terminal)
+            } else {
+                focused_size
+            };
+            (*session_id, size)
+        })
         .collect::<Vec<_>>();
 
     let mut runtimes = context.runtimes.borrow_mut();
     for (session_id, size) in sizes {
+        let Some(size) = size else {
+            continue;
+        };
         let Some(runtime) = runtimes.get_mut(&session_id) else {
             continue;
         };
@@ -1533,6 +1547,13 @@ fn sync_runtime_sizes(context: &Rc<AppContext>) {
         }
         runtime.last_size = Some(current);
     }
+}
+
+fn predicted_focus_terminal_size(context: &Rc<AppContext>) -> Option<PtySize> {
+    let focused = context.state.borrow().focused_session()?;
+    let cards = context.session_cards.borrow();
+    let card = cards.get(&focused)?;
+    measured_terminal_size_hint(&card.terminal).or_else(|| Some(terminal_size_hint(&card.terminal)))
 }
 
 fn resize_display_pty(fd: i32, size: PtySize) -> std::io::Result<()> {

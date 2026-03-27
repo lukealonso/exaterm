@@ -338,6 +338,12 @@ fn collect_file_changes(
 
     for entry in entries.flatten() {
         let entry_path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
         let Ok(metadata) = entry.metadata() else {
             continue;
         };
@@ -451,11 +457,14 @@ fn is_meaningful_output_line(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        append_recent_lines, effective_display_name, naming_terminal_history,
+        append_recent_lines, effective_display_name, naming_terminal_history, scan_recent_files,
         synthesis_terminal_activity, SessionObservation, TerminalActivityEntry,
     };
     use crate::model::{SessionId, SessionKind, SessionLaunch, SessionRecord, SessionStatus};
-    use std::time::{Duration, Instant};
+    use std::fs;
+    use std::os::unix::fs::symlink;
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     #[test]
     fn recent_lines_accumulate_semantic_output_without_duplicates() {
@@ -549,5 +558,37 @@ mod tests {
             ..session
         };
         assert_eq!(effective_display_name(&named_session), "Parser repair");
+    }
+
+    #[test]
+    fn scan_recent_files_skips_symlinked_directories() {
+        let root = tempdir_path("exaterm-observation-symlink");
+        let real_dir = root.join("real");
+        let linked_dir = root.join("linked");
+        fs::create_dir_all(&real_dir).expect("real dir");
+        fs::write(real_dir.join("file.txt"), "hello").expect("real file");
+        symlink(&real_dir, &linked_dir).expect("symlink dir");
+
+        let mut fingerprints = std::collections::BTreeMap::new();
+        let changed = scan_recent_files(&root, &mut fingerprints);
+
+        assert_eq!(changed, vec!["real/file.txt".to_string()]);
+        assert_eq!(fingerprints.len(), 1);
+    }
+
+    fn tempdir_path(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should be monotonic enough for temp dir names")
+            .as_nanos();
+        let unique = format!(
+            "{}-{}-{}",
+            prefix,
+            std::process::id(),
+            nanos
+        );
+        let path = std::env::temp_dir().join(unique);
+        fs::create_dir_all(&path).expect("temp dir");
+        path
     }
 }
