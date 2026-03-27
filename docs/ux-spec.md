@@ -485,6 +485,8 @@ The model-assisted layer should selectively help with:
 - compressing noisy recent activity into one useful summary instead of several mediocre ones
 - synthesizing visible narrative with observed execution into a concise alignment or mismatch judgment
 - turning raw evidence into a battle-card presentation that feels intelligent rather than mechanical
+- classifying trajectory states that are hard to detect heuristically, such as `waiting_for_nudge`, healthy verification loops, converged waiting, or flailing
+- judging whether the agent sounds coherent and on track versus uncertain, confused, or risky
 
 The model-assisted layer should not be responsible for:
 
@@ -500,8 +502,31 @@ Model calls should be:
 
 - driven by meaningful evidence changes, not constant repaints
 - aggressively cached
-- bounded to a small recent evidence window
+- bounded to a recent evidence window that is large enough to reveal short-term trajectory, not just the latest line
 - conservative about confidence
+
+## LLM Supervision Dimensions
+
+The model-assisted synthesis layer should report into several distinct operator-facing dimensions rather than one overloaded summary state.
+
+Recommended dimensions:
+
+- `tactical_state`: the broad present-tense state, such as `Idle`, `Active`, `Working`, `Blocked`, `Failed`, or `Complete`
+- `progress_state`: the trajectory or momentum, such as steady progress, verifying, exploring, waiting for nudge, flailing, converged waiting, or blocked
+- `confidence_state`: how coherent and self-consistent the agent appears from visible evidence
+- `operator_action`: whether the operator should watch, nudge, intervene, or do nothing
+- `risk_posture`: whether the current behavior appears low-risk, watch-worthy, high-risk, or extreme
+- `mismatch_level`: how much the visible narrative and machine evidence diverge
+
+Each dimension should come with a terse grounded justification. These justifications exist so the UI can selectively surface the most valuable explanation for a given card without rendering the whole schema literally.
+
+Examples of the intended shape:
+
+- `progress_state = waiting_for_nudge` with a short reason that the agent paused after a crisp checkpoint
+- `confidence_state = uncertain` with a short reason that the narrative keeps restarting without narrowing the issue
+- `risk_posture = high` with a short reason that the agent is bypassing validation or taking shortcuts
+
+The UI does not need to show every dimension on every card. The synthesis model should still provide them so Exaterm can decide which dimensions matter most for the current tactical state and density mode.
 
 ## Command-Level Visibility
 

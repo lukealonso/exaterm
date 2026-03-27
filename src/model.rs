@@ -57,6 +57,18 @@ impl SessionLaunch {
         }
     }
 
+    pub fn user_shell(name: impl Into<String>, subtitle: impl Into<String>) -> Self {
+        let (program, args) = preferred_user_shell_launch();
+        Self {
+            name: name.into(),
+            subtitle: subtitle.into(),
+            program,
+            args,
+            cwd: None,
+            kind: SessionKind::WaitingShell,
+        }
+    }
+
     pub fn running_stream(
         name: impl Into<String>,
         subtitle: impl Into<String>,
@@ -178,13 +190,30 @@ impl SessionLaunch {
                 SessionKind::PlanningStream => "Visible planning narrative".into(),
                 _ => "Actively producing terminal activity".into(),
             },
-            SessionStatus::Waiting => "Ready for direct intervention".into(),
+            SessionStatus::Waiting => "Interactive shell ready".into(),
             SessionStatus::Blocked => "Waiting for operator input".into(),
             SessionStatus::Failed(code) => format!("Exited with code {code}"),
             SessionStatus::Complete => "Process exited cleanly".into(),
             SessionStatus::Detached => "Runtime disconnected".into(),
         }
     }
+}
+
+fn preferred_user_shell_launch() -> (String, Vec<String>) {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+    let shell_name = std::path::Path::new(&shell)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("bash");
+
+    let args = match shell_name {
+        "bash" => vec!["-il".into()],
+        "zsh" => vec!["-il".into()],
+        "fish" => vec!["--interactive".into(), "--login".into()],
+        _ => vec!["-i".into()],
+    };
+
+    (shell, args)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -292,6 +321,7 @@ pub struct SessionEvent {
 pub struct SessionRecord {
     pub id: SessionId,
     pub launch: SessionLaunch,
+    pub display_name: Option<String>,
     pub status: SessionStatus,
     pub pid: Option<u32>,
     pub events: Vec<SessionEvent>,
@@ -336,6 +366,7 @@ impl WorkspaceState {
         self.sessions.push(SessionRecord {
             id,
             launch,
+            display_name: None,
             status: SessionStatus::Launching,
             pid: None,
             events: Vec::new(),
@@ -375,6 +406,21 @@ impl WorkspaceState {
 
     pub fn session(&self, session_id: SessionId) -> Option<&SessionRecord> {
         self.sessions.iter().find(|session| session.id == session_id)
+    }
+
+    pub fn set_display_name(&mut self, session_id: SessionId, display_name: Option<String>) {
+        let Some(session) = self
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == session_id)
+        else {
+            return;
+        };
+
+        session.display_name = display_name.and_then(|name| {
+            let trimmed = name.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        });
     }
 
     pub fn select_session(&mut self, session_id: SessionId) {
@@ -604,12 +650,14 @@ mod tests {
     }
 
     #[test]
-    fn shell_launch_is_deterministic() {
-        let shell = SessionLaunch::shell("A", "shell", "banner");
+    fn user_shell_launch_uses_real_shell_conventions() {
+        let shell = SessionLaunch::user_shell("A", "shell");
 
         assert_eq!(shell.kind, SessionKind::WaitingShell);
-        assert!(shell.args.contains(&"--noprofile".to_string()));
-        assert!(shell.args.contains(&"--norc".to_string()));
+        assert!(!shell.program.is_empty());
+        assert!(!shell.args.is_empty());
+        assert!(!shell.args.contains(&"--noprofile".to_string()));
+        assert!(!shell.args.contains(&"--norc".to_string()));
     }
 
     #[test]
@@ -681,6 +729,24 @@ mod tests {
         assert_eq!(probe.session_id, first);
         assert_eq!(probe.lens, ProbeLens::Process);
         assert_eq!(probe.mode, ProbeMode::Pinned);
+    }
+
+    #[test]
+    fn display_name_override_is_optional_and_trimmed() {
+        let mut state = WorkspaceState::new();
+        let session_id = state.add_session(SessionLaunch::shell("One", "shell", "banner"));
+
+        state.set_display_name(session_id, Some("  Parser Fix  ".into()));
+        assert_eq!(
+            state.session(session_id).and_then(|session| session.display_name.as_deref()),
+            Some("Parser Fix")
+        );
+
+        state.set_display_name(session_id, Some("   ".into()));
+        assert_eq!(
+            state.session(session_id).and_then(|session| session.display_name.as_deref()),
+            None
+        );
     }
 
     #[test]

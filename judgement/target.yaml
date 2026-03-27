@@ -13,4 +13,4 @@ contract:
 notes:
   - Prefer X11 for automation.
   - Resize the main window before evaluating dense multi-session workflows.
-  - The app launches directly into a built-in demo workspace.
+  - The app launches into an empty battlefield; use Add Shell to create real sessions for evaluation.

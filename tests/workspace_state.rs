@@ -1,17 +1,15 @@
-use exaterm::demo::WorkspaceBlueprint;
 use exaterm::model::{PresentationMode, SessionLaunch, SessionStatus, WorkspaceState};
 use std::process::Command;
 
 #[test]
-fn demo_workspace_commands_have_program_and_args() {
-    let demo = WorkspaceBlueprint::demo();
+fn user_shell_launch_has_program_and_args() {
+    let launch = SessionLaunch::user_shell("Shell", "Generic command session");
 
-    assert_eq!(demo.sessions.len(), 5);
-    for session in demo.sessions {
-        let argv = session.argv();
-        assert!(!argv.is_empty());
-        assert!(!argv[0].is_empty());
-    }
+    let argv = launch.argv();
+    assert!(!argv.is_empty());
+    assert!(!argv[0].is_empty());
+    assert!(!launch.args.contains(&"--noprofile".to_string()));
+    assert!(!launch.args.contains(&"--norc".to_string()));
 }
 
 #[test]

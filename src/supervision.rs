@@ -15,6 +15,7 @@ pub struct IntentSummary {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BattleCardStatus {
     Idle,
+    Active,
     Thinking,
     Working,
     Blocked,
@@ -27,6 +28,7 @@ impl BattleCardStatus {
     pub fn label(self) -> &'static str {
         match self {
             BattleCardStatus::Idle => "Idle",
+            BattleCardStatus::Active => "Active",
             BattleCardStatus::Thinking => "Thinking",
             BattleCardStatus::Working => "Working",
             BattleCardStatus::Blocked => "Blocked",
@@ -150,7 +152,14 @@ pub fn build_battle_card(
     let intent = intent_engine.determine_intent(&intent_context);
     let status = derive_battle_card_status(record.status, observed, intent.as_ref());
     let correlation = derive_correlation(intent.as_ref(), observed);
-    let tactical = tactical_copy(record.status, status, observed, intent.as_ref(), &correlation);
+    let tactical = tactical_copy(
+        &record.launch.subtitle,
+        record.status,
+        status,
+        observed,
+        intent.as_ref(),
+        &correlation,
+    );
 
     BattleCardViewModel {
         session_id: record.id,
@@ -168,19 +177,29 @@ pub fn build_battle_card(
 pub fn derive_battle_card_status(
     session_status: SessionStatus,
     observed: &ObservedActivity,
-    intent: Option<&IntentSummary>,
+    _intent: Option<&IntentSummary>,
 ) -> BattleCardStatus {
+    let shell_ready = matches!(observed.active_command.as_deref(), Some("Interactive shell ready"));
+    let has_runtime_evidence = observed
+        .active_command
+        .as_deref()
+        .is_some_and(|command| command != "Interactive shell ready")
+        || observed.dominant_process.is_some()
+        || observed.work_output_excerpt.is_some()
+        || !observed.recent_files.is_empty();
     match session_status {
         SessionStatus::Blocked => BattleCardStatus::Blocked,
         SessionStatus::Failed(_) => BattleCardStatus::Failed,
         SessionStatus::Complete => BattleCardStatus::Complete,
         SessionStatus::Detached => BattleCardStatus::Detached,
-        SessionStatus::Launching => BattleCardStatus::Thinking,
+        SessionStatus::Launching => BattleCardStatus::Active,
         SessionStatus::Waiting => {
-            if observed.idle_seconds.unwrap_or_default() >= 30 {
+            if has_runtime_evidence {
+                BattleCardStatus::Active
+            } else if shell_ready || observed.idle_seconds.unwrap_or_default() >= 30 {
                 BattleCardStatus::Idle
             } else {
-                BattleCardStatus::Thinking
+                BattleCardStatus::Active
             }
         }
         SessionStatus::Running => {
@@ -189,22 +208,14 @@ pub fn derive_battle_card_status(
                 && observed.dominant_process.is_none()
             {
                 BattleCardStatus::Idle
-            } else if observed.active_command.is_none()
-                && observed.dominant_process.is_none()
-                && observed.recent_files.is_empty()
-                && intent.is_some()
-            {
-                BattleCardStatus::Thinking
             } else if observed.active_command.is_some()
                 || observed.dominant_process.is_some()
                 || observed.work_output_excerpt.is_some()
                 || !observed.recent_files.is_empty()
             {
-                BattleCardStatus::Working
-            } else if intent.is_some() {
-                BattleCardStatus::Thinking
+                BattleCardStatus::Active
             } else {
-                BattleCardStatus::Working
+                BattleCardStatus::Active
             }
         }
     }
@@ -226,6 +237,7 @@ struct TacticalCopy {
 }
 
 fn tactical_copy(
+    task_label: &str,
     session_status: SessionStatus,
     status: BattleCardStatus,
     observed: &ObservedActivity,
@@ -238,6 +250,16 @@ fn tactical_copy(
     let output_text = observed.work_output_excerpt.as_deref();
     let file_text = (!observed.recent_files.is_empty()).then(|| summarize_files(&observed.recent_files));
     let shell_ready = matches!(command_text, Some("Interactive shell ready"));
+    let anchor_text = (!task_label.trim().is_empty())
+        .then_some(task_label)
+        .or_else(|| command_text)
+        .or_else(|| {
+            process_text.and_then(|process| {
+                (!matches!(process, "bash" | "sh" | "sleep" | "zsh" | "claude" | "codex"))
+                    .then_some(process)
+            })
+        })
+        .unwrap_or(task_label);
 
     let mut tactical = match status {
         BattleCardStatus::Idle => TacticalCopy {
@@ -245,10 +267,7 @@ fn tactical_copy(
                 if shell_ready {
                     "Interactive shell ready"
                 } else {
-                    intent_text
-                        .or(command_text)
-                        .or(output_text)
-                        .unwrap_or("Waiting for the next meaningful step")
+                    anchor_text
                 },
             ),
             primary_detail: if shell_ready {
@@ -270,31 +289,39 @@ fn tactical_copy(
             },
             evidence_fragments: Vec::new(),
         },
+        BattleCardStatus::Active => TacticalCopy {
+            headline: compact_fragment(anchor_text),
+            primary_detail: output_text
+                .filter(|output| Some(*output) != command_text && Some(*output) != Some(anchor_text))
+                .map(compact_fragment)
+                .or_else(|| {
+                    intent_text
+                        .filter(|intent| Some(*intent) != command_text && Some(*intent) != Some(anchor_text))
+                        .map(compact_fragment)
+                }),
+            evidence_fragments: Vec::new(),
+        },
         BattleCardStatus::Thinking => TacticalCopy {
             headline: compact_fragment(
                 if shell_ready {
                     "Terminal is ready for direct intervention"
                 } else {
-                    intent_text
-                        .or(command_text)
-                        .or(process_text)
-                        .unwrap_or("Working through the next step")
+                    anchor_text
                 }
             ),
             primary_detail: output_text.map(compact_fragment),
             evidence_fragments: Vec::new(),
         },
         BattleCardStatus::Working => TacticalCopy {
-            headline: compact_fragment(
-                command_text
-                    .or(process_text)
-                    .or(intent_text)
-                    .unwrap_or("Concrete work is underway"),
-            ),
+            headline: compact_fragment(anchor_text),
             primary_detail: intent_text
-                .filter(|intent| Some(*intent) != command_text)
+                .filter(|intent| Some(*intent) != command_text && Some(*intent) != Some(anchor_text))
                 .map(compact_fragment)
-                .or_else(|| output_text.map(compact_fragment)),
+                .or_else(|| {
+                    output_text
+                        .filter(|output| Some(*output) != Some(anchor_text))
+                        .map(compact_fragment)
+                }),
             evidence_fragments: Vec::new(),
         },
         BattleCardStatus::Blocked => TacticalCopy {
@@ -400,6 +427,18 @@ fn derive_alignment_signal(
         BattleCardStatus::Failed => AlignmentSignal {
             text: "Failure is machine-confirmed".into(),
             tone: SignalTone::Alert,
+        },
+        BattleCardStatus::Active if has_files && has_output => AlignmentSignal {
+            text: "Files + output confirm activity".into(),
+            tone: SignalTone::Calm,
+        },
+        BattleCardStatus::Active if has_files => AlignmentSignal {
+            text: "Recent file changes confirm activity".into(),
+            tone: SignalTone::Calm,
+        },
+        BattleCardStatus::Active if has_output || has_runtime => AlignmentSignal {
+            text: "Runtime evidence confirms activity".into(),
+            tone: SignalTone::Calm,
         },
         BattleCardStatus::Working if has_files && has_output => AlignmentSignal {
             text: "Files + output agree".into(),
@@ -577,6 +616,9 @@ fn looks_like_narrative(line: &str) -> bool {
 
 fn normalize_line(line: &str) -> String {
     let trimmed = strip_prompt_prefix(line.trim());
+    let trimmed = trimmed
+        .trim_start_matches(['•', '-', '*', '›', '>'])
+        .trim_start();
     trimmed
         .split_whitespace()
         .collect::<Vec<_>>()
@@ -625,6 +667,7 @@ mod tests {
                 "/usr/bin/env",
                 vec!["bash".into()],
             ),
+            display_name: None,
             status,
             pid: Some(4242),
             events: Vec::new(),
@@ -677,6 +720,21 @@ mod tests {
     }
 
     #[test]
+    fn running_session_with_machine_evidence_is_active_by_default() {
+        let status = derive_battle_card_status(
+            SessionStatus::Running,
+            &ObservedActivity {
+                active_command: Some("codex".into()),
+                work_output_excerpt: Some("Updating auth flow".into()),
+                ..Default::default()
+            },
+            None,
+        );
+
+        assert_eq!(status, BattleCardStatus::Active);
+    }
+
+    #[test]
     fn battle_card_status_marks_blocked_and_failed_directly() {
         assert_eq!(
             derive_battle_card_status(SessionStatus::Blocked, &ObservedActivity::default(), None),
@@ -689,6 +747,38 @@ mod tests {
                 None
             ),
             BattleCardStatus::Failed
+        );
+    }
+
+    #[test]
+    fn ready_shells_are_idle_immediately() {
+        assert_eq!(
+            derive_battle_card_status(
+                SessionStatus::Waiting,
+                &ObservedActivity {
+                    active_command: Some("Interactive shell ready".into()),
+                    idle_seconds: Some(1),
+                    ..Default::default()
+                },
+                None
+            ),
+            BattleCardStatus::Idle
+        );
+    }
+
+    #[test]
+    fn waiting_shell_with_real_agent_activity_is_active_not_idle() {
+        assert_eq!(
+            derive_battle_card_status(
+                SessionStatus::Waiting,
+                &ObservedActivity {
+                    active_command: Some("codex".into()),
+                    work_output_excerpt: Some("Investigating failing snapshot".into()),
+                    ..Default::default()
+                },
+                None
+            ),
+            BattleCardStatus::Active
         );
     }
 
@@ -707,7 +797,7 @@ mod tests {
 
         assert_eq!(card.status, BattleCardStatus::Idle);
         assert_eq!(card.recency_label, "idle 52s");
-        assert!(card.headline.contains("rerunning the parser tests"));
+        assert_eq!(card.headline, "Parser fix");
         assert!(card
             .primary_detail
             .as_deref()

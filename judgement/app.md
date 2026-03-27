@@ -15,6 +15,7 @@ The most important parts of the experience are:
 - Whether command-level evidence such as active subprocesses, file activity, and meaningful output excerpts helps the operator verify whether claimed progress is real.
 - Whether the product helps the operator spot mismatch between visible agent narrative and observed execution.
 - Whether model-assisted tactical synthesis, when present, makes the cards feel more intelligent and useful rather than more verbose or noisy.
+- Whether model assistance appears to be reporting into distinct useful dimensions such as trajectory, confidence, operator action, and risk posture, rather than collapsing everything into one vague status line.
 - Whether clicking a card cleanly promotes it into a large, uncluttered real-terminal view for direct intervention.
 
 The workflows that deserve the most evaluation time are:
@@ -44,6 +45,7 @@ Quality looks like this:
 - The operator can tell whether an agent's visible narrative matches reality.
 - The app exposes useful under-the-covers evidence without forcing the operator to abandon the main grid.
 - Model assistance, if present, improves tactical usefulness by choosing better summaries rather than by adding more copy.
+- When model assistance is present, any surfaced one-line justifications feel grounded in real terminal history rather than generic motivational filler.
 - Clicking a session for intervention produces a large, comfortable, uncluttered terminal view that feels direct and native.
 - Returning from intervention to the battlefield view is coherent and low-friction.
 - Dense multi-session layouts remain legible at realistic working window sizes.
@@ -61,6 +63,7 @@ Weak quality looks like this:
 - Button-heavy card chrome competes with the battlefield scan loop.
 - Whole-card intervention exists in principle but is hard to discover without trial-and-error clicking.
 - Model-assisted copy makes the overview more verbose, repetitive, or noisy instead of sharper.
+- Model-assisted copy collapses distinct concerns like momentum, confidence, and risk into one mushy sentence.
 - It is difficult to tell whether an agent is actually doing work or only narrating work.
 - The product requires too much clicking or mode-switching to get from scan to diagnosis to intervention.
 - Entering a session for intervention still feels cluttered or indirect rather than like direct terminal control.
