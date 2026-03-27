@@ -1,3 +1,4 @@
+use crate::daemon::LocalBeachheadClient;
 use crate::model::{
     SessionId, SessionLaunch, WorkspaceState,
 };
@@ -6,8 +7,11 @@ use crate::observation::{
     effective_display_name, refresh_observation as refresh_session_observation,
     scrollback_fragments, SessionObservation,
 };
-use crate::runtime::{spawn_runtime, terminal_size_hint, RuntimeEvent, SessionRuntime};
-use crate::runtime::measured_terminal_size_hint;
+use crate::proto::{ClientMessage, ObservationSnapshot, ServerMessage, WorkspaceSnapshot};
+use crate::runtime::{
+    attach_display_runtime, measured_terminal_size_hint, spawn_runtime, terminal_size_hint,
+    write_display_output, ClientDisplayRuntime, RuntimeEvent, SessionRuntime,
+};
 use crate::synthesis::{
     name_signature, nudge_signature, suggest_name_blocking, suggest_nudge_blocking,
     summary_signature, summarize_blocking, MismatchLevel, MomentumState, NameSuggestion,
@@ -21,13 +25,15 @@ use crate::supervision::{
 use gtk::gdk;
 use gtk::prelude::*;
 use libadwaita as adw;
+use libadwaita::prelude::*;
 use portable_pty::PtySize;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -42,6 +48,7 @@ const MIN_EMBEDDED_TERMINAL_COLS: i32 = 80;
 const MIN_EMBEDDED_TERMINAL_ROWS: i32 = 24;
 const EMBEDDED_TERMINAL_MIN_WIDTH: i32 = (ESTIMATED_TERMINAL_CELL_WIDTH * MIN_EMBEDDED_TERMINAL_COLS) + 72;
 const EMBEDDED_TERMINAL_MIN_HEIGHT: i32 = (ESTIMATED_TERMINAL_CELL_HEIGHT * MIN_EMBEDDED_TERMINAL_ROWS) + 96;
+static TRACE_INPUT_SEQ: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
 struct SegmentedBarWidgets {
@@ -230,6 +237,7 @@ enum RunMode {
 
 struct AppContext {
     mode: RunMode,
+    beachhead: Option<LocalBeachheadClient>,
     state: Rc<RefCell<WorkspaceState>>,
     title: adw::WindowTitle,
     empty_state: gtk::Box,
@@ -240,12 +248,14 @@ struct AppContext {
     session_cards: RefCell<BTreeMap<SessionId, SessionCardWidgets>>,
     observations: RefCell<BTreeMap<SessionId, SessionObservation>>,
     runtimes: RefCell<BTreeMap<SessionId, SessionRuntime>>,
+    display_runtimes: RefCell<BTreeMap<SessionId, ClientDisplayRuntime>>,
     summary_worker: Option<SummaryWorker>,
     summary_cache: RefCell<BTreeMap<SessionId, SummaryCacheEntry>>,
     naming_worker: Option<NamingWorker>,
     naming_cache: RefCell<BTreeMap<SessionId, NamingCacheEntry>>,
     nudge_worker: Option<NudgeWorker>,
     nudge_cache: RefCell<BTreeMap<SessionId, NudgeCacheEntry>>,
+    closing_confirmed: Cell<bool>,
 }
 
 pub fn run() -> glib::ExitCode {
@@ -291,8 +301,36 @@ fn parse_run_mode(args: impl IntoIterator<Item = String>) -> Result<RunMode, Str
     }
 }
 
+fn daemon_backed(context: &AppContext) -> bool {
+    context.beachhead.is_some()
+}
+
+fn transport_trace_enabled() -> bool {
+    std::env::var("EXATERM_BEACHHEAD_TRACE")
+        .ok()
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes"))
+}
+
+fn now_unix_us() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros() as u64
+}
+
 fn build_ui(app: &gtk::Application, mode: RunMode) {
     load_css();
+    let beachhead = if !visual_gallery_enabled() && matches!(mode, RunMode::Local) {
+        match LocalBeachheadClient::connect_or_spawn() {
+            Ok(client) => Some(client),
+            Err(error) => {
+                eprintln!("failed to connect to local beachhead: {error}");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     let cards = gtk::FlowBox::builder()
         .selection_mode(gtk::SelectionMode::Single)
@@ -470,6 +508,7 @@ fn build_ui(app: &gtk::Application, mode: RunMode) {
 
     let context = Rc::new(AppContext {
         mode: mode.clone(),
+        beachhead,
         state: Rc::new(RefCell::new(WorkspaceState::new())),
         title,
         empty_state,
@@ -490,12 +529,26 @@ fn build_ui(app: &gtk::Application, mode: RunMode) {
         session_cards: RefCell::new(BTreeMap::new()),
         observations: RefCell::new(BTreeMap::new()),
         runtimes: RefCell::new(BTreeMap::new()),
-        summary_worker: spawn_summary_worker(),
+        display_runtimes: RefCell::new(BTreeMap::new()),
+        summary_worker: if matches!(mode, RunMode::Local) && !visual_gallery_enabled() {
+            None
+        } else {
+            spawn_summary_worker()
+        },
         summary_cache: RefCell::new(BTreeMap::new()),
-        naming_worker: spawn_naming_worker(),
+        naming_worker: if matches!(mode, RunMode::Local) && !visual_gallery_enabled() {
+            None
+        } else {
+            spawn_naming_worker()
+        },
         naming_cache: RefCell::new(BTreeMap::new()),
-        nudge_worker: spawn_nudge_worker(),
+        nudge_worker: if matches!(mode, RunMode::Local) && !visual_gallery_enabled() {
+            None
+        } else {
+            spawn_nudge_worker()
+        },
         nudge_cache: RefCell::new(BTreeMap::new()),
+        closing_confirmed: Cell::new(false),
     });
 
     {
@@ -512,7 +565,8 @@ fn build_ui(app: &gtk::Application, mode: RunMode) {
                 .iter()
                 .find_map(|(session_id, card)| (card.row == *selected_child).then_some(*session_id));
             if let Some(session_id) = maybe_session {
-                if context.state.borrow().focused_session().is_some() {
+                let focused = context.state.borrow().focused_session().is_some();
+                if focused {
                     show_intervention(&context, session_id);
                 } else {
                     context.state.borrow_mut().select_session(session_id);
@@ -567,8 +621,20 @@ fn build_ui(app: &gtk::Application, mode: RunMode) {
         });
     }
 
+    if context.beachhead.is_some() {
+        let context = context.clone();
+        glib::timeout_add_local(std::time::Duration::from_millis(33), move || {
+            drain_daemon_events(&context);
+            glib::ControlFlow::Continue
+        });
+    }
+
     if visual_gallery_enabled() {
         seed_visual_gallery(&context);
+    } else if let Some(client) = context.beachhead.as_ref() {
+        let _ = client
+            .commands
+            .send(ClientMessage::CreateOrResumeDefaultWorkspace);
     } else {
         let launch = default_shell_launch(&context, 1);
         append_session_card(&context, launch);
@@ -576,6 +642,61 @@ fn build_ui(app: &gtk::Application, mode: RunMode) {
 
     refresh_runtime_and_cards(&context);
     refresh_workspace(&context);
+
+    {
+        let context = context.clone();
+        let close_window = window.clone();
+        close_window.clone().connect_close_request(move |_| {
+            if context.closing_confirmed.get() || context.beachhead.is_none() {
+                return glib::Propagation::Proceed;
+            }
+            if context.state.borrow().sessions().is_empty() {
+                return glib::Propagation::Proceed;
+            }
+
+            let dialog = adw::AlertDialog::builder()
+                .heading("Keep terminals alive?")
+                .body("Closing Exaterm can leave the local beachhead running so you can reconnect to the same live terminal later.")
+                .close_response("cancel")
+                .build();
+            dialog.add_responses(&[
+                ("cancel", "Cancel"),
+                ("terminate", "Terminate"),
+                ("keep", "Keep Alive"),
+            ]);
+            dialog.set_default_response(Some("keep"));
+            dialog.set_response_appearance("terminate", adw::ResponseAppearance::Destructive);
+            let context = context.clone();
+            let action_window = close_window.clone();
+            let present_window = close_window.clone();
+            dialog.connect_response(None, move |dialog: &adw::AlertDialog, response| {
+                match response {
+                    "keep" => {
+                        if let Some(client) = context.beachhead.as_ref() {
+                            let _ = client
+                                .commands
+                                .send(ClientMessage::DetachClient { keep_alive: true });
+                        }
+                        context.closing_confirmed.set(true);
+                        action_window.close();
+                    }
+                    "terminate" => {
+                        if let Some(client) = context.beachhead.as_ref() {
+                            let _ = client
+                                .commands
+                                .send(ClientMessage::DetachClient { keep_alive: false });
+                        }
+                        context.closing_confirmed.set(true);
+                        action_window.close();
+                    }
+                    _ => {}
+                }
+                dialog.close();
+            });
+            dialog.present(Some(&present_window));
+            glib::Propagation::Stop
+        });
+    }
 
     window.present();
 }
@@ -1076,7 +1197,9 @@ fn install_terminal_context_menu(
         right_click.connect_pressed(move |gesture, _, x, y| {
             let count = context.state.borrow().sessions().len();
             copy_button.set_sensitive(terminal.has_selection());
-            split_terminal_button.set_sensitive(matches!(count, 1 | 2 | 4 | 6 | 8 | 12));
+            split_terminal_button.set_sensitive(
+                !daemon_backed(&context) && matches!(count, 1 | 2 | 4 | 6 | 8 | 12),
+            );
             let rect = gdk::Rectangle::new(x as i32, y as i32, 1, 1);
             popover.set_pointing_to(Some(&rect));
             popover.popup();
@@ -1132,6 +1255,12 @@ fn toggle_auto_nudge(context: &Rc<AppContext>, session_id: SessionId) {
         }
         entry.enabled
     };
+    if let Some(client) = context.beachhead.as_ref() {
+        let _ = client.commands.send(ClientMessage::ToggleAutoNudge {
+            session_id,
+            enabled,
+        });
+    }
     update_nudge_widgets(context, session_id);
     if enabled {
         refresh_runtime_and_cards(context);
@@ -1154,6 +1283,9 @@ fn set_auto_nudge_hover(context: &Rc<AppContext>, session_id: SessionId, hovered
 }
 
 fn split_terminal_here(context: &Rc<AppContext>, source_session: SessionId) {
+    if daemon_backed(context) {
+        return;
+    }
     let current_count = context.state.borrow().sessions().len();
     let additions = match current_count {
         1 => 1,
@@ -1335,7 +1467,216 @@ fn spawn_nudge_worker() -> Option<NudgeWorker> {
     })
 }
 
+fn drain_daemon_events(context: &Rc<AppContext>) {
+    let Some(client) = context.beachhead.as_ref() else {
+        return;
+    };
+
+    let mut changed = false;
+    while let Ok(message) = client.events.try_recv() {
+        match message {
+            ServerMessage::WorkspaceSnapshot { snapshot } => {
+                apply_workspace_snapshot(context, snapshot);
+                changed = true;
+            }
+            ServerMessage::TraceInputAck {
+                trace_id,
+                sent_at_us,
+                daemon_recv_at_us,
+                daemon_write_done_at_us,
+                len,
+            } => {
+                if transport_trace_enabled() {
+                    let now = now_unix_us();
+                    eprintln!(
+                        "[beachhead-trace] input#{trace_id} len={len} client->daemon={}us daemon_write={}us ack_roundtrip={}us",
+                        daemon_recv_at_us.saturating_sub(sent_at_us),
+                        daemon_write_done_at_us.saturating_sub(daemon_recv_at_us),
+                        now.saturating_sub(sent_at_us),
+                    );
+                }
+            }
+            ServerMessage::Error { message } => {
+                eprintln!("beachhead error: {message}");
+            }
+        }
+    }
+
+    if changed {
+        let sessions = context.state.borrow().sessions().to_vec();
+        for session in &sessions {
+            update_battle_card_widgets(context, session);
+        }
+        refresh_workspace(context);
+        refresh_card_styles(context);
+        refresh_focus_panel(context);
+    }
+}
+
+fn apply_workspace_snapshot(context: &Rc<AppContext>, snapshot: WorkspaceSnapshot) {
+    let session_ids = snapshot
+        .sessions
+        .iter()
+        .map(|session| session.record.id)
+        .collect::<Vec<_>>();
+
+    context.state.borrow_mut().replace_sessions(
+        snapshot
+            .sessions
+            .iter()
+            .map(|session| session.record.clone())
+            .collect(),
+    );
+
+    let existing_ids = context
+        .session_cards
+        .borrow()
+        .keys()
+        .copied()
+        .collect::<Vec<_>>();
+    for session_id in existing_ids {
+        if session_ids.contains(&session_id) {
+            continue;
+        }
+        if let Some(card) = context.session_cards.borrow_mut().remove(&session_id) {
+            context.cards.remove(&card.row);
+        }
+        context.observations.borrow_mut().remove(&session_id);
+        context.display_runtimes.borrow_mut().remove(&session_id);
+        context.summary_cache.borrow_mut().remove(&session_id);
+        context.naming_cache.borrow_mut().remove(&session_id);
+        context.nudge_cache.borrow_mut().remove(&session_id);
+    }
+
+    for session in snapshot.sessions {
+        if !context.session_cards.borrow().contains_key(&session.record.id) {
+            let card = build_battle_card_widgets(context, &session.record);
+            context.cards.insert(&card.row, -1);
+            context
+                .session_cards
+                .borrow_mut()
+                .insert(session.record.id, card.clone());
+            if daemon_backed(context) {
+                attach_daemon_display_runtime(context, session.record.id, &card.terminal);
+            }
+        }
+        context
+            .observations
+            .borrow_mut()
+            .insert(session.record.id, observation_from_snapshot(&session.observation));
+        {
+            let mut summary_cache = context.summary_cache.borrow_mut();
+            let cache = summary_cache
+                .entry(session.record.id)
+                .or_insert_with(SummaryCacheEntry::new);
+            cache.last_summary = session.summary;
+        }
+        {
+            let mut nudge_cache = context.nudge_cache.borrow_mut();
+            let nudge = nudge_cache
+                .entry(session.record.id)
+                .or_insert_with(NudgeCacheEntry::new);
+            nudge.enabled = session.auto_nudge_enabled;
+            nudge.last_nudge = session.last_nudge;
+            nudge.last_sent = session
+                .last_sent_age_secs
+                .map(|age| Instant::now() - Duration::from_secs(age));
+        }
+    }
+
+    let selected = context.state.borrow().selected_session();
+    if let Some(selected) = selected {
+        let row = context
+            .session_cards
+            .borrow()
+            .get(&selected)
+            .map(|card| card.row.clone());
+        if let Some(row) = row {
+            context.cards.select_child(&row);
+        }
+    }
+    update_flowbox_columns(context);
+}
+
+fn observation_from_snapshot(snapshot: &ObservationSnapshot) -> SessionObservation {
+    SessionObservation {
+        last_change: Instant::now() - Duration::from_secs(snapshot.last_change_age_secs),
+        recent_lines: snapshot.recent_lines.clone(),
+        terminal_activity: Vec::new(),
+        painted_line: snapshot.painted_line.clone(),
+        shell_child_command: snapshot.shell_child_command.clone(),
+        active_command: snapshot.active_command.clone(),
+        dominant_process: snapshot.dominant_process.clone(),
+        process_tree_excerpt: snapshot.process_tree_excerpt.clone(),
+        recent_files: snapshot.recent_files.clone(),
+        recent_file_activity: BTreeMap::new(),
+        work_output_excerpt: snapshot.work_output_excerpt.clone(),
+        file_fingerprints: BTreeMap::new(),
+    }
+}
+
+fn attach_daemon_display_runtime(
+    context: &Rc<AppContext>,
+    session_id: SessionId,
+    terminal: &vte::Terminal,
+) {
+    if context.display_runtimes.borrow().contains_key(&session_id) {
+        return;
+    }
+    let size = terminal_size_hint(terminal);
+    let Ok((runtime, input_events)) = attach_display_runtime(terminal, size) else {
+        return;
+    };
+    if let Some(client) = context.beachhead.as_ref() {
+        let raw_writer = client.raw_writer.clone();
+        let raw_reader = client.raw_reader.clone();
+        let output_writer = runtime.output_writer.clone();
+        let command_tx = client.commands.clone();
+        thread::spawn(move || {
+            while let Ok(bytes) = input_events.recv() {
+                if transport_trace_enabled() {
+                    let trace_id = TRACE_INPUT_SEQ.fetch_add(1, Ordering::Relaxed);
+                    let _ = command_tx.send(ClientMessage::TraceInputSample {
+                        trace_id,
+                        sent_at_us: now_unix_us(),
+                        len: bytes.len(),
+                    });
+                }
+                let Ok(mut writer) = raw_writer.lock() else {
+                    break;
+                };
+                if writer.write_all(&bytes).is_err() {
+                    break;
+                }
+            }
+        });
+        let raw_reader = raw_reader
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.take());
+        if let Some(mut reader) = raw_reader {
+            thread::spawn(move || {
+                let mut buf = [0u8; 8192];
+                loop {
+                    match reader.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            if write_display_output(&output_writer, &buf[..n]).is_err() {
+                                break;
+                            }
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(_) => break,
+                    }
+                }
+            });
+        }
+    }
+    context.display_runtimes.borrow_mut().insert(session_id, runtime);
+}
+
 fn refresh_runtime_and_cards(context: &Rc<AppContext>) {
+    drain_daemon_events(context);
     drain_summary_results(context);
     drain_naming_results(context);
     drain_nudge_results(context);
@@ -1462,6 +1803,34 @@ fn sync_runtime_sizes(context: &Rc<AppContext>) {
             (*session_id, size)
         })
         .collect::<Vec<_>>();
+
+    if daemon_backed(context) {
+        let mut runtimes = context.display_runtimes.borrow_mut();
+        for (session_id, size) in sizes {
+            let Some(size) = size else {
+                continue;
+            };
+            let Some(runtime) = runtimes.get_mut(&session_id) else {
+                continue;
+            };
+            let current = (size.rows, size.cols);
+            if runtime.last_size == Some(current) {
+                continue;
+            }
+            if let Ok(display_resizer) = runtime.display_resize_target.lock() {
+                let _ = resize_display_pty(display_resizer.as_raw_fd(), size);
+            }
+            if let Some(client) = context.beachhead.as_ref() {
+                let _ = client.commands.send(ClientMessage::ResizeTerminal {
+                    session_id,
+                    rows: size.rows,
+                    cols: size.cols,
+                });
+            }
+            runtime.last_size = Some(current);
+        }
+        return;
+    }
 
     let mut runtimes = context.runtimes.borrow_mut();
     for (session_id, size) in sizes {
@@ -1597,6 +1966,9 @@ fn drain_summary_results(context: &Rc<AppContext>) {
 }
 
 fn refresh_observation(context: &Rc<AppContext>, session: &crate::model::SessionRecord) {
+    if daemon_backed(context) {
+        return;
+    }
     let remote_mode = matches!(context.mode, RunMode::Ssh { .. });
     let mut observations = context.observations.borrow_mut();
     let observation = observations
@@ -1678,6 +2050,9 @@ fn update_battle_card_widgets(context: &Rc<AppContext>, session: &crate::model::
 }
 
 fn maybe_queue_summary(context: &Rc<AppContext>, session_id: SessionId, evidence: &TacticalEvidence) {
+    if daemon_backed(context) {
+        return;
+    }
     if visual_gallery_enabled() {
         return;
     }
@@ -1723,6 +2098,9 @@ fn maybe_queue_nudge(
     observation: &SessionObservation,
     summary: Option<&TacticalSynthesis>,
 ) {
+    if daemon_backed(context) {
+        return;
+    }
     if visual_gallery_enabled() {
         return;
     }
@@ -1792,6 +2170,9 @@ fn looks_like_coding_agent(command: &str) -> bool {
 }
 
 fn maybe_queue_name(context: &Rc<AppContext>, session_id: SessionId, evidence: &NamingEvidence) {
+    if daemon_backed(context) {
+        return;
+    }
     if visual_gallery_enabled() {
         return;
     }
@@ -1835,6 +2216,13 @@ fn current_summary(
     session_id: SessionId,
     evidence: &TacticalEvidence,
 ) -> Option<TacticalSynthesis> {
+    if daemon_backed(context) {
+        return context
+            .summary_cache
+            .borrow()
+            .get(&session_id)
+            .and_then(|entry| entry.last_summary.clone());
+    }
     if visual_gallery_enabled() {
         return gallery_mock_summary(context, session_id);
     }
@@ -3096,7 +3484,6 @@ fn load_css() {
         .focus-mode flowboxchild .card-detail,
         .focus-mode flowboxchild .card-scrollback-band,
         .focus-mode flowboxchild .bar-widget {
-            display: none;
         }
 
         terminal {
