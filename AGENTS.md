@@ -10,15 +10,16 @@ For the fuller product framing, see:
 
 ## What Exaterm Is
 
-Exaterm is a Linux desktop app for supervising multiple terminal-native coding agents at once.
+Exaterm is a beachhead-backed Linux desktop app for supervising terminal-native coding agents.
 
 Its job is not to replace Codex, Claude Code, or a normal terminal workflow. Its job is to make multi-agent supervision possible without forcing the operator to read several full terminal transcripts in parallel.
 
 The core promise is:
-- keep multiple sessions legible at a glance
-- make progress, idleness, blockage, and failure easy to spot
+- keep terminal work legible at a glance
+- make progress, stoppage, blockage, and failure easy to spot
 - surface enough concrete evidence to verify whether an agent is really doing useful work
 - let the operator intervene in a real terminal immediately
+- make sessions persistent and reconnectable through a long-lived beachhead
 
 ## What Exaterm Is Not
 
@@ -62,6 +63,8 @@ The design target is:
 - 2 sessions: still terminal-first if viable
 - higher density: adaptive mix of real terminals and supervisory cards depending on space
 
+Exaterm should feel like a normal terminal first and only gradually reveal more supervision structure as density rises.
+
 ### 3. Real Evidence Beats Decorative Summaries
 
 Exaterm should always prefer grounded evidence over polished but vague status copy.
@@ -86,11 +89,11 @@ The deterministic substrate owns:
 - PTY state
 - resize behavior
 - process/file inspection when trustworthy
-- idle timing and generic activity baselines
+- generic activity baselines
 
 The model layer may refine and classify:
 - thinking vs working
-- idle vs blocked vs complete
+- idle vs stopped vs blocked vs complete
 - momentum
 - risk posture
 - terse operator summary
@@ -98,12 +101,18 @@ The model layer may refine and classify:
 
 The model must not be used as an excuse to skip building good observability.
 
+State semantics matter:
+- `idle` means there is no meaningful active goal to resume; there is nothing to nudge
+- `stopped` means the agent has unnecessarily paused after a coherent pass and a nudge may help
+- `blocked` means human intervention is actually required; a nudge or simple continue will not fix it
+- `complete` means the task is genuinely done
+
 ### 5. Honest Degradation Matters
 
 Exaterm must degrade honestly when it lacks deeper visibility.
 
 Examples:
-- plain SSH sessions are terminal-only supervision unless a remote foothold exists
+- plain SSH terminals are not a special UI mode; the correct long-term model is always a beachhead-backed session, local or remote
 - remote/local process and file claims should only appear when they are actually trustworthy
 - if the model does not know, the UI should stay sparse rather than fabricate certainty
 
@@ -139,41 +148,83 @@ Rules:
 - focused mode should still feel like the same session/card system, not a different product
 - avoid obvious or repetitive instructional chrome when the interaction is already clear
 
-### Idleness
+### Idleness and Stoppage
 
-Idle is one of the most important normal states in the product.
+`idle` and `stopped` are distinct and should stay distinct.
 
-It should be:
-- easy to notice
-- semantically correct
-- not confused with active repaint churn or quiet-but-healthy work
+Rules:
+- `idle` is passive, muted, and not nudgeable
+- `stopped` is the nudgeable paused state and should be more attention-grabbing than idle
+- `blocked` is more severe than `stopped`
+- do not confuse quiet repaint churn or a checkpoint pause with healthy active work
 
 ### Auto-Nudge
 
 Auto-nudge is an assistive feature, not a spam machine.
 
 Rules:
-- only fire for LLM-determined idle states
+- only fire for LLM-determined `stopped` states
 - only for sessions that actually look like coding agents
 - use cooldowns
 - prefer no nudge over a bad nudge
 
 ## Architecture Guidance
 
-The desired architecture is:
-- `model`: durable workspace/session state
-- `runtime`: PTY/session transport and lifecycle
-- `observation`: terminal history, process/file observation, evidence construction
-- `supervision`: deterministic view-model shaping
-- `synthesis`: LLM schemas, prompts, signatures, sanitization
-- `ui`: GTK widgets, layout, presentation, and user interaction wiring
+The current intended architecture is a three-part workspace:
+- `crates/exaterm-core`
+  - pure shared core
+  - model
+  - headless runtime and PTY ownership
+  - observation
+  - supervision
+  - synthesis
+  - protocol
+- `crates/exatermd`
+  - pure daemon binary
+  - no GTK
+  - no VTE
+  - owns the canonical session state and LLM work
+- `crates/exaterm`
+  - GTK/VTE client
+  - layout, interaction, local display PTYs, and rendering
 
-The codebase is moving toward that split. Keep pushing in that direction.
+### Beachhead Rules
+
+The UI should always be beachhead-backed in normal operation.
+
+That means:
+- the GTK app is a client of a beachhead
+- the beachhead owns canonical PTYs, observations, summaries, naming, nudging, and persistence-oriented state
+- the UI must not silently fall back to owning live sessions itself
+- local and remote beachheads must be hidden behind the same client abstraction
+
+The only acceptable non-beachhead exception is explicit fake/demo/gallery mode.
+
+### Transport Rules
+
+Use two transport planes:
+- raw byte stream
+  - low-latency terminal I/O only
+  - keep it off JSON and off slow UI/model paths
+- control/model channel
+  - snapshots, commands, lifecycle, errors, and state updates
+  - readability and evolvability matter more than micro-optimization here
+
+For local transport, prefer Unix domain sockets.
+
+For remote transport, the intended direction is:
+- remote `exatermd`
+- SSH as the outer transport
+- SSH-forwarded Unix sockets
+- same protocol as local
+
+### Code Placement Rules
 
 In particular:
-- do not let `ui.rs` absorb more PTY/runtime logic
-- do not let GTK widget concerns leak into reusable observation/runtime modules
-- prefer adding testable helpers in non-UI modules instead of burying logic in callbacks
+- do not let `crates/exaterm/src/ui.rs` absorb more headless runtime logic
+- do not let GTK or VTE leak back into `exaterm-core`
+- prefer testable helpers in core modules instead of burying logic in GTK callbacks
+- keep `exatermd` pure enough to ship independently to remote Linux hosts
 
 ## Terminal and PTY Philosophy
 
@@ -184,6 +235,12 @@ Rules:
 - avoid fake geometry churn
 - avoid output corruption under TUI redraw or scrolling
 - treat PTY resizing as meaningful application state, not a cosmetic detail
+- keep the hot terminal path wake-driven and near-realtime
+- keep model/control traffic off the raw byte path
+
+The canonical session PTY belongs to the beachhead.
+
+The GTK client may use a local display PTY for VTE, but that display PTY is not the source of truth. It is only a rendering/input adapter.
 
 When hidden terminals need geometry:
 - prefer a real measured size
@@ -216,6 +273,11 @@ Do not:
 - sneak unrelated cleanup into feature changes
 - rewrite large stable areas without a clear architectural gain
 - replace grounded behavior with hand-wavy heuristics
+
+When changing beachhead/client boundaries:
+- prefer one clear abstraction over local-vs-remote branches in the UI
+- keep raw-path latency measurable
+- preserve terminal responsiveness before adding protocol sophistication
 
 ## Naming and Tone
 
