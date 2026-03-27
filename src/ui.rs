@@ -901,7 +901,7 @@ fn install_terminal_context_menu(
         .spacing(0)
         .build();
     let split_terminal_button = gtk::Button::builder()
-        .label("Split Terminal")
+        .label("Add Terminals")
         .halign(gtk::Align::Fill)
         .build();
     split_terminal_button.add_css_class("flat");
@@ -931,7 +931,7 @@ fn install_terminal_context_menu(
         let popover = popover.clone();
         right_click.connect_pressed(move |gesture, _, x, y| {
             let count = context.state.borrow().sessions().len();
-            split_terminal_button.set_sensitive(matches!(count, 1 | 2 | 4 | 6));
+            split_terminal_button.set_sensitive(matches!(count, 1 | 2 | 4 | 6 | 8 | 12));
             let rect = gdk::Rectangle::new(x as i32, y as i32, 1, 1);
             popover.set_pointing_to(Some(&rect));
             popover.popup();
@@ -946,6 +946,7 @@ fn split_terminal_here(context: &Rc<AppContext>, source_session: SessionId) {
     let additions = match current_count {
         1 => 1,
         2 | 4 | 6 => 2,
+        8 | 12 => 4,
         _ => 0,
     };
     if additions == 0 {
@@ -2520,6 +2521,8 @@ fn update_flowbox_columns(context: &Rc<AppContext>) {
         }
     } else if total == 4 {
         2
+    } else if total == 6 {
+        3
     } else if total <= 4 {
         if available_width >= 1800 {
             total
@@ -2541,7 +2544,7 @@ fn battlefield_embeds_terminal(context: &Rc<AppContext>, _session_id: SessionId)
     }
 
     let total = context.session_cards.borrow().len();
-    if total == 0 || total > 4 {
+    if total == 0 {
         return false;
     }
 
