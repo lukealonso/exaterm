@@ -234,7 +234,8 @@ struct AppContext {
 }
 
 pub fn run() -> glib::ExitCode {
-    let mode = match parse_run_mode(std::env::args().skip(1)) {
+    let argv = std::env::args().collect::<Vec<_>>();
+    let mode = match parse_run_mode(argv.iter().skip(1).cloned()) {
         Ok(mode) => mode,
         Err(error) => {
             eprintln!("{error}");
@@ -248,7 +249,11 @@ pub fn run() -> glib::ExitCode {
         adw::StyleManager::default().set_color_scheme(adw::ColorScheme::ForceDark);
     });
     app.connect_activate(move |app| build_ui(app, mode.clone()));
-    app.run()
+    let program = argv
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "exaterm".to_string());
+    app.run_with_args(&[program])
 }
 
 fn parse_run_mode(args: impl IntoIterator<Item = String>) -> Result<RunMode, String> {
