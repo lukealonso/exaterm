@@ -44,6 +44,12 @@ impl SessionObservation {
     }
 }
 
+impl Default for SessionObservation {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub fn apply_stream_update(observation: &mut SessionObservation, update: StreamRuntimeUpdate) {
     append_recent_lines(&mut observation.recent_lines, &update.semantic_lines);
     append_terminal_activity(&mut observation.terminal_activity, &update.semantic_lines);
@@ -83,6 +89,14 @@ pub fn apply_file_activity(
 pub fn clear_file_activity(observation: &mut SessionObservation) {
     observation.recent_files.clear();
     observation.recent_file_activity.clear();
+}
+
+pub fn is_bare_waiting_shell(
+    session: &SessionRecord,
+    observation: &SessionObservation,
+) -> bool {
+    session.launch.kind == SessionKind::WaitingShell
+        && observation.shell_child_command.is_none()
 }
 
 pub fn refresh_observation(
@@ -153,7 +167,7 @@ pub fn effective_display_name(session: &SessionRecord) -> String {
     session
         .display_name
         .clone()
-        .unwrap_or_else(|| "New Session".into())
+        .unwrap_or_else(|| session.launch.name.clone())
 }
 
 pub fn build_tactical_evidence(
@@ -205,9 +219,8 @@ pub fn build_nudge_evidence(
         shell_child_command: observation.shell_child_command.clone(),
         idle_seconds: Some(observation.last_change.elapsed().as_secs()),
         tactical_state_brief: summary.tactical_state_brief.clone(),
-        progress_state_brief: summary.progress_state_brief.clone(),
         momentum_state_brief: summary.momentum_state_brief.clone(),
-        terse_operator_summary: summary.terse_operator_summary.clone(),
+        headline: summary.headline.clone(),
         recent_terminal_history: nudge_terminal_history(observation),
     }
 }
@@ -439,9 +452,12 @@ mod tests {
     use super::{
         append_recent_lines, apply_file_activity, compute_observation_refresh,
         effective_display_name, find_git_worktree_root, naming_terminal_history,
-        synthesis_terminal_activity, SessionObservation, TerminalActivityEntry,
+        is_bare_waiting_shell, synthesis_terminal_activity, SessionObservation,
+        TerminalActivityEntry,
     };
-    use crate::model::{SessionId, SessionKind, SessionLaunch, SessionRecord, SessionStatus};
+    use crate::model::{
+        user_shell_launch, SessionId, SessionKind, SessionLaunch, SessionRecord, SessionStatus,
+    };
     use std::fs;
     use std::path::PathBuf;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -514,7 +530,7 @@ mod tests {
     }
 
     #[test]
-    fn effective_display_name_prefers_override_then_new_session() {
+    fn effective_display_name_prefers_override_then_launch_name() {
         let launch = SessionLaunch {
             name: "Shell 1".into(),
             subtitle: "Main".into(),
@@ -531,7 +547,7 @@ mod tests {
             pid: None,
             events: Vec::new(),
         };
-        assert_eq!(effective_display_name(&session), "New Session");
+        assert_eq!(effective_display_name(&session), "Shell 1");
 
         let named_session = SessionRecord {
             display_name: Some("Parser repair".into()),
@@ -592,6 +608,42 @@ mod tests {
     }
 
     #[test]
+    fn bare_waiting_shell_detects_shell_without_subprocesses() {
+        let session = session_record_with_cwd(
+            SessionId(42),
+            tempdir_path("exaterm-observation-bare-shell"),
+        );
+        let observation = SessionObservation::new();
+
+        assert!(is_bare_waiting_shell(&session, &observation));
+    }
+
+    #[test]
+    fn bare_waiting_shell_rejects_shell_with_direct_child() {
+        let session = session_record_with_cwd(
+            SessionId(42),
+            tempdir_path("exaterm-observation-active-shell"),
+        );
+        let mut observation = SessionObservation::new();
+        observation.shell_child_command = Some("codex".into());
+
+        assert!(!is_bare_waiting_shell(&session, &observation));
+    }
+
+    #[test]
+    fn bare_waiting_shell_ignores_terminal_evidence_without_subprocesses() {
+        let session = session_record_with_cwd(
+            SessionId(42),
+            tempdir_path("exaterm-observation-terminal-evidence"),
+        );
+        let mut observation = SessionObservation::new();
+        observation.active_command = Some("codex".into());
+        observation.work_output_excerpt = Some("Updating parser".into());
+
+        assert!(is_bare_waiting_shell(&session, &observation));
+    }
+
+    #[test]
     fn apply_file_activity_deduplicates_path_to_latest_timestamp() {
         let mut observation = SessionObservation::new();
         let base = Instant::now();
@@ -634,7 +686,7 @@ mod tests {
     }
 
     fn session_record_with_cwd(session_id: SessionId, cwd: PathBuf) -> SessionRecord {
-        let launch = SessionLaunch::user_shell("Shell", "test shell").with_cwd(cwd);
+        let launch = user_shell_launch("Shell", "test shell").with_cwd(cwd);
         SessionRecord {
             id: session_id,
             launch,

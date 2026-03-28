@@ -16,19 +16,6 @@ pub enum TacticalState {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ProgressState {
-    SteadyProgress,
-    Verifying,
-    Exploring,
-    WaitingForNudge,
-    Blocked,
-    Flailing,
-    ConvergedWaiting,
-    Idle,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum MomentumState {
     Strong,
     Steady,
@@ -66,43 +53,25 @@ pub enum MismatchLevel {
 pub struct TacticalSynthesis {
     pub tactical_state: Option<TacticalState>,
     pub tactical_state_brief: Option<String>,
-    pub progress_state: Option<ProgressState>,
-    pub progress_state_brief: Option<String>,
     pub momentum_state: Option<MomentumState>,
     pub momentum_state_brief: Option<String>,
     pub operator_action: Option<OperatorAction>,
     pub operator_action_brief: Option<String>,
-    pub terse_operator_summary: Option<String>,
     pub headline: Option<String>,
-    pub primary_fragment: Option<String>,
-    #[serde(default)]
-    pub supporting_fragments: Vec<String>,
-    pub alignment_fragment: Option<String>,
     pub risk_posture: Option<RiskPosture>,
     pub risk_brief: Option<String>,
     pub mismatch_level: MismatchLevel,
     pub mismatch_brief: Option<String>,
-    pub intervention_warranted: bool,
 }
 
 impl TacticalSynthesis {
     pub fn sanitize(mut self) -> Self {
         self.headline = sanitize_optional(self.headline);
-        self.primary_fragment = sanitize_optional(self.primary_fragment);
-        self.alignment_fragment = sanitize_optional(self.alignment_fragment);
         self.tactical_state_brief = sanitize_optional(self.tactical_state_brief);
-        self.progress_state_brief = sanitize_optional(self.progress_state_brief);
         self.momentum_state_brief = sanitize_optional(self.momentum_state_brief);
         self.operator_action_brief = sanitize_optional(self.operator_action_brief);
-        self.terse_operator_summary = sanitize_optional(self.terse_operator_summary);
         self.risk_brief = sanitize_optional(self.risk_brief);
         self.mismatch_brief = sanitize_optional(self.mismatch_brief);
-        self.supporting_fragments = self
-            .supporting_fragments
-            .into_iter()
-            .filter_map(|fragment| sanitize_optional(Some(fragment)))
-            .take(2)
-            .collect();
         self
     }
 }
@@ -175,29 +144,20 @@ mod tests {
         let summary = TacticalSynthesis {
             tactical_state: None,
             tactical_state_brief: Some("  stopped   cleanly  ".into()),
-            progress_state: None,
-            progress_state_brief: None,
             momentum_state: None,
             momentum_state_brief: None,
             operator_action: None,
             operator_action_brief: None,
-            terse_operator_summary: Some("  waiting   for   continue ".into()),
             headline: Some("  parser   pass ".into()),
-            primary_fragment: None,
-            supporting_fragments: vec!["  one  ".into(), " ".into(), "two".into()],
-            alignment_fragment: None,
             risk_posture: None,
             risk_brief: None,
             mismatch_level: MismatchLevel::Low,
             mismatch_brief: None,
-            intervention_warranted: false,
         }
         .sanitize();
 
         assert_eq!(summary.headline.as_deref(), Some("parser pass"));
         assert_eq!(summary.tactical_state_brief.as_deref(), Some("stopped cleanly"));
-        assert_eq!(summary.terse_operator_summary.as_deref(), Some("waiting for continue"));
-        assert_eq!(summary.supporting_fragments, vec!["one".to_string(), "two".to_string()]);
     }
 
     #[test]

@@ -1,15 +1,28 @@
 use crate::beachhead::{BeachheadConnection, BeachheadTarget};
+use crate::layout::{
+    battlefield_can_embed_terminals, battlefield_columns,
+    visible_scrollback_line_capacity as layout_visible_scrollback_line_capacity,
+};
+use crate::style::{
+    apply_battle_card_surface_style, apply_battle_status_style, configure_app_icons, load_css,
+    status_chip_label,
+};
 use crate::terminal_adapter::{
     attach_display_runtime, measured_terminal_size_hint, spawn_runtime, terminal_size_hint,
     write_display_output, ClientDisplayRuntime,
 };
 use crate::supervision::{
-    build_battle_card, BattleCardStatus, BattleCardViewModel, DeterministicIntentEngine,
-    ObservedActivity, SignalTone,
+    build_battle_card, BattleCardStatus, BattleCardViewModel, ObservedActivity, SignalTone,
+};
+use crate::widgets::{build_segmented_bar, FocusWidgets, SegmentedBarWidgets, SessionCardWidgets};
+use crate::workspace_view::WorkspaceViewState;
+use exaterm_core::model::{
+    blocking_prompt_launch, planning_stream_launch, running_stream_launch, ssh_shell_launch,
+    user_shell_launch,
 };
 use exaterm_core::observation::{
     apply_stream_update, build_naming_evidence, build_nudge_evidence, build_tactical_evidence,
-    effective_display_name, refresh_observation as refresh_session_observation,
+    is_bare_waiting_shell, refresh_observation as refresh_session_observation,
     scrollback_fragments, SessionObservation,
 };
 use exaterm_core::runtime::{RuntimeEvent, SessionRuntime};
@@ -18,13 +31,11 @@ use exaterm_core::synthesis::{
     summary_signature, summarize_blocking, NamingEvidence, NudgeEvidence, OpenAiNamingConfig,
     OpenAiNudgeConfig, OpenAiSynthesisConfig, TacticalEvidence,
 };
-use exaterm_types::model::{
-    SessionId, SessionLaunch, SessionRecord, WorkspaceState,
-};
+use exaterm_types::model::{SessionId, SessionLaunch, SessionRecord};
 use exaterm_types::proto::{ClientMessage, ObservationSnapshot, ServerMessage, WorkspaceSnapshot};
 use exaterm_types::synthesis::{
-    MismatchLevel, MomentumState, NameSuggestion, NudgeSuggestion, OperatorAction, ProgressState,
-    RiskPosture, TacticalState, TacticalSynthesis,
+    MismatchLevel, MomentumState, NameSuggestion, NudgeSuggestion, OperatorAction, RiskPosture,
+    TacticalState, TacticalSynthesis,
 };
 use gtk::gdk;
 use gtk::prelude::*;
@@ -36,7 +47,6 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
-use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
@@ -45,54 +55,6 @@ use vte::prelude::*;
 use vte4 as vte;
 
 const APP_ID: &str = "io.exaterm.Exaterm";
-
-const ESTIMATED_TERMINAL_CELL_WIDTH: i32 = 8;
-const ESTIMATED_TERMINAL_CELL_HEIGHT: i32 = 18;
-const MIN_EMBEDDED_TERMINAL_COLS: i32 = 80;
-const MIN_EMBEDDED_TERMINAL_ROWS: i32 = 24;
-const EMBEDDED_TERMINAL_MIN_WIDTH: i32 = (ESTIMATED_TERMINAL_CELL_WIDTH * MIN_EMBEDDED_TERMINAL_COLS) + 72;
-const EMBEDDED_TERMINAL_MIN_HEIGHT: i32 = (ESTIMATED_TERMINAL_CELL_HEIGHT * MIN_EMBEDDED_TERMINAL_ROWS) + 96;
-
-fn bundled_icon_search_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets/icons")
-}
-
-fn configure_app_icons() {
-    if let Some(display) = gdk::Display::default() {
-        let icon_theme = gtk::IconTheme::for_display(&display);
-        icon_theme.add_search_path(bundled_icon_search_path());
-    }
-    gtk::Window::set_default_icon_name(APP_ID);
-}
-
-#[derive(Clone)]
-struct SegmentedBarWidgets {
-    frame: gtk::Box,
-    reason: gtk::Label,
-    segments: Vec<gtk::Box>,
-}
-
-#[derive(Clone)]
-struct SessionCardWidgets {
-    row: gtk::FlowBoxChild,
-    frame: gtk::Frame,
-    title: gtk::Label,
-    status: gtk::Label,
-    nudge_row: gtk::Box,
-    nudge_state: gtk::Label,
-    recency: gtk::Label,
-    middle_stack: gtk::Stack,
-    scrollback_band: gtk::Box,
-    terminal_slot: gtk::Box,
-    bars: gtk::Box,
-    headline: gtk::Label,
-    detail: gtk::Label,
-    alert: gtk::Label,
-    momentum_bar: SegmentedBarWidgets,
-    risk_bar: SegmentedBarWidgets,
-    terminal_view: gtk::ScrolledWindow,
-    terminal: vte::Terminal,
-}
 
 struct SummaryWorker {
     requests: mpsc::Sender<SummaryJob>,
@@ -232,28 +194,66 @@ impl NudgeCacheEntry {
     }
 }
 
-struct FocusWidgets {
-    panel: gtk::Box,
-    frame: gtk::Frame,
-    title: gtk::Label,
-    status: gtk::Label,
-    alert: gtk::Label,
-    terminal_slot: gtk::Box,
-    bars: gtk::Box,
-    momentum_bar: SegmentedBarWidgets,
-    risk_bar: SegmentedBarWidgets,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum RunMode {
     Local,
     Ssh { target: String },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CardChromeMode {
+    SparseShell,
+    Summarized,
+}
+
+impl CardChromeMode {
+    fn from_summary(summary: Option<&TacticalSynthesis>) -> Self {
+        if summary.is_some() {
+            Self::Summarized
+        } else {
+            Self::SparseShell
+        }
+    }
+
+    fn summarized(self) -> bool {
+        matches!(self, Self::Summarized)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CardChromeVisibility {
+    title_visible: bool,
+    headline_visible: bool,
+    status_visible: bool,
+    header_visible: bool,
+    bars_visible: bool,
+    nudge_state_visible: bool,
+    nudge_row_visible: bool,
+}
+
+fn card_chrome_visibility(
+    chrome_mode: CardChromeMode,
+    focus_mode: bool,
+    has_operator_summary: bool,
+) -> CardChromeVisibility {
+    let summarized = chrome_mode.summarized();
+    let title_visible = summarized;
+    let status_visible = summarized;
+    CardChromeVisibility {
+        title_visible,
+        headline_visible: summarized && !focus_mode,
+        status_visible,
+        header_visible: title_visible || status_visible,
+        bars_visible: summarized && !focus_mode,
+        nudge_state_visible: summarized && !focus_mode,
+        nudge_row_visible: has_operator_summary || (summarized && !focus_mode),
+    }
+}
+
 struct AppContext {
     mode: RunMode,
     beachhead: Option<BeachheadConnection>,
-    state: Rc<RefCell<WorkspaceState>>,
+    state: Rc<RefCell<WorkspaceViewState>>,
     title: adw::WindowTitle,
     empty_state: gtk::Box,
     content_root: gtk::Box,
@@ -323,7 +323,8 @@ fn daemon_backed(context: &AppContext) -> bool {
 
 fn build_ui(app: &gtk::Application, mode: RunMode) {
     load_css();
-    configure_app_icons();
+    configure_app_icons(APP_ID);
+    let missing_openai_key = !visual_gallery_enabled() && OpenAiSynthesisConfig::from_env().is_none();
     let beachhead = if visual_gallery_enabled() {
         None
     } else {
@@ -444,6 +445,7 @@ fn build_ui(app: &gtk::Application, mode: RunMode) {
         .hexpand(true)
         .build();
     focus_bars.add_css_class("card-bars-row");
+    focus_bars.set_homogeneous(true);
     focus_bars.append(&focus_momentum_bar.frame);
     focus_bars.append(&focus_risk_bar.frame);
 
@@ -518,7 +520,7 @@ fn build_ui(app: &gtk::Application, mode: RunMode) {
     let context = Rc::new(AppContext {
         mode: mode.clone(),
         beachhead,
-        state: Rc::new(RefCell::new(WorkspaceState::new())),
+        state: Rc::new(RefCell::new(WorkspaceViewState::new())),
         title,
         empty_state,
         content_root,
@@ -527,6 +529,7 @@ fn build_ui(app: &gtk::Application, mode: RunMode) {
         focus: FocusWidgets {
             panel: focus_panel,
             frame: focus_frame,
+            header: focus_header,
             title: focus_title,
             status: focus_status,
             alert: focus_alert,
@@ -710,6 +713,9 @@ fn build_ui(app: &gtk::Application, mode: RunMode) {
     }
 
     window.present();
+    if missing_openai_key {
+        present_openai_key_warning(&window);
+    }
 }
 
 fn present_startup_error(app: &gtk::Application, error: &str) {
@@ -763,13 +769,23 @@ fn present_startup_error(app: &gtk::Application, error: &str) {
     window.present();
 }
 
+fn present_openai_key_warning(window: &adw::ApplicationWindow) {
+    let dialog = adw::AlertDialog::builder()
+        .heading("OpenAI API key missing")
+        .body(
+            "Exaterm started, but `OPENAI_API_KEY` is not set. Tactical summaries, naming, and auto-nudge are disabled until you provide a key.",
+        )
+        .close_response("ok")
+        .build();
+    dialog.add_response("ok", "OK");
+    dialog.set_default_response(Some("ok"));
+    dialog.present(Some(window));
+}
+
 fn default_shell_launch(context: &Rc<AppContext>, number: usize) -> SessionLaunch {
     match &context.mode {
-        RunMode::Local => SessionLaunch::user_shell(
-            format!("Shell {number}"),
-            "Generic command session",
-        ),
-        RunMode::Ssh { target } => SessionLaunch::ssh_shell(
+        RunMode::Local => user_shell_launch(format!("Shell {number}"), "Generic command session"),
+        RunMode::Ssh { target } => ssh_shell_launch(
             format!("SSH {number}"),
             format!("Remote session on {target}"),
             target.clone(),
@@ -820,7 +836,7 @@ fn visual_gallery_enabled() -> bool {
 
 fn seed_visual_gallery(context: &Rc<AppContext>) {
     let launches = vec![
-        SessionLaunch::running_stream(
+        running_stream_launch(
             "Agent A",
             "Parser recovery",
             transcript_script(&[
@@ -833,7 +849,7 @@ fn seed_visual_gallery(context: &Rc<AppContext>) {
                 "2 parser tests still failing",
             ]),
         ),
-        SessionLaunch::planning_stream(
+        planning_stream_launch(
             "Agent B",
             "Checkpointed UI pass",
             transcript_script(&[
@@ -846,12 +862,12 @@ fn seed_visual_gallery(context: &Rc<AppContext>) {
                 "• Tests pass. Ready for the next instruction or a keep-going nudge.",
             ]),
         ),
-        SessionLaunch::blocking_prompt(
+        blocking_prompt_launch(
             "Agent C",
             "Deploy approval",
             "The deploy script is ready, but this next step will touch production. Proceed with deploy? [y/N]",
         ),
-        SessionLaunch::running_stream(
+        running_stream_launch(
             "Agent D",
             "GTK focus regression",
             transcript_script(&[
@@ -866,7 +882,7 @@ fn seed_visual_gallery(context: &Rc<AppContext>) {
                 "error[E0599]: no method named present on FocusHandle",
             ]),
         ),
-        SessionLaunch::planning_stream(
+        planning_stream_launch(
             "Agent E",
             "Post-fix watch",
             transcript_script(&[
@@ -878,7 +894,7 @@ fn seed_visual_gallery(context: &Rc<AppContext>) {
                 "• Stable. Standing by.",
             ]),
         ),
-        SessionLaunch::planning_stream(
+        planning_stream_launch(
             "Agent F",
             "Disk pressure",
             transcript_script(&[
@@ -917,7 +933,7 @@ fn build_battle_card_widgets(
     session: &SessionRecord,
 ) -> SessionCardWidgets {
     let title = gtk::Label::builder()
-        .label(&session.launch.name)
+        .label("")
         .xalign(0.0)
         .css_classes(vec!["card-title".to_string()])
         .build();
@@ -943,8 +959,8 @@ fn build_battle_card_widgets(
     let nudge_row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(8)
-        .hexpand(true)
-        .halign(gtk::Align::Fill)
+        .hexpand(false)
+        .halign(gtk::Align::End)
         .visible(false)
         .build();
     nudge_row.set_valign(gtk::Align::Center);
@@ -1064,6 +1080,8 @@ fn build_battle_card_widgets(
         .vexpand(true)
         .build();
     content.append(&header);
+    content.append(&headline);
+    content.append(&detail);
     content.append(&nudge_row);
     content.append(&middle_stack);
     content.append(&footer);
@@ -1092,11 +1110,16 @@ fn build_battle_card_widgets(
         let click = gtk::GestureClick::new();
         click.set_button(1);
         click.connect_released(move |_, _, _, _| {
+            let focused_before = context.state.borrow().focused_session();
             context.cards.select_child(&row);
             context.state.borrow_mut().select_session(session_id);
-            if context.state.borrow().focused_session() == Some(session_id) {
-                show_battlefield(&context);
-            } else if battlefield_embeds_terminal(&context, session_id) {
+            if let Some(focused_session) = focused_before {
+                if focused_session == session_id {
+                    show_battlefield(&context);
+                }
+                return;
+            }
+            if battlefield_embeds_terminal(&context, session_id) {
                 if let Some(card) = context.session_cards.borrow().get(&session_id) {
                     card.terminal.grab_focus();
                 }
@@ -1166,6 +1189,7 @@ fn build_battle_card_widgets(
     SessionCardWidgets {
         row,
         frame,
+        header,
         title,
         status,
         nudge_row,
@@ -1182,6 +1206,16 @@ fn build_battle_card_widgets(
         risk_bar,
         terminal_view,
         terminal,
+    }
+}
+
+fn ui_display_name(session: &SessionRecord, chrome_mode: CardChromeMode) -> String {
+    match chrome_mode {
+        CardChromeMode::SparseShell => String::new(),
+        CardChromeMode::Summarized => session
+            .display_name
+            .clone()
+            .unwrap_or_else(|| "New Session".into()),
     }
 }
 
@@ -1395,47 +1429,6 @@ fn split_terminal_here(context: &Rc<AppContext>, source_session: SessionId) {
         }
     }
     refresh_card_styles(context);
-}
-
-fn build_segmented_bar(label: &str) -> SegmentedBarWidgets {
-    let caption = gtk::Label::builder()
-        .label(label)
-        .xalign(0.0)
-        .css_classes(vec!["bar-caption".to_string()])
-        .build();
-    let bar = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(4)
-        .hexpand(true)
-        .build();
-    bar.add_css_class("segmented-bar");
-    let segments = (0..4)
-        .map(|_| {
-            let segment = gtk::Box::builder().hexpand(true).build();
-            segment.add_css_class("bar-segment");
-            bar.append(&segment);
-            segment
-        })
-        .collect::<Vec<_>>();
-    let reason = gtk::Label::builder()
-        .xalign(0.0)
-        .wrap(true)
-        .css_classes(vec!["bar-reason".to_string()])
-        .build();
-    let frame = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(4)
-        .hexpand(true)
-        .build();
-    frame.add_css_class("bar-widget");
-    frame.append(&caption);
-    frame.append(&bar);
-    frame.append(&reason);
-    SegmentedBarWidgets {
-        frame,
-        reason,
-        segments,
-    }
 }
 
 fn spawn_session(
@@ -1843,7 +1836,7 @@ fn drain_runtime_events(context: &Rc<AppContext>) {
                 let mut observations = context.observations.borrow_mut();
                 let observation = observations
                     .entry(session_id)
-                    .or_insert_with(SessionObservation::new);
+                    .or_default();
                 apply_stream_update(observation, update);
             }
             RuntimeEvent::Exited(exit_code) => {
@@ -2040,7 +2033,7 @@ fn refresh_observation(context: &Rc<AppContext>, session: &SessionRecord) {
     let mut observations = context.observations.borrow_mut();
     let observation = observations
         .entry(session.id)
-        .or_insert_with(SessionObservation::new);
+        .or_default();
     refresh_session_observation(observation, session, remote_mode);
 }
 
@@ -2063,26 +2056,34 @@ fn update_battle_card_widgets(
         work_output_excerpt: observation.work_output_excerpt.clone(),
         idle_seconds: Some(observation.last_change.elapsed().as_secs()),
     };
-    let mut card_model = build_battle_card(
-        session,
-        &observed,
-        &observation.recent_lines,
-        &DeterministicIntentEngine,
-    );
+    let mut card_model = build_battle_card(session, &observed);
+    let should_synthesize = !is_bare_waiting_shell(session, observation);
     let evidence = build_tactical_evidence(session, observation);
-    maybe_queue_summary(context, session.id, &evidence);
-    let naming = build_naming_evidence(session, observation);
-    maybe_queue_name(context, session.id, &naming);
-    let live_summary = current_summary(context, session.id, &evidence);
+    if should_synthesize {
+        maybe_queue_summary(context, session.id, &evidence);
+        let naming = build_naming_evidence(session, observation);
+        maybe_queue_name(context, session.id, &naming);
+    }
+    let live_summary = if should_synthesize {
+        current_summary(context, session.id, &evidence)
+    } else {
+        None
+    };
     maybe_queue_nudge(context, session, observation, live_summary.as_ref());
+    let chrome_mode = CardChromeMode::from_summary(live_summary.as_ref());
     if let Some(summary) = live_summary.clone() {
         card_model = apply_tactical_synthesis(card_model, summary);
     }
+    let visual_status = if chrome_mode.summarized() {
+        card_model.status
+    } else {
+        BattleCardStatus::Idle
+    };
 
-    let display_name = effective_display_name(session);
+    let display_name = ui_display_name(session, chrome_mode);
     card.title.set_label(&display_name);
-    apply_battle_status_style(&card.status, card_model.status);
-    apply_battle_card_surface_style(&card.frame, card_model.status);
+    apply_battle_status_style(&card.status, visual_status);
+    apply_battle_card_surface_style(&card.frame, visual_status);
     card.status
         .set_label(&status_chip_label(card_model.status, &card_model.recency_label));
     card.recency.set_label("");
@@ -2105,18 +2106,16 @@ fn update_battle_card_widgets(
         Some(observation.last_change.elapsed().as_secs()),
     );
 
-    let operator_summary = live_summary
-        .as_ref()
-        .and_then(|summary| summary.terse_operator_summary.as_ref())
-        .cloned()
-        .unwrap_or_default();
-    card.alert.set_label(&operator_summary);
-    card.alert.set_visible(!operator_summary.is_empty());
+    card.alert.set_label("");
+    card.alert.set_visible(false);
     let in_focus_mode = context.state.borrow().focused_session().is_some();
-    card.nudge_row.set_visible(!in_focus_mode);
-    if !in_focus_mode {
+    if !in_focus_mode && chrome_mode.summarized() {
         apply_nudge_pill(&context.nudge_cache.borrow(), session.id, &card.nudge_state);
     }
+    apply_summary_chrome_visibility(
+        &card,
+        card_chrome_visibility(chrome_mode, in_focus_mode, false),
+    );
 }
 
 fn maybe_queue_summary(context: &Rc<AppContext>, session_id: SessionId, evidence: &TacticalEvidence) {
@@ -2284,7 +2283,7 @@ fn maybe_queue_name(context: &Rc<AppContext>, session_id: SessionId, evidence: &
 fn current_summary(
     context: &Rc<AppContext>,
     session_id: SessionId,
-    evidence: &TacticalEvidence,
+    _evidence: &TacticalEvidence,
 ) -> Option<TacticalSynthesis> {
     if daemon_backed(context) {
         return context
@@ -2297,16 +2296,43 @@ fn current_summary(
         return gallery_mock_summary(context, session_id);
     }
 
-    let signature = summary_signature(evidence);
     let cache = context.summary_cache.borrow();
     let entry = cache.get(&session_id)?;
-    if entry.completed_signature.as_deref() == Some(signature.as_str()) {
-        return entry.last_summary.clone();
+    entry.last_summary.clone()
+}
+
+fn should_show_summary(
+    context: &Rc<AppContext>,
+    session_id: SessionId,
+) -> bool {
+    let state = context.state.borrow();
+    let observations = context.observations.borrow();
+    let Some(session) = state.session(session_id) else {
+        return false;
+    };
+    let Some(observation) = observations.get(&session_id) else {
+        return false;
+    };
+    !is_bare_waiting_shell(session, observation)
+}
+
+fn card_chrome_mode_for_session(context: &Rc<AppContext>, session_id: SessionId) -> CardChromeMode {
+    if visual_gallery_enabled() {
+        return CardChromeMode::Summarized;
     }
-    if entry.in_flight || entry.requested_signature.is_some() {
-        return entry.last_summary.clone();
+    if !should_show_summary(context, session_id) {
+        return CardChromeMode::SparseShell;
+    }
+    let has_summary = context
+        .summary_cache
+        .borrow()
+        .get(&session_id)
+        .and_then(|entry| entry.last_summary.as_ref())
+        .is_some();
+    if has_summary {
+        CardChromeMode::Summarized
     } else {
-        entry.last_summary.clone()
+        CardChromeMode::SparseShell
     }
 }
 
@@ -2318,122 +2344,80 @@ fn gallery_mock_summary(context: &Rc<AppContext>, session_id: SessionId) -> Opti
         "Agent A" => TacticalSynthesis {
             tactical_state: Some(TacticalState::Working),
             tactical_state_brief: Some("Narrowing the parser failure with focused reruns".into()),
-            progress_state: Some(ProgressState::Verifying),
-            progress_state_brief: Some("Focused test reruns are narrowing the failure".into()),
             momentum_state: Some(MomentumState::Steady),
             momentum_state_brief: Some("The loop keeps moving, but the fix is not landed yet".into()),
             operator_action: Some(OperatorAction::Watch),
             operator_action_brief: Some("Let the focused repair loop continue".into()),
-            terse_operator_summary: Some("Tight edit-test loop, still failing but converging.".into()),
-            headline: None,
-            primary_fragment: None,
-            supporting_fragments: Vec::new(),
-            alignment_fragment: None,
+            headline: Some("Tight edit-test loop, still failing but converging.".into()),
             risk_posture: Some(RiskPosture::Low),
             risk_brief: Some("Normal repair work with no risky behavior visible".into()),
             mismatch_level: MismatchLevel::Low,
             mismatch_brief: Some("Narrative and machine evidence line up".into()),
-            intervention_warranted: false,
         },
         "Agent B" => TacticalSynthesis {
             tactical_state: Some(TacticalState::Stopped),
             tactical_state_brief: Some("Paused after a clean checkpoint".into()),
-            progress_state: Some(ProgressState::WaitingForNudge),
-            progress_state_brief: Some("The agent paused after reporting a clean checkpoint".into()),
             momentum_state: Some(MomentumState::Strong),
             momentum_state_brief: Some("The checkpoint landed cleanly before the pause".into()),
             operator_action: Some(OperatorAction::Nudge),
             operator_action_brief: Some("A continue prompt is probably enough".into()),
-            terse_operator_summary: Some("Looks done with this pass and waiting for a nudge.".into()),
-            headline: None,
-            primary_fragment: None,
-            supporting_fragments: Vec::new(),
-            alignment_fragment: None,
+            headline: Some("Looks done with this pass and waiting for a nudge.".into()),
             risk_posture: Some(RiskPosture::Low),
             risk_brief: Some("No risky behavior visible; this looks like a clean pause".into()),
             mismatch_level: MismatchLevel::Low,
             mismatch_brief: Some("The pause matches the visible checkpoint".into()),
-            intervention_warranted: false,
         },
         "Agent C" => TacticalSynthesis {
             tactical_state: Some(TacticalState::Blocked),
             tactical_state_brief: Some("Waiting on explicit approval".into()),
-            progress_state: Some(ProgressState::Blocked),
-            progress_state_brief: Some("The next step cannot proceed without operator input".into()),
             momentum_state: Some(MomentumState::Fragile),
             momentum_state_brief: Some("Forward motion stops at the approval boundary".into()),
             operator_action: Some(OperatorAction::Intervene),
             operator_action_brief: Some("Approval or redirection is required now".into()),
-            terse_operator_summary: Some("Hard stop on approval boundary; operator input required.".into()),
-            headline: None,
-            primary_fragment: None,
-            supporting_fragments: Vec::new(),
-            alignment_fragment: None,
+            headline: Some("Hard stop on approval boundary; operator input required.".into()),
             risk_posture: Some(RiskPosture::Watch),
             risk_brief: Some("The next step touches production, so operator review matters".into()),
             mismatch_level: MismatchLevel::Low,
             mismatch_brief: Some("The stop is consistent with the stated boundary".into()),
-            intervention_warranted: true,
         },
         "Agent D" => TacticalSynthesis {
             tactical_state: Some(TacticalState::Active),
             tactical_state_brief: Some("Retrying the same failing path".into()),
-            progress_state: Some(ProgressState::Flailing),
-            progress_state_brief: Some("Repeated retries are not producing new evidence".into()),
             momentum_state: Some(MomentumState::Stalled),
             momentum_state_brief: Some("Retries keep looping without narrowing the issue".into()),
             operator_action: Some(OperatorAction::Watch),
             operator_action_brief: Some("Watch closely; step in if the loop repeats again".into()),
-            terse_operator_summary: Some("Retry loop is repeating without a decisive new clue.".into()),
-            headline: None,
-            primary_fragment: None,
-            supporting_fragments: Vec::new(),
-            alignment_fragment: None,
+            headline: Some("Retry loop is repeating without a decisive new clue.".into()),
             risk_posture: Some(RiskPosture::Watch),
             risk_brief: Some("Churn risk is rising because the same failure keeps returning".into()),
             mismatch_level: MismatchLevel::Watch,
             mismatch_brief: Some("The narrative sounds active, but progress is weak".into()),
-            intervention_warranted: false,
         },
         "Agent E" => TacticalSynthesis {
             tactical_state: Some(TacticalState::Idle),
             tactical_state_brief: Some("Stable after validation with nothing to resume".into()),
-            progress_state: Some(ProgressState::ConvergedWaiting),
-            progress_state_brief: Some("Repeated steady status suggests the task is parked cleanly".into()),
             momentum_state: Some(MomentumState::Steady),
             momentum_state_brief: Some("Recent momentum is fading after a clean finish".into()),
             operator_action: Some(OperatorAction::None),
             operator_action_brief: Some("No intervention needed unless priorities change".into()),
-            terse_operator_summary: Some("Looks stably parked after validation, not suspiciously idle.".into()),
-            headline: None,
-            primary_fragment: None,
-            supporting_fragments: Vec::new(),
-            alignment_fragment: None,
+            headline: Some("Looks stably parked after validation, not suspiciously idle.".into()),
             risk_posture: Some(RiskPosture::Low),
             risk_brief: Some("No risky behavior or mismatch is visible".into()),
             mismatch_level: MismatchLevel::Low,
             mismatch_brief: Some("The transcript supports a clean stand-by state".into()),
-            intervention_warranted: false,
         },
         "Agent F" => TacticalSynthesis {
             tactical_state: Some(TacticalState::Active),
             tactical_state_brief: Some("Escalating from disk pressure into risky cleanup ideas".into()),
-            progress_state: Some(ProgressState::Blocked),
-            progress_state_brief: Some("Disk pressure is blocking forward progress".into()),
             momentum_state: Some(MomentumState::Stalled),
             momentum_state_brief: Some("Disk pressure is halting forward motion".into()),
             operator_action: Some(OperatorAction::Intervene),
             operator_action_brief: Some("Step in before cleanup turns destructive".into()),
-            terse_operator_summary: Some("Blocked on disk space and drifting toward risky cleanup actions.".into()),
-            headline: None,
-            primary_fragment: None,
-            supporting_fragments: Vec::new(),
-            alignment_fragment: None,
+            headline: Some("Blocked on disk space and drifting toward risky cleanup actions.".into()),
             risk_posture: Some(RiskPosture::Extreme),
             risk_brief: Some("Frustration plus destructive cleanup ideas is an extreme-risk combination".into()),
             mismatch_level: MismatchLevel::Watch,
             mismatch_brief: Some("The transcript still matches the disk-pressure problem, but escalation is concerning".into()),
-            intervention_warranted: true,
         },
         _ => return None,
     })
@@ -2462,18 +2446,8 @@ fn apply_tactical_synthesis(
         };
     }
 
-    if !summary.supporting_fragments.is_empty() {
-        let mut merged = card_model.evidence_fragments.clone();
-        for fragment in &summary.supporting_fragments {
-            if !merged
-                .iter()
-                .any(|existing| existing.eq_ignore_ascii_case(fragment))
-            {
-                merged.push(fragment.clone());
-            }
-        }
-        merged.truncate(2);
-        card_model.evidence_fragments = merged;
+    if let Some(headline) = summary.headline.clone() {
+        card_model.headline = headline;
     }
     let caution_text = match summary.operator_action {
         Some(OperatorAction::Intervene) => {
@@ -2490,7 +2464,7 @@ fn apply_tactical_synthesis(
             summary.risk_brief.clone()
         }
         _ if !matches!(summary.mismatch_level, MismatchLevel::Low) => summary.mismatch_brief.clone(),
-        _ => summary.alignment_fragment.clone(),
+        _ => None,
     };
 
     if let Some(text) = caution_text {
@@ -2532,18 +2506,19 @@ fn apply_metric_widgets(
     idle_seconds: Option<u64>,
 ) {
     let momentum = momentum_bar_value(summary, idle_seconds);
-    apply_segmented_bar(&card.momentum_bar, momentum.as_ref());
+    apply_segmented_bar(&card.momentum_bar, momentum.as_ref(), summary.is_some());
 
     let risk = risk_bar_value(summary);
-    apply_segmented_bar(&card.risk_bar, risk.as_ref());
+    apply_segmented_bar(&card.risk_bar, risk.as_ref(), summary.is_some());
 }
 
 fn apply_segmented_bar(
     bar: &SegmentedBarWidgets,
     value: Option<&(usize, SignalTone, Option<String>)>,
+    show_when_empty: bool,
 ) {
     let Some((fill, tone, reason)) = value else {
-        bar.frame.set_visible(false);
+        bar.frame.set_visible(show_when_empty);
         bar.reason.set_label("");
         bar.frame.set_tooltip_text(None::<&str>);
         for segment in &bar.segments {
@@ -2645,13 +2620,7 @@ fn refresh_workspace(context: &Rc<AppContext>) {
                 work_output_excerpt: observation.work_output_excerpt.clone(),
                 idle_seconds: Some(observation.last_change.elapsed().as_secs()),
             };
-            let status = build_battle_card(
-                session,
-                &observed,
-                &observation.recent_lines,
-                &DeterministicIntentEngine,
-            )
-            .status;
+            let status = build_battle_card(session, &observed).status;
             match status {
                 BattleCardStatus::Idle => idle += 1,
                 BattleCardStatus::Stopped => active += 1,
@@ -2688,10 +2657,13 @@ fn refresh_card_styles(context: &Rc<AppContext>) {
         if focused == Some(*session_id) {
             card.row.add_css_class("focused-card");
         }
-        card.headline.set_visible(!focus_mode);
+        let chrome_visibility = card_chrome_visibility(
+            card_chrome_mode_for_session(context, *session_id),
+            focus_mode,
+            !card.alert.label().is_empty(),
+        );
+        card.headline.set_visible(chrome_visibility.headline_visible);
         card.detail.set_visible(!focus_mode && !card.detail.label().is_empty());
-        card.momentum_bar.frame.set_visible(!focus_mode);
-        card.risk_bar.frame.set_visible(!focus_mode);
         card.alert.set_wrap(focus_mode);
         card.alert.set_single_line_mode(!focus_mode);
         card.alert.set_ellipsize(if focus_mode {
@@ -2699,12 +2671,14 @@ fn refresh_card_styles(context: &Rc<AppContext>) {
         } else {
             gtk::pango::EllipsizeMode::End
         });
+        apply_summary_chrome_visibility(card, chrome_visibility);
         let shows_terminal = battlefield_embeds_terminal(context, *session_id);
         card.bars.set_orientation(if shows_terminal {
             gtk::Orientation::Horizontal
         } else {
             gtk::Orientation::Vertical
         });
+        card.bars.set_homogeneous(shows_terminal);
         if shows_terminal {
             card.frame.remove_css_class("scrollback-card");
             card.terminal_slot.remove_css_class("scrollback-terminal-hidden");
@@ -2744,6 +2718,7 @@ fn show_intervention(context: &Rc<AppContext>, session_id: SessionId) {
     refresh_card_styles(context);
     refresh_focus_panel(context);
     refresh_workspace(context);
+    schedule_runtime_size_sync(context);
 }
 
 fn show_battlefield(context: &Rc<AppContext>) {
@@ -2759,6 +2734,7 @@ fn show_battlefield(context: &Rc<AppContext>) {
     sync_terminal_parents(context);
     refresh_card_styles(context);
     refresh_workspace(context);
+    schedule_runtime_size_sync(context);
 }
 
 fn refresh_focus_panel(context: &Rc<AppContext>) {
@@ -2780,42 +2756,54 @@ fn refresh_focus_panel(context: &Rc<AppContext>) {
         work_output_excerpt: observation.work_output_excerpt.clone(),
         idle_seconds: Some(observation.last_change.elapsed().as_secs()),
     };
-    let mut card_model = build_battle_card(
-        session,
-        &observed,
-        &observation.recent_lines,
-        &DeterministicIntentEngine,
-    );
+    let mut card_model = build_battle_card(session, &observed);
     let evidence = build_tactical_evidence(session, observation);
-    let live_summary = current_summary(context, session_id, &evidence);
+    let live_summary = if should_show_summary(context, session_id) {
+        current_summary(context, session_id, &evidence)
+    } else {
+        None
+    };
     if let Some(summary) = live_summary.clone() {
         card_model = apply_tactical_synthesis(card_model, summary);
     }
+    let chrome_mode = CardChromeMode::from_summary(live_summary.as_ref());
+    let visual_status = if chrome_mode.summarized() {
+        card_model.status
+    } else {
+        BattleCardStatus::Idle
+    };
 
     context
         .focus
         .title
-        .set_label(&effective_display_name(session));
-    apply_battle_status_style(&context.focus.status, card_model.status);
-    apply_battle_card_surface_style(&context.focus.frame, card_model.status);
+        .set_label(&ui_display_name(session, chrome_mode));
+    context.focus.title.set_visible(chrome_mode.summarized());
+    apply_battle_status_style(&context.focus.status, visual_status);
+    apply_battle_card_surface_style(&context.focus.frame, visual_status);
     context
         .focus
         .status
         .set_label(&status_chip_label(card_model.status, &card_model.recency_label));
-    let operator_summary = live_summary
-        .as_ref()
-        .and_then(|summary| summary.terse_operator_summary.as_ref())
-        .cloned()
-        .unwrap_or_default();
-    context.focus.alert.set_label(&operator_summary);
-    context.focus.alert.set_visible(!operator_summary.is_empty());
+    context.focus.status.set_visible(chrome_mode.summarized());
+    context
+        .focus
+        .header
+        .set_visible(context.focus.title.is_visible() || context.focus.status.is_visible());
+    context.focus.alert.set_label("");
+    context.focus.alert.set_visible(false);
     context.focus.bars.set_orientation(gtk::Orientation::Horizontal);
+    context.focus.bars.set_visible(chrome_mode.summarized());
     apply_segmented_bar(
         &context.focus.momentum_bar,
         momentum_bar_value(live_summary.as_ref(), Some(observation.last_change.elapsed().as_secs()))
             .as_ref(),
+        live_summary.is_some(),
     );
-    apply_segmented_bar(&context.focus.risk_bar, risk_bar_value(live_summary.as_ref()).as_ref());
+    apply_segmented_bar(
+        &context.focus.risk_bar,
+        risk_bar_value(live_summary.as_ref()).as_ref(),
+        live_summary.is_some(),
+    );
 }
 
 fn update_flowbox_columns(context: &Rc<AppContext>) {
@@ -2825,43 +2813,11 @@ fn update_flowbox_columns(context: &Rc<AppContext>) {
     }
 
     let available_width = context.battlefield_scroller.width();
-    let columns = if available_width <= 0 {
-        if context.state.borrow().focused_session().is_some() {
-            total
-        } else if total <= 2 {
-            total
-        } else if total <= 4 {
-            2
-        } else if total <= 6 {
-            3
-        } else {
-            4
-        }
-    } else if context.state.borrow().focused_session().is_some() {
-        total
-    } else if total == 1 {
-        1
-    } else if total == 2 {
-        if (available_width / 2) >= EMBEDDED_TERMINAL_MIN_WIDTH {
-            2
-        } else {
-            1
-        }
-    } else if total == 4 {
-        2
-    } else if total == 6 {
-        3
-    } else if total <= 4 {
-        if available_width >= 1800 {
-            total
-        } else {
-            2
-        }
-    } else if total == 5 {
-        ((available_width as usize) / 420).clamp(3, 5)
-    } else {
-        ((available_width as usize) / 380).clamp(3, total.min(4))
-    } as u32;
+    let columns = battlefield_columns(
+        total,
+        available_width,
+        context.state.borrow().focused_session().is_some(),
+    );
     context.cards.set_max_children_per_line(columns);
     context.cards.set_min_children_per_line(columns);
 }
@@ -2877,21 +2833,9 @@ fn battlefield_embeds_terminal(context: &Rc<AppContext>, _session_id: SessionId)
     }
 
     let columns = current_battlefield_columns(context).max(1);
-    let available_width = context.battlefield_scroller.width().max(0);
-    let available_height = context.battlefield_scroller.height().max(0);
-    let tile_width = if columns > 0 {
-        (available_width - ((columns - 1) as i32 * 12) - 24) / columns as i32
-    } else {
-        0
-    };
-    let rows = ((total as f32) / (columns as f32)).ceil() as i32;
-    let tile_height = if rows > 0 {
-        (available_height - ((rows - 1) * 12) - 24) / rows
-    } else {
-        0
-    };
-
-    tile_width >= EMBEDDED_TERMINAL_MIN_WIDTH && tile_height >= EMBEDDED_TERMINAL_MIN_HEIGHT
+    let available_width = context.battlefield_scroller.width();
+    let available_height = context.battlefield_scroller.height();
+    battlefield_can_embed_terminals(total, columns, available_width, available_height)
 }
 
 fn current_battlefield_columns(context: &Rc<AppContext>) -> usize {
@@ -2915,21 +2859,29 @@ fn update_nudge_widgets(context: &Rc<AppContext>, session_id: SessionId) {
     }
 }
 
+fn apply_summary_chrome_visibility(
+    card: &SessionCardWidgets,
+    visibility: CardChromeVisibility,
+) {
+    card.title.set_visible(visibility.title_visible);
+    card.headline.set_visible(visibility.headline_visible);
+    card.status.set_visible(visibility.status_visible);
+    card.header.set_visible(visibility.header_visible);
+    card.bars.set_visible(visibility.bars_visible);
+    card.nudge_state.set_visible(visibility.nudge_state_visible);
+    card.nudge_row.set_visible(visibility.nudge_row_visible);
+}
+
+fn schedule_runtime_size_sync(context: &Rc<AppContext>) {
+    sync_runtime_sizes(context);
+    let context = context.clone();
+    glib::idle_add_local_once(move || {
+        sync_runtime_sizes(&context);
+    });
+}
+
 fn visible_scrollback_line_capacity(scrollback_band: &gtk::Box) -> usize {
-    const SCROLLBACK_VERTICAL_PADDING: i32 = 16;
-    const SCROLLBACK_LINE_HEIGHT: i32 = 14;
-    const SCROLLBACK_LINE_SPACING: i32 = 4;
-    const MIN_SCROLLBACK_LINES: usize = 1;
-
-    let height = scrollback_band.height();
-    if height <= 0 {
-        return 3;
-    }
-
-    let usable_height = (height - SCROLLBACK_VERTICAL_PADDING).max(SCROLLBACK_LINE_HEIGHT);
-    let line_block = SCROLLBACK_LINE_HEIGHT + SCROLLBACK_LINE_SPACING;
-    let lines = ((usable_height + SCROLLBACK_LINE_SPACING) / line_block).max(1);
-    (lines as usize).max(MIN_SCROLLBACK_LINES)
+    layout_visible_scrollback_line_capacity(scrollback_band.height())
 }
 
 fn repopulate_scrollback_band(scrollback_band: &gtk::Box, lines: &[String]) {
@@ -3004,7 +2956,7 @@ fn sync_terminal_parents(context: &Rc<AppContext>) {
         if focused == Some(*session_id) {
             reparent_widget_to_box(&card.terminal_view, &context.focus.terminal_slot);
             card.terminal.grab_focus();
-        } else if battlefield_embeds_terminal(context, *session_id) {
+        } else {
             reparent_widget_to_box(&card.terminal_view, &card.terminal_slot);
         }
     }
@@ -3030,557 +2982,12 @@ fn reparent_widget_to_box<W: IsA<gtk::Widget>>(widget: &W, target: &gtk::Box) {
     target.append(widget);
 }
 
-fn apply_battle_status_style(label: &gtk::Label, status: BattleCardStatus) {
-    for css in [
-        "battle-idle",
-        "battle-stopped",
-        "battle-active",
-        "battle-thinking",
-        "battle-working",
-        "battle-blocked",
-        "battle-failed",
-        "battle-complete",
-        "battle-detached",
-    ] {
-        label.remove_css_class(css);
-    }
-
-    label.add_css_class(match status {
-        BattleCardStatus::Idle => "battle-idle",
-        BattleCardStatus::Stopped => "battle-stopped",
-        BattleCardStatus::Active => "battle-active",
-        BattleCardStatus::Thinking => "battle-thinking",
-        BattleCardStatus::Working => "battle-working",
-        BattleCardStatus::Blocked => "battle-blocked",
-        BattleCardStatus::Failed => "battle-failed",
-        BattleCardStatus::Complete => "battle-complete",
-        BattleCardStatus::Detached => "battle-detached",
-    });
-}
-
-fn status_chip_label(status: BattleCardStatus, recency_label: &str) -> String {
-    if matches!(status, BattleCardStatus::Idle | BattleCardStatus::Stopped)
-        && recency_label.starts_with("idle ")
-    {
-        let seconds = recency_label.trim_start_matches("idle ").trim();
-        let label = match status {
-            BattleCardStatus::Idle => "IDLE",
-            BattleCardStatus::Stopped => "STOPPED",
-            _ => unreachable!(),
-        };
-        return format!("{label} - {seconds}");
-    }
-
-    status.label().to_string()
-}
-
-fn apply_battle_card_surface_style(frame: &gtk::Frame, status: BattleCardStatus) {
-    for css in [
-        "card-idle",
-        "card-stopped",
-        "card-active",
-        "card-thinking",
-        "card-working",
-        "card-blocked",
-        "card-failed",
-        "card-complete",
-        "card-detached",
-    ] {
-        frame.remove_css_class(css);
-    }
-
-    frame.add_css_class(match status {
-        BattleCardStatus::Idle => "card-idle",
-        BattleCardStatus::Stopped => "card-stopped",
-        BattleCardStatus::Active => "card-active",
-        BattleCardStatus::Thinking => "card-thinking",
-        BattleCardStatus::Working => "card-working",
-        BattleCardStatus::Blocked => "card-blocked",
-        BattleCardStatus::Failed => "card-failed",
-        BattleCardStatus::Complete => "card-complete",
-        BattleCardStatus::Detached => "card-detached",
-    });
-}
-
-fn load_css() {
-    let provider = gtk::CssProvider::new();
-    provider.load_from_string(
-        "
-        window {
-            background: #000000;
-        }
-
-        flowboxchild {
-            padding: 0;
-            background: transparent;
-            box-shadow: none;
-            outline: none;
-        }
-
-        flowboxchild:selected {
-            background: transparent;
-            box-shadow: none;
-            outline: none;
-        }
-
-        flowboxchild:selected > * {
-            box-shadow: none;
-        }
-
-        flowboxchild.selected-card > * {
-            border-color: rgba(113, 197, 255, 0.98);
-            box-shadow: 0 0 0 1px rgba(113, 197, 255, 0.92), 0 22px 44px rgba(13, 92, 151, 0.24);
-        }
-
-        .workspace-summary {
-            color: rgba(199, 210, 222, 0.9);
-            font-size: 13px;
-            letter-spacing: 0.08em;
-            text-transform: uppercase;
-        }
-
-        .workspace-hint {
-            color: rgba(189, 204, 219, 0.74);
-            font-size: 12px;
-        }
-
-        .empty-state {
-            margin-top: 40px;
-            margin-bottom: 56px;
-        }
-
-        .empty-title {
-            color: #f8fafc;
-            font-size: 28px;
-            font-weight: 800;
-        }
-
-        .empty-body {
-            color: rgba(198, 211, 225, 0.82);
-            font-size: 15px;
-            line-height: 1.45;
-        }
-
-        .battle-card {
-            border-radius: 24px;
-            border: 1px solid rgba(163, 175, 194, 0.16);
-            background: rgba(10, 18, 28, 0.95);
-            box-shadow: 0 24px 46px rgba(0, 0, 0, 0.28);
-            min-width: 392px;
-            min-height: 220px;
-        }
-
-        .battle-card.single-card {
-            min-width: 0;
-            min-height: 0;
-        }
-
-        .battle-card.scrollback-card {
-            min-width: 0;
-            min-height: 0;
-        }
-
-        .card-terminal-slot {
-            border-radius: 20px;
-            border: 1px solid rgba(120, 136, 158, 0.2);
-            background: rgba(7, 13, 20, 0.96);
-            min-height: 420px;
-            padding: 10px;
-        }
-
-        .card-terminal-slot.scrollback-terminal-hidden {
-            min-height: 0;
-            padding: 0;
-            border-color: transparent;
-            background: transparent;
-        }
-
-        .card-header-row {
-            min-height: 34px;
-        }
-
-        .card-body-stack {
-            margin-top: 2px;
-        }
-
-        .card-bottom-stack,
-        .card-footer-stack {
-            margin-top: 0;
-        }
-
-        .card-scrollback-band {
-            border-radius: 14px;
-            border: 1px solid rgba(173, 188, 204, 0.08);
-            background: rgba(8, 14, 22, 0.34);
-            padding: 8px 10px;
-            min-height: 0;
-        }
-
-        .card-scrollback-line {
-            color: rgba(202, 214, 227, 0.88);
-            font-size: 11px;
-            font-family: Monospace;
-            line-height: 1.1;
-        }
-
-        .card-bars-row {
-            margin-top: 0;
-        }
-
-        .card-title {
-            font-weight: 800;
-            font-size: 18px;
-            color: #f8fafc;
-        }
-
-        .card-subtitle {
-            color: rgba(196, 208, 222, 0.66);
-            font-size: 12px;
-            letter-spacing: 0.04em;
-            text-transform: uppercase;
-        }
-
-        .card-status {
-            font-weight: 800;
-            font-size: 10px;
-            letter-spacing: 0.08em;
-            text-transform: uppercase;
-            border-radius: 999px;
-            padding: 4px 10px;
-            border: 1px solid rgba(190, 202, 217, 0.2);
-        }
-
-        .card-recency {
-            color: rgba(188, 201, 216, 0.88);
-            font-size: 12px;
-            font-weight: 700;
-            letter-spacing: 0.03em;
-        }
-
-        .card-headline {
-            color: #f8fafc;
-            font-weight: 800;
-            font-size: 20px;
-            line-height: 1.12;
-        }
-
-        .card-detail {
-            color: rgba(226, 234, 242, 0.94);
-            font-size: 15px;
-            font-weight: 650;
-            line-height: 1.25;
-        }
-
-        .card-evidence {
-            color: rgba(198, 212, 227, 0.88);
-            font-size: 12px;
-            font-family: Monospace;
-            background: rgba(11, 18, 28, 0.32);
-            border-radius: 11px;
-            border: 1px solid rgba(173, 188, 204, 0.12);
-            padding: 7px 10px;
-        }
-
-        .card-alert {
-            color: rgba(202, 214, 227, 0.78);
-            font-size: 11px;
-            font-weight: 600;
-            line-height: 1.2;
-            margin: 0;
-        }
-
-        .card-control-row {
-            min-height: 28px;
-            margin-top: -2px;
-            margin-bottom: -2px;
-        }
-
-        .card-control-label {
-            color: rgba(203, 214, 226, 0.72);
-            font-size: 10px;
-            font-weight: 700;
-            letter-spacing: 0.08em;
-            text-transform: uppercase;
-        }
-
-        .card-control-state {
-            font-size: 10px;
-            font-weight: 800;
-            letter-spacing: 0.08em;
-            text-transform: uppercase;
-            border-radius: 999px;
-            padding: 4px 10px;
-            border: 1px solid rgba(190, 202, 217, 0.16);
-        }
-
-        .card-control-off {
-            color: rgba(214, 222, 230, 0.84);
-            background: rgba(84, 97, 112, 0.18);
-            border-color: rgba(163, 175, 194, 0.16);
-        }
-
-        .card-control-armed {
-            color: #fde68a;
-            background: rgba(120, 87, 10, 0.22);
-            border-color: rgba(250, 204, 21, 0.22);
-        }
-
-        .card-control-nudged {
-            color: #86efac;
-            background: rgba(17, 88, 51, 0.22);
-            border-color: rgba(74, 222, 128, 0.2);
-        }
-
-        .card-control-cooldown {
-            color: #93c5fd;
-            background: rgba(33, 82, 145, 0.22);
-            border-color: rgba(96, 165, 250, 0.2);
-        }
-
-        .bar-widget {
-            border-radius: 12px;
-            border: 1px solid rgba(173, 188, 204, 0.08);
-            background: rgba(11, 18, 28, 0.18);
-            padding: 7px 9px;
-        }
-
-        .bar-caption {
-            color: rgba(186, 200, 214, 0.62);
-            font-size: 10px;
-            letter-spacing: 0.08em;
-            text-transform: uppercase;
-        }
-
-        .segmented-bar {
-            min-height: 8px;
-        }
-
-        .bar-segment {
-            min-height: 8px;
-            border-radius: 999px;
-        }
-
-        .bar-empty {
-            background: rgba(163, 175, 194, 0.14);
-        }
-
-        .bar-calm {
-            background: linear-gradient(90deg, rgba(110, 231, 183, 0.88) 0%, rgba(52, 211, 153, 0.92) 100%);
-        }
-
-        .bar-watch {
-            background: linear-gradient(90deg, rgba(250, 204, 21, 0.88) 0%, rgba(251, 146, 60, 0.92) 100%);
-        }
-
-        .bar-alert {
-            background: linear-gradient(90deg, rgba(248, 113, 113, 0.9) 0%, rgba(239, 68, 68, 0.94) 100%);
-        }
-
-        .bar-reason {
-            color: rgba(186, 200, 214, 0.56);
-            font-size: 10px;
-            line-height: 1.2;
-        }
-
-        .focus-title {
-            color: #f8fafc;
-            font-size: 20px;
-            font-weight: 800;
-        }
-
-        .focus-subtitle {
-            color: rgba(196, 208, 222, 0.78);
-            font-size: 14px;
-            margin-bottom: 6px;
-        }
-
-        .focus-frame {
-            border-radius: 24px;
-            border: 1px solid rgba(120, 136, 158, 0.2);
-            background: rgba(7, 13, 20, 0.96);
-            padding: 10px;
-        }
-
-        .focus-panel {
-            margin-top: 4px;
-        }
-
-        .pill {
-            border-radius: 999px;
-            padding: 6px 14px;
-        }
-
-        .pill {
-            background: rgba(119, 198, 255, 0.16);
-            color: #dbeafe;
-        }
-
-        flowboxchild.focused-card > * {
-            border-color: rgba(110, 231, 183, 0.92);
-            box-shadow: 0 0 0 1px rgba(110, 231, 183, 0.78), 0 20px 38px rgba(7, 88, 57, 0.22);
-        }
-
-        .card-idle {
-            background: linear-gradient(180deg, rgba(21, 24, 30, 0.98) 0%, rgba(12, 14, 19, 0.97) 100%);
-            border-color: rgba(21, 24, 30, 0.96);
-        }
-
-        .card-stopped {
-            background: linear-gradient(180deg, rgba(54, 43, 11, 0.98) 0%, rgba(23, 21, 9, 0.97) 100%);
-            border-color: rgba(54, 43, 11, 0.96);
-        }
-
-        .card-active {
-            background: linear-gradient(180deg, rgba(14, 33, 52, 0.98) 0%, rgba(9, 18, 31, 0.97) 100%);
-            border-color: rgba(14, 33, 52, 0.96);
-        }
-
-        .card-thinking {
-            background: linear-gradient(180deg, rgba(9, 44, 29, 0.98) 0%, rgba(9, 23, 16, 0.97) 100%);
-            border-color: rgba(9, 44, 29, 0.96);
-        }
-
-        .card-working {
-            background: linear-gradient(180deg, rgba(9, 44, 29, 0.98) 0%, rgba(9, 23, 16, 0.97) 100%);
-            border-color: rgba(9, 44, 29, 0.96);
-        }
-
-        .card-blocked {
-            background: linear-gradient(180deg, rgba(55, 18, 22, 0.98) 0%, rgba(27, 11, 14, 0.97) 100%);
-            border-color: rgba(55, 18, 22, 0.96);
-        }
-
-        .card-failed {
-            background: linear-gradient(180deg, rgba(55, 18, 22, 0.98) 0%, rgba(27, 11, 14, 0.97) 100%);
-            border-color: rgba(55, 18, 22, 0.96);
-        }
-
-        .card-complete {
-            background: linear-gradient(180deg, rgba(11, 40, 41, 0.98) 0%, rgba(7, 20, 22, 0.97) 100%);
-            border-color: rgba(11, 40, 41, 0.96);
-        }
-
-        .card-detached {
-            background: linear-gradient(180deg, rgba(36, 18, 51, 0.98) 0%, rgba(16, 9, 25, 0.97) 100%);
-            border-color: rgba(36, 18, 51, 0.96);
-        }
-
-        .battle-idle {
-            color: #cbd5e1;
-            background: rgba(71, 85, 105, 0.18);
-            border-color: rgba(148, 163, 184, 0.22);
-        }
-
-        .battle-stopped {
-            color: #fde68a;
-            background: rgba(120, 87, 10, 0.22);
-            border-color: rgba(250, 204, 21, 0.28);
-        }
-
-        .battle-active {
-            color: #93c5fd;
-            background: rgba(33, 82, 145, 0.22);
-            border-color: rgba(96, 165, 250, 0.26);
-        }
-
-        .battle-thinking {
-            color: #86efac;
-            background: rgba(17, 88, 51, 0.24);
-            border-color: rgba(74, 222, 128, 0.24);
-        }
-
-        .battle-working {
-            color: #86efac;
-            background: rgba(17, 88, 51, 0.24);
-            border-color: rgba(74, 222, 128, 0.24);
-        }
-
-        .battle-blocked {
-            color: #fca5a5;
-            background: rgba(114, 28, 35, 0.24);
-            border-color: rgba(248, 113, 113, 0.24);
-        }
-
-        .battle-failed {
-            color: #fca5a5;
-            background: rgba(114, 28, 35, 0.24);
-            border-color: rgba(248, 113, 113, 0.24);
-        }
-
-        .battle-complete {
-            color: #99f6e4;
-            background: rgba(16, 77, 77, 0.22);
-            border-color: rgba(94, 234, 212, 0.24);
-        }
-
-        .battle-detached {
-            color: #e9d5ff;
-            background: rgba(74, 34, 112, 0.22);
-            border-color: rgba(192, 132, 252, 0.24);
-        }
-
-        .focus-mode flowboxchild .battle-card {
-            min-width: 176px;
-            min-height: 182px;
-            border-radius: 18px;
-            box-shadow: 0 14px 28px rgba(0, 0, 0, 0.22);
-        }
-
-        .focus-mode flowboxchild .card-title {
-            font-size: 15px;
-        }
-
-        .focus-mode flowboxchild .card-status,
-        .focus-mode flowboxchild .card-recency {
-            font-size: 10px;
-        }
-
-        .focus-mode flowboxchild .card-header-row {
-            min-height: 28px;
-        }
-
-        .focus-mode flowboxchild .card-bottom-stack {
-            margin-top: 0;
-        }
-
-        .focus-mode flowboxchild .card-alert {
-            color: rgba(206, 217, 229, 0.84);
-            font-size: 12px;
-            font-weight: 600;
-            line-height: 1.3;
-            padding: 0;
-            background: transparent;
-            border-color: transparent;
-            min-height: 112px;
-            margin-top: 6px;
-            margin-bottom: 0;
-            margin-left: 0;
-            margin-right: 0;
-        }
-
-        .focus-mode flowboxchild .card-headline,
-        .focus-mode flowboxchild .card-detail,
-        .focus-mode flowboxchild .card-scrollback-band,
-        .focus-mode flowboxchild .bar-widget {
-        }
-
-        terminal {
-            border-radius: 18px;
-            padding: 12px;
-        }
-        ",
-    );
-
-    gtk::style_context_add_provider_for_display(
-        &gdk::Display::default().expect("display should exist"),
-        &provider,
-        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
-    );
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{parse_run_mode, summary_refresh_interval, RunMode};
+    use super::{
+        card_chrome_visibility, CardChromeMode, parse_run_mode, summary_refresh_interval, RunMode,
+    };
+    use crate::layout::battlefield_can_embed_terminals;
     use std::time::Duration;
 
     #[test]
@@ -3610,5 +3017,42 @@ mod tests {
         assert_eq!(summary_refresh_interval(Duration::from_secs(299)), Duration::from_secs(20));
         assert_eq!(summary_refresh_interval(Duration::from_secs(300)), Duration::from_secs(30));
         assert_eq!(summary_refresh_interval(Duration::from_secs(900)), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn four_terminal_interstitial_layout_collapses_to_scrollback() {
+        assert!(!battlefield_can_embed_terminals(4, 2, 1500, 1100));
+        assert!(!battlefield_can_embed_terminals(4, 2, 1600, 1150));
+    }
+
+    #[test]
+    fn embedded_terminals_require_genuinely_roomy_battlefield() {
+        assert!(battlefield_can_embed_terminals(1, 1, 1200, 900));
+        assert!(battlefield_can_embed_terminals(2, 2, 1480, 900));
+        assert!(battlefield_can_embed_terminals(4, 2, 1700, 1300));
+    }
+
+    #[test]
+    fn sparse_shell_hides_all_summary_chrome() {
+        let visibility = card_chrome_visibility(CardChromeMode::SparseShell, false, false);
+
+        assert!(!visibility.title_visible);
+        assert!(!visibility.status_visible);
+        assert!(!visibility.header_visible);
+        assert!(!visibility.bars_visible);
+        assert!(!visibility.nudge_state_visible);
+        assert!(!visibility.nudge_row_visible);
+    }
+
+    #[test]
+    fn summarized_mode_shows_full_card_chrome() {
+        let visibility = card_chrome_visibility(CardChromeMode::Summarized, false, true);
+
+        assert!(visibility.title_visible);
+        assert!(visibility.status_visible);
+        assert!(visibility.header_visible);
+        assert!(visibility.bars_visible);
+        assert!(visibility.nudge_state_visible);
+        assert!(visibility.nudge_row_visible);
     }
 }
