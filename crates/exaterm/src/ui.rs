@@ -1169,7 +1169,7 @@ fn build_battle_card_widgets(
         .child(&terminal)
         .build();
     terminal_view.add_css_class("terminal-scroll");
-    install_terminal_context_menu(context, &terminal_view, &terminal, session.id);
+    install_terminal_context_menu(context, &terminal, session.id);
     install_nudge_pill_interactions(context, &nudge_state, session.id);
     {
         let terminal_for_keys = terminal.clone();
@@ -1221,87 +1221,74 @@ fn ui_display_name(session: &SessionRecord, chrome_mode: CardChromeMode) -> Stri
 
 fn install_terminal_context_menu(
     context: &Rc<AppContext>,
-    terminal_view: &gtk::ScrolledWindow,
     terminal: &vte::Terminal,
     source_session: SessionId,
 ) {
-    let menu_box = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(0)
-        .build();
-    let copy_button = gtk::Button::builder()
-        .label("Copy")
-        .halign(gtk::Align::Fill)
-        .build();
-    copy_button.add_css_class("flat");
-    menu_box.append(&copy_button);
-    let paste_button = gtk::Button::builder()
-        .label("Paste")
-        .halign(gtk::Align::Fill)
-        .build();
-    paste_button.add_css_class("flat");
-    menu_box.append(&paste_button);
-    let split_terminal_button = gtk::Button::builder()
-        .label("Add Terminals")
-        .halign(gtk::Align::Fill)
-        .build();
-    split_terminal_button.add_css_class("flat");
-    split_terminal_button.set_sensitive(true);
-    menu_box.append(&split_terminal_button);
+    let actions = gtk::gio::SimpleActionGroup::new();
 
-    let popover = gtk::Popover::builder()
-        .has_arrow(true)
-        .autohide(true)
-        .child(&menu_box)
-        .build();
-    popover.set_parent(terminal_view);
-
+    let copy_action = gtk::gio::SimpleAction::new("copy", None);
     {
-        let popover = popover.clone();
         let terminal = terminal.clone();
-        copy_button.connect_clicked(move |_| {
+        copy_action.connect_activate(move |_, _| {
             terminal.copy_clipboard_format(vte::Format::Text);
-            popover.popdown();
         });
     }
+    actions.add_action(&copy_action);
 
+    let paste_action = gtk::gio::SimpleAction::new("paste", None);
     {
-        let popover = popover.clone();
         let terminal = terminal.clone();
-        paste_button.connect_clicked(move |_| {
+        paste_action.connect_activate(move |_, _| {
             terminal.paste_clipboard();
-            popover.popdown();
         });
     }
+    actions.add_action(&paste_action);
 
+    let add_terminals_action = gtk::gio::SimpleAction::new("add_terminals", None);
     {
         let context = context.clone();
-        let popover = popover.clone();
-        split_terminal_button.connect_clicked(move |_| {
-            popover.popdown();
+        add_terminals_action.connect_activate(move |_, _| {
             split_terminal_here(&context, source_session);
         });
     }
+    actions.add_action(&add_terminals_action);
+    terminal.insert_action_group("terminal", Some(&actions));
+
+    let menu = gtk::gio::Menu::new();
+    menu.append(Some("Copy"), Some("terminal.copy"));
+    menu.append(Some("Paste"), Some("terminal.paste"));
+    menu.append(Some("Add Terminals"), Some("terminal.add_terminals"));
+
+    let popover = gtk::PopoverMenu::from_model(Some(&menu));
+    popover.set_has_arrow(false);
+    popover.set_autohide(true);
+    popover.set_halign(gtk::Align::Start);
+    popover.set_valign(gtk::Align::Start);
+    popover.set_parent(terminal);
+    popover.set_position(gtk::PositionType::Bottom);
+    popover.add_css_class("menu");
+    popover.add_css_class("context-menu");
 
     let right_click = gtk::GestureClick::new();
     right_click.set_button(3);
     {
         let context = context.clone();
         let terminal = terminal.clone();
-        let copy_button = copy_button.clone();
-        let split_terminal_button = split_terminal_button.clone();
+        let copy_action = copy_action.clone();
+        let add_terminals_action = add_terminals_action.clone();
         let popover = popover.clone();
         right_click.connect_pressed(move |gesture, _, x, y| {
             let count = context.state.borrow().sessions().len();
-            copy_button.set_sensitive(terminal.has_selection());
-            split_terminal_button.set_sensitive(matches!(count, 1 | 2 | 4 | 6 | 8 | 12));
+            copy_action.set_enabled(terminal.has_selection());
+            add_terminals_action.set_enabled(matches!(count, 1 | 2 | 4 | 6 | 8 | 12));
             let rect = gdk::Rectangle::new(x as i32, y as i32, 1, 1);
             popover.set_pointing_to(Some(&rect));
+            popover.set_offset(0, 0);
             popover.popup();
             gesture.set_state(gtk::EventSequenceState::Claimed);
         });
     }
-    terminal_view.add_controller(right_click);
+    terminal.add_controller(right_click);
 }
 
 fn install_nudge_pill_interactions(
