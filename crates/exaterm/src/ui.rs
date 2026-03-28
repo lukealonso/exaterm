@@ -1,3 +1,6 @@
+use crate::actions::{
+    insert_terminal_number, send_runtime_input_line, set_auto_nudge_hover, toggle_auto_nudge,
+};
 use crate::beachhead::{BeachheadConnection, BeachheadTarget};
 use crate::layout::{
     battlefield_can_embed_terminals, battlefield_columns,
@@ -8,8 +11,8 @@ use crate::style::{
     status_chip_label,
 };
 use crate::terminal_adapter::{
-    attach_display_runtime, measured_terminal_size_hint, spawn_runtime, terminal_size_hint,
-    write_display_output, ClientDisplayRuntime,
+    attach_display_runtime, measured_terminal_size_hint, spawn_daemon_display_bridge,
+    spawn_runtime, terminal_size_hint, ClientDisplayRuntime,
 };
 use crate::supervision::{
     build_battle_card, BattleCardStatus, BattleCardViewModel, ObservedActivity, SignalTone,
@@ -40,13 +43,14 @@ use gtk::gdk;
 use gtk::prelude::*;
 use libadwaita as adw;
 use libadwaita::prelude::*;
+use pangocairo::functions::show_layout;
 use portable_pty::PtySize;
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
-use std::fs::File;
-use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
+use std::os::unix::net::UnixStream;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -125,16 +129,16 @@ struct NamingCacheEntry {
     in_flight: bool,
 }
 
-struct NudgeCacheEntry {
-    enabled: bool,
-    hovered: bool,
-    completed_signature: Option<String>,
-    requested_signature: Option<String>,
-    last_nudge: Option<String>,
-    last_error: Option<String>,
-    last_attempt: Option<Instant>,
-    last_sent: Option<Instant>,
-    in_flight: bool,
+pub(crate) struct NudgeCacheEntry {
+    pub(crate) enabled: bool,
+    pub(crate) hovered: bool,
+    pub(crate) completed_signature: Option<String>,
+    pub(crate) requested_signature: Option<String>,
+    pub(crate) last_nudge: Option<String>,
+    pub(crate) last_error: Option<String>,
+    pub(crate) last_attempt: Option<Instant>,
+    pub(crate) last_sent: Option<Instant>,
+    pub(crate) in_flight: bool,
 }
 
 impl SummaryCacheEntry {
@@ -178,7 +182,7 @@ impl NamingCacheEntry {
 }
 
 impl NudgeCacheEntry {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             enabled: false,
             hovered: false,
@@ -249,27 +253,29 @@ fn card_chrome_visibility(
     }
 }
 
-struct AppContext {
+pub(crate) struct AppContext {
     mode: RunMode,
-    beachhead: Option<BeachheadConnection>,
-    state: Rc<RefCell<WorkspaceViewState>>,
+    pub(crate) beachhead: Option<BeachheadConnection>,
+    pub(crate) state: Rc<RefCell<WorkspaceViewState>>,
     title: adw::WindowTitle,
     empty_state: gtk::Box,
     content_root: gtk::Box,
     cards: gtk::FlowBox,
     battlefield_panel: gtk::Box,
+    pub(crate) sync_inputs_enabled: Arc<AtomicBool>,
+    pub(crate) raw_input_writers: Arc<Mutex<BTreeMap<SessionId, Arc<Mutex<UnixStream>>>>>,
     focus: FocusWidgets,
     session_cards: RefCell<BTreeMap<SessionId, SessionCardWidgets>>,
     observations: RefCell<BTreeMap<SessionId, SessionObservation>>,
     raw_stream_socket_names: RefCell<BTreeMap<SessionId, String>>,
-    runtimes: RefCell<BTreeMap<SessionId, SessionRuntime>>,
+    pub(crate) runtimes: RefCell<BTreeMap<SessionId, SessionRuntime>>,
     display_runtimes: RefCell<BTreeMap<SessionId, ClientDisplayRuntime>>,
     summary_worker: Option<SummaryWorker>,
     summary_cache: RefCell<BTreeMap<SessionId, SummaryCacheEntry>>,
     naming_worker: Option<NamingWorker>,
     naming_cache: RefCell<BTreeMap<SessionId, NamingCacheEntry>>,
     nudge_worker: Option<NudgeWorker>,
-    nudge_cache: RefCell<BTreeMap<SessionId, NudgeCacheEntry>>,
+    pub(crate) nudge_cache: RefCell<BTreeMap<SessionId, NudgeCacheEntry>>,
     closing_confirmed: Cell<bool>,
 }
 
@@ -316,7 +322,7 @@ fn parse_run_mode(args: impl IntoIterator<Item = String>) -> Result<RunMode, Str
     }
 }
 
-fn daemon_backed(context: &AppContext) -> bool {
+pub(crate) fn daemon_backed(context: &AppContext) -> bool {
     context.beachhead.is_some()
 }
 
@@ -524,6 +530,8 @@ fn build_ui(app: &gtk::Application, mode: RunMode) {
         content_root,
         cards,
         battlefield_panel,
+        sync_inputs_enabled: Arc::new(AtomicBool::new(false)),
+        raw_input_writers: Arc::new(Mutex::new(BTreeMap::new())),
         focus: FocusWidgets {
             panel: focus_panel,
             frame: focus_frame,
@@ -1064,7 +1072,9 @@ fn build_battle_card_widgets(
 
             cr.rectangle(0.0, 0.0, width as f64, height as f64);
             cr.clip();
-            gtk::render_layout(&area.style_context(), cr, x, y, &layout);
+            cr.move_to(x, y);
+            cr.set_source_rgba(202.0 / 255.0, 214.0 / 255.0, 227.0 / 255.0, 0.88);
+            show_layout(cr, &layout);
         });
     }
     scrollback_content.add_css_class("card-scrollback-view");
@@ -1296,12 +1306,64 @@ fn install_terminal_context_menu(
         });
     }
     actions.add_action(&add_terminals_action);
+
+    let insert_terminal_number_one_action =
+        gtk::gio::SimpleAction::new("insert_terminal_number_one", None);
+    {
+        let context = context.clone();
+        insert_terminal_number_one_action.connect_activate(move |_, _| {
+            insert_terminal_number(&context, source_session, true);
+        });
+    }
+    actions.add_action(&insert_terminal_number_one_action);
+
+    let insert_terminal_number_zero_action =
+        gtk::gio::SimpleAction::new("insert_terminal_number_zero", None);
+    {
+        let context = context.clone();
+        insert_terminal_number_zero_action.connect_activate(move |_, _| {
+            insert_terminal_number(&context, source_session, false);
+        });
+    }
+    actions.add_action(&insert_terminal_number_zero_action);
+
+    let sync_inputs_action = gtk::gio::SimpleAction::new_stateful(
+        "sync_inputs",
+        None,
+        &context
+            .sync_inputs_enabled
+            .load(Ordering::Relaxed)
+            .to_variant(),
+    );
+    {
+        let context = context.clone();
+        sync_inputs_action.connect_change_state(move |action, value| {
+            let enabled = value.and_then(|state| state.get::<bool>()).unwrap_or(false);
+            context
+                .sync_inputs_enabled
+                .store(enabled, Ordering::Relaxed);
+            action.set_state(&enabled.to_variant());
+        });
+    }
+    actions.add_action(&sync_inputs_action);
     terminal.insert_action_group("terminal", Some(&actions));
 
     let menu = gtk::gio::Menu::new();
     menu.append(Some("Copy"), Some("terminal.copy"));
     menu.append(Some("Paste"), Some("terminal.paste"));
     menu.append(Some("Add Terminals"), Some("terminal.add_terminals"));
+    menu.append(
+        Some("Insert Terminal Number (1-base)"),
+        Some("terminal.insert_terminal_number_one"),
+    );
+    menu.append(
+        Some("Insert Terminal Number (0-base)"),
+        Some("terminal.insert_terminal_number_zero"),
+    );
+    let sync_inputs_item =
+        gtk::gio::MenuItem::new(Some("Synchronize Inputs"), Some("terminal.sync_inputs"));
+    sync_inputs_item.set_attribute_value("role", Some(&"check".to_variant()));
+    menu.append_item(&sync_inputs_item);
 
     let popover = gtk::PopoverMenu::from_model(Some(&menu));
     popover.set_has_arrow(false);
@@ -1320,11 +1382,18 @@ fn install_terminal_context_menu(
         let terminal = terminal.clone();
         let copy_action = copy_action.clone();
         let add_terminals_action = add_terminals_action.clone();
+        let sync_inputs_action = sync_inputs_action.clone();
         let popover = popover.clone();
         right_click.connect_pressed(move |gesture, _, x, y| {
             let count = context.state.borrow().sessions().len();
             copy_action.set_enabled(terminal.has_selection());
             add_terminals_action.set_enabled(matches!(count, 1 | 2 | 4 | 6 | 8 | 12));
+            sync_inputs_action.set_state(
+                &context
+                    .sync_inputs_enabled
+                    .load(Ordering::Relaxed)
+                    .to_variant(),
+            );
             let rect = gdk::Rectangle::new(x as i32, y as i32, 1, 1);
             popover.set_pointing_to(Some(&rect));
             popover.set_offset(0, 0);
@@ -1365,47 +1434,6 @@ fn install_nudge_pill_interactions(
         });
     }
     pill.add_controller(motion);
-}
-
-fn toggle_auto_nudge(context: &Rc<AppContext>, session_id: SessionId) {
-    let enabled = {
-        let mut cache = context.nudge_cache.borrow_mut();
-        let entry = cache
-            .entry(session_id)
-            .or_insert_with(NudgeCacheEntry::new);
-        entry.enabled = !entry.enabled;
-        if !entry.enabled {
-            entry.in_flight = false;
-            entry.requested_signature = None;
-            entry.hovered = false;
-        }
-        entry.enabled
-    };
-    if let Some(beachhead) = context.beachhead.as_ref() {
-        let _ = beachhead.commands().send(ClientMessage::ToggleAutoNudge {
-            session_id,
-            enabled,
-        });
-    }
-    update_nudge_widgets(context, session_id);
-    if enabled {
-        refresh_runtime_and_cards(context);
-    }
-}
-
-fn set_auto_nudge_hover(context: &Rc<AppContext>, session_id: SessionId, hovered: bool) {
-    let changed = {
-        let mut cache = context.nudge_cache.borrow_mut();
-        let entry = cache
-            .entry(session_id)
-            .or_insert_with(NudgeCacheEntry::new);
-        let changed = entry.hovered != hovered;
-        entry.hovered = hovered;
-        changed
-    };
-    if changed {
-        update_nudge_widgets(context, session_id);
-    }
 }
 
 fn split_terminal_here(context: &Rc<AppContext>, source_session: SessionId) {
@@ -1490,6 +1518,7 @@ fn spawn_session(
         .insert(session_id, runtime.session_runtime);
     refresh_runtime_and_cards(context);
 }
+
 
 fn spawn_summary_worker() -> Option<SummaryWorker> {
     let config = OpenAiSynthesisConfig::from_env()?;
@@ -1617,6 +1646,9 @@ fn apply_workspace_snapshot(context: &Rc<AppContext>, snapshot: WorkspaceSnapsho
         context.observations.borrow_mut().remove(&session_id);
         context.raw_stream_socket_names.borrow_mut().remove(&session_id);
         context.display_runtimes.borrow_mut().remove(&session_id);
+        if let Ok(mut writers) = context.raw_input_writers.lock() {
+            writers.remove(&session_id);
+        }
         context.summary_cache.borrow_mut().remove(&session_id);
         context.naming_cache.borrow_mut().remove(&session_id);
         context.nudge_cache.borrow_mut().remove(&session_id);
@@ -1724,49 +1756,20 @@ fn attach_daemon_display_runtime(
         return;
     };
     if let Some(beachhead) = context.beachhead.as_ref() {
-        let connector = beachhead.raw_session_connector();
-        let output_writer = runtime.output_writer.clone();
-        let socket_name = socket_name.to_string();
-        thread::spawn(move || {
-            let Ok(raw_reader) = connector.connect_raw_session(session_id, &socket_name) else {
-                return;
-            };
-            let Ok(raw_writer_stream) = raw_reader.try_clone() else {
-                return;
-            };
-            let raw_writer = Arc::new(Mutex::new(raw_writer_stream));
-            let input_raw_writer = raw_writer.clone();
-            thread::spawn(move || {
-                while let Ok(bytes) = input_events.recv() {
-                    let Ok(mut writer) = input_raw_writer.lock() else {
-                        break;
-                    };
-                    if writer.write_all(&bytes).is_err() {
-                        break;
-                    }
-                }
-            });
-
-            let mut raw_reader = raw_reader;
-            let mut buf = [0u8; 8192];
-            loop {
-                match raw_reader.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        if write_display_output(&output_writer, &buf[..n]).is_err() {
-                            break;
-                        }
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(_) => break,
-                }
-            }
-        });
+        spawn_daemon_display_bridge(
+            beachhead.raw_session_connector(),
+            session_id,
+            socket_name.to_string(),
+            runtime.output_writer.clone(),
+            context.raw_input_writers.clone(),
+            context.sync_inputs_enabled.clone(),
+            input_events,
+        );
     }
     context.display_runtimes.borrow_mut().insert(session_id, runtime);
 }
 
-fn refresh_runtime_and_cards(context: &Rc<AppContext>) {
+pub(crate) fn refresh_runtime_and_cards(context: &Rc<AppContext>) {
     drain_daemon_events(context);
     drain_summary_results(context);
     drain_naming_results(context);
@@ -1965,68 +1968,6 @@ fn resize_display_pty(fd: i32, size: PtySize) -> std::io::Result<()> {
     if result != 0 {
         return Err(std::io::Error::last_os_error());
     }
-    Ok(())
-}
-
-fn send_runtime_input_line(
-    context: &Rc<AppContext>,
-    session_id: SessionId,
-    line: &str,
-) -> std::io::Result<()> {
-    let writer = {
-        let runtimes = context.runtimes.borrow();
-        runtimes
-            .get(&session_id)
-            .and_then(|runtime| runtime.input_writer.as_ref().cloned())
-    }
-    .ok_or_else(|| std::io::Error::other("session runtime input writer missing"))?;
-
-    let mut bytes = line.as_bytes().to_vec();
-    bytes.push(b'\n');
-    write_runtime_input(&writer, &bytes)
-}
-
-fn write_runtime_input(writer: &Arc<Mutex<File>>, bytes: &[u8]) -> std::io::Result<()> {
-    let mut writer = writer
-        .lock()
-        .map_err(|_| std::io::Error::other("runtime input writer lock poisoned"))?;
-    let mut offset = 0usize;
-
-    while offset < bytes.len() {
-        match writer.write(&bytes[offset..]) {
-            Ok(0) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::WriteZero,
-                    "short write to runtime input",
-                ))
-            }
-            Ok(n) => offset += n,
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                let mut fds = [libc::pollfd {
-                    fd: writer.as_raw_fd(),
-                    events: libc::POLLOUT,
-                    revents: 0,
-                }];
-                let poll_result =
-                    unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 1000) };
-                if poll_result < 0 {
-                    let poll_error = std::io::Error::last_os_error();
-                    if poll_error.kind() == std::io::ErrorKind::Interrupted {
-                        continue;
-                    }
-                    return Err(poll_error);
-                }
-                if poll_result == 0 {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "timed out waiting to write runtime input",
-                    ));
-                }
-            }
-            Err(error) => return Err(error),
-        }
-    }
-
     Ok(())
 }
 
@@ -2635,7 +2576,7 @@ fn show_intervention(context: &Rc<AppContext>, session_id: SessionId) {
     context.focus.panel.set_visible(true);
     context.content_root.add_css_class("focus-mode");
     context.battlefield_panel.set_vexpand(false);
-    context.battlefield_panel.set_height_request(300);
+    context.battlefield_panel.set_height_request(240);
     update_flowbox_columns(context);
     sync_terminal_parents(context);
     refresh_card_styles(context);
@@ -2768,7 +2709,7 @@ fn focused_embedded_terminal_session(context: &Rc<AppContext>) -> Option<Session
     })
 }
 
-fn update_nudge_widgets(context: &Rc<AppContext>, session_id: SessionId) {
+pub(crate) fn update_nudge_widgets(context: &Rc<AppContext>, session_id: SessionId) {
     if let Some(card) = context.session_cards.borrow().get(&session_id) {
         apply_nudge_pill(&context.nudge_cache.borrow(), session_id, &card.nudge_state);
     }

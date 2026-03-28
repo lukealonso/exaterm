@@ -1,3 +1,5 @@
+use crate::beachhead::RawSessionConnector;
+use exaterm_types::model::SessionId;
 use exaterm_core::model::launch_argv;
 use exaterm_core::runtime::{RuntimeEvent, SessionRuntime, SpawnedRuntime, StreamRuntimeUpdate};
 use exaterm_core::terminal_stream::TerminalStreamProcessor;
@@ -6,6 +8,7 @@ use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
@@ -65,6 +68,88 @@ pub fn write_display_output(writer: &Arc<Mutex<File>>, bytes: &[u8]) -> std::io:
         .lock()
         .map_err(|_| std::io::Error::other("display writer lock poisoned"))?;
     writer.write_all(bytes)
+}
+
+pub fn spawn_daemon_display_bridge(
+    connector: RawSessionConnector,
+    session_id: SessionId,
+    socket_name: String,
+    output_writer: Arc<Mutex<File>>,
+    raw_input_writers: Arc<Mutex<std::collections::BTreeMap<SessionId, Arc<Mutex<UnixStream>>>>>,
+    sync_inputs_enabled: Arc<AtomicBool>,
+    input_events: mpsc::Receiver<Vec<u8>>,
+) {
+    thread::spawn(move || {
+        let Ok(raw_reader) = connector.connect_raw_session(session_id, &socket_name) else {
+            return;
+        };
+        let Ok(raw_writer_stream) = raw_reader.try_clone() else {
+            return;
+        };
+        let raw_writer = Arc::new(Mutex::new(raw_writer_stream));
+        if let Ok(mut writers) = raw_input_writers.lock() {
+            writers.insert(session_id, raw_writer.clone());
+        }
+        let input_raw_writer = raw_writer.clone();
+        let fanout_writers = raw_input_writers.clone();
+        thread::spawn(move || {
+            while let Ok(bytes) = input_events.recv() {
+                if sync_inputs_enabled.load(Ordering::Relaxed) {
+                    let targets = fanout_writers
+                        .lock()
+                        .map(|writers| {
+                            writers
+                                .iter()
+                                .map(|(target_session, writer)| (*target_session, writer.clone()))
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    let mut failed = Vec::new();
+                    for (target_session, writer) in targets {
+                        let Ok(mut writer) = writer.lock() else {
+                            failed.push(target_session);
+                            continue;
+                        };
+                        if writer.write_all(&bytes).is_err() {
+                            failed.push(target_session);
+                        }
+                    }
+                    if !failed.is_empty() {
+                        if let Ok(mut writers) = fanout_writers.lock() {
+                            for target_session in failed {
+                                writers.remove(&target_session);
+                            }
+                        }
+                    }
+                } else {
+                    let Ok(mut writer) = input_raw_writer.lock() else {
+                        break;
+                    };
+                    if writer.write_all(&bytes).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+
+        let mut raw_reader = raw_reader;
+        let mut buf = [0u8; 8192];
+        loop {
+            match raw_reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if write_display_output(&output_writer, &buf[..n]).is_err() {
+                        break;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+        if let Ok(mut writers) = raw_input_writers.lock() {
+            writers.remove(&session_id);
+        }
+    });
 }
 
 pub fn terminal_size_hint(terminal: &vte::Terminal) -> PtySize {
