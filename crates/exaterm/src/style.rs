@@ -239,10 +239,10 @@ pub(crate) fn load_css() {
         }
 
         .card-headline {
-            color: #f8fafc;
-            font-weight: 800;
-            font-size: 20px;
-            line-height: 1.12;
+            color: rgba(222, 232, 242, 0.82);
+            font-weight: 700;
+            font-size: 14px;
+            line-height: 1.18;
         }
 
         .card-evidence {
@@ -338,16 +338,24 @@ pub(crate) fn load_css() {
             background: rgba(163, 175, 194, 0.14);
         }
 
-        .bar-calm {
+        .bar-attention-1 {
             background: linear-gradient(90deg, rgba(110, 231, 183, 0.88) 0%, rgba(52, 211, 153, 0.92) 100%);
         }
 
-        .bar-watch {
+        .bar-attention-2 {
+            background: linear-gradient(90deg, rgba(96, 165, 250, 0.88) 0%, rgba(59, 130, 246, 0.92) 100%);
+        }
+
+        .bar-attention-3 {
             background: linear-gradient(90deg, rgba(250, 204, 21, 0.88) 0%, rgba(251, 146, 60, 0.92) 100%);
         }
 
-        .bar-alert {
+        .bar-attention-4 {
             background: linear-gradient(90deg, rgba(248, 113, 113, 0.9) 0%, rgba(239, 68, 68, 0.94) 100%);
+        }
+
+        .bar-attention-5 {
+            background: linear-gradient(90deg, rgba(244, 63, 94, 0.92) 0%, rgba(190, 24, 93, 0.96) 100%);
         }
 
         .bar-reason {

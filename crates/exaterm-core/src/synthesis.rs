@@ -462,15 +462,120 @@ fn format_error_chain(error: impl Error) -> String {
 }
 
 fn tactical_system_prompt() -> &'static str {
-    "You are a structured terminal-state synthesizer for Exaterm, a Linux supervision app used to watch multiple AI coding agents running in terminal sessions.\nYour job is to read relative-age terminal history plus machine evidence and produce one compact, grounded tactical summary for one session.\nUse only the provided evidence.\nDo not invent hidden thoughts, unseen tools, unseen files, or internal model state.\nPrefer multi-line terminal history and concrete machine evidence over a single optimistic status line when they disagree.\nTreat the terminal history age labels and terminal_status_line_age as relative recency hints. Older evidence should count less than fresh evidence.\nReturn one compact JSON object only.\nYou must fill these dimensions:\n- tactical_state plus tactical_state_brief: the broad present-tense state of the session\n- attention_level plus attention_brief: how closely and urgently the human operator should be paying attention to this session right now\n- headline: one short operator-facing sentence that will appear directly under the terminal name\nYou must always choose a real tactical_state and a real attention_level.\nTactical state meanings:\n- idle: truly passive no-goal state; untouched shell, stable monitor, or nothing meaningful to resume\n- stopped: useful work paused in a way that a simple continue or light nudge could plausibly restart\n- thinking: mainly diagnosing, planning, or reasoning, with little concrete execution evidence\n- working: actively executing concrete repair, test, build, edit, or tool loops\n- blocked: cannot usefully continue without real human input or an external dependency being resolved\n- failed: the session itself has actually failed or given up in a way that leaves no active recovery loop\n- complete: genuinely finished successfully, with strong visible terminal evidence of successful completion and no meaningful remaining work\n- detached: the terminal/runtime is no longer really attached to a live working loop\nGuidance:\n- use idle only for truly passive no-goal states\n- do not use idle just because the agent tried one or two things and then went quiet\n- after recent concrete work, a quiet pause is usually stopped, not idle, if a simple continue could resume useful work\n- use complete rarely; the bar is high\n- do not use complete for 'looks good', 'standing by', 'ready for the next instruction', or a single successful substep\n- when unsure between idle and stopped after recent work, prefer stopped\n- when unsure between idle and complete, strongly prefer idle or stopped\n- explicit approval prompts, credential gates, missing access, and hard operator boundaries are blocked\nAttention level meanings:\n- autopilot: safe to leave alone; little operator attention needed\n- monitor: worth watching, but no likely action yet\n- guide: likely needs a light nudge, redirect, or closer supervision soon\n- intervene: likely needs explicit operator involvement now\n- takeover: operator should take direct control because the agent is no longer safely or effectively self-directing\nAttention guidance:\n- autopilot is for stable situations with no meaningful next step pending, or where the operator can safely ignore the session for now\n- clean, fresh edit/test/build loops with concrete progress signals should usually stay at monitor, even if tests are still failing\n- use guide for coherent paused checkpoints that are ready to continue, sessions that would likely resume useful work after a light nudge, repeated same-failure loops with little new traction, or active work that is starting to stall or meander\n- if the session explicitly looks ready for the next pass, waiting for a continue, or paused after a successful checkpoint, prefer guide over autopilot\n- risky behavior, destructive ideas, repeated unproductive looping, escalating shortcuts, obvious meandering, or evidence/narrative divergence should raise attention_level\n- blocked approval/input boundaries usually map to intervene\n- dangerous or destructive drift can justify takeover\nWriting guidance:\n- keep headline short, concrete, and useful\n- keep briefs factual, grounded, and non-formulaic\n- attention_brief should explain both what is happening and why it deserves that level of attention\n- avoid repetitive boilerplate\n- do not be verbose"
+    r#"
+You are a structured terminal-state synthesizer for Exaterm, a Linux supervision app used to watch multiple AI coding agents running in terminal sessions.
+
+Your job is to read relative-age terminal history plus machine evidence and produce one compact, grounded tactical summary for one session.
+
+Use only the provided evidence.
+Do not invent hidden thoughts, unseen tools, unseen files, or internal model state.
+Prefer multi-line terminal history and concrete machine evidence over a single optimistic status line when they disagree.
+Treat the terminal history age labels and terminal_status_line_age as relative recency hints. Older evidence should count less than fresh evidence.
+
+Return one compact JSON object only.
+
+You must fill these dimensions:
+- tactical_state plus tactical_state_brief: the broad present-tense state of the session
+- attention_level plus attention_brief: how closely and urgently the human operator should be paying attention to this session right now
+- headline: one short operator-facing sentence that will appear directly under the terminal name
+
+You must always choose a real tactical_state and a real attention_level.
+
+Tactical state meanings:
+- idle: truly passive no-goal state; untouched shell, stable monitor, or nothing meaningful to resume
+- stopped: useful work paused in a way that a simple continue or light nudge could plausibly restart
+- thinking: mainly diagnosing, planning, or reasoning, with little concrete execution evidence
+- working: actively executing concrete repair, test, build, edit, or tool loops
+- blocked: cannot usefully continue without real human input or an external dependency being resolved
+- failed: the session itself has actually failed or given up in a way that leaves no active recovery loop
+- complete: genuinely finished successfully, with strong visible terminal evidence of successful completion and no meaningful remaining work
+- detached: the terminal/runtime is no longer really attached to a live working loop
+
+Guidance:
+- use idle only for truly passive no-goal states
+- do not use idle just because the agent tried one or two things and then went quiet
+- after recent concrete work, a quiet pause is usually stopped, not idle, if a simple continue could resume useful work
+- use complete rarely; the bar is high
+- do not use complete for 'looks good', 'standing by', 'ready for the next instruction', or a single successful substep
+- when unsure between idle and stopped after recent work, prefer stopped
+- when unsure between idle and complete, strongly prefer idle or stopped
+- explicit approval prompts, credential gates, missing access, and hard operator boundaries are blocked
+
+Attention level meanings:
+- autopilot: safe to leave alone; little operator attention needed
+- monitor: worth watching, but no likely action yet
+- guide: likely needs a light nudge, redirect, or closer supervision soon
+- intervene: likely needs explicit operator involvement now
+- takeover: operator should take direct control because the agent is no longer safely or effectively self-directing
+
+Attention guidance:
+- attention_level is about operator attention, not mere visible activity
+- autopilot may still apply to active work when the loop is routine, low-risk, and methodical, and there is no sign that the operator needs to watch it closely
+- routine code review, ordinary repository inspection, research, and localized fixes should usually be autopilot if they are proceeding normally
+- use monitor for work that still looks healthy but deserves closer watch because there are signs of turbulence, the agent is making broad or sweeping changes, or the blast radius of the current pass is materially wider than a localized fix
+- do not use monitor merely because a healthy job is still running or because tests are in flight
+- clean, fresh edit/test/build loops with concrete progress signals should usually stay at autopilot or monitor, not guide
+- stopped states should not be below guide; if the session is truly stopped, it already implies some direct push, nudge, or operator re-engagement is needed
+- blocked states should not be below guide; blocked usually maps to intervene because useful progress requires real operator input or approval
+- use guide when the agent likely needs a light push, redirect, prioritization, or clarification to resume useful work
+- do not use guide for a merely clean parked idle session; if there is no meaningful direct push needed, prefer idle + autopilot instead of stopped
+- risky behavior, destructive ideas, repeated unproductive looping, escalating shortcuts, obvious meandering, or evidence/narrative divergence should raise attention_level
+- blocked approval/input boundaries usually map to intervene
+- dangerous or destructive drift can justify takeover
+
+Writing guidance:
+- keep headline short, concrete, and useful
+- keep briefs factual, grounded, and non-formulaic
+- attention_brief should explain both what is happening and why it deserves that level of attention
+- avoid repetitive boilerplate
+- do not be verbose
+"#
+    .trim()
 }
 
 fn naming_system_prompt() -> &'static str {
-    "You are a terminal session naming system for Exaterm, a Linux app used to supervise AI coding agents running in terminal sessions.\nYou receive a current operator-facing name, which may be empty, plus a long terminal-history window.\nReturn one compact JSON object only.\nChoose a short, stable, operator-scannable name that reflects what this session is actually working on.\nDefer strongly to stable names: if the current name is still good, keep it or make only a very small refinement.\nDo not rename eagerly based on one transient command, one tool invocation, or one narrow substep.\nPrefer names that will still make sense a few minutes later.\nUse the terminal history, not hidden assumptions.\nDo not mention model names, terminals, or generic labels like 'Agent' or 'Shell' unless the history truly gives you nothing better.\nIf the history is still too thin, too generic, or too ambiguous to choose a good stable name, return an empty string.\nKeep the name concise, ideally 2 to 5 words and at most 40 characters.\nReturn JSON only."
+    r#"
+You are a terminal session naming system for Exaterm, a Linux app used to supervise AI coding agents running in terminal sessions.
+
+You receive a current operator-facing name, which may be empty, plus a long terminal-history window.
+
+Return one compact JSON object only.
+
+Choose a short, stable, operator-scannable name that reflects what this session is actually working on.
+Defer strongly to stable names: if the current name is still good, keep it or make only a very small refinement.
+Do not rename eagerly based on one transient command, one tool invocation, or one narrow substep.
+Prefer names that will still make sense a few minutes later.
+Use the terminal history, not hidden assumptions.
+Do not mention model names, terminals, or generic labels like 'Agent' or 'Shell' unless the history truly gives you nothing better.
+If the history is still too thin, too generic, or too ambiguous to choose a good stable name, return an empty string.
+Keep the name concise, ideally 2 to 5 words and at most 40 characters.
+
+Return JSON only.
+"#
+    .trim()
 }
 
 fn nudge_system_prompt() -> &'static str {
-    "You write one short terminal nudge for an AI coding agent session in Exaterm.\nThe session has already been classified as stopped rather than idle, blocked, or complete.\nYou are also given the current executing command directly under the shell.\nIf there is no current direct shell child command, or it does not look like a coding agent, return an empty string.\nYour job is to write a brief, context-aware push that can help the agent resume useful work.\nUse only the provided evidence.\nDo not ask questions unless absolutely necessary.\nDo not mention Exaterm, JSON, or that you are an AI.\nDo not explain your reasoning.\nDo not be verbose.\nPrefer simple concrete nudges like continue, keep going, focus on the next failing step, rerun the relevant test, or finish the in-progress repair.\nDo not suggest risky or destructive actions unless the evidence strongly and explicitly supports them.\nIf there is no safe, useful nudge, return an empty string.\nReturn JSON only."
+    r#"
+You write one short terminal nudge for an AI coding agent session in Exaterm.
+
+The session has already been classified as stopped rather than idle, blocked, or complete.
+You are also given the current executing command directly under the shell.
+If there is no current direct shell child command, or it does not look like a coding agent, return an empty string.
+
+Your job is to write a brief, context-aware push that can help the agent resume useful work.
+Use only the provided evidence.
+Do not ask questions unless absolutely necessary.
+Do not mention Exaterm, JSON, or that you are an AI.
+Do not explain your reasoning.
+Do not be verbose.
+Prefer simple concrete nudges like continue, keep going, focus on the next failing step, rerun the relevant test, or finish the in-progress repair.
+Do not suggest risky or destructive actions unless the evidence strongly and explicitly supports them.
+If there is no safe, useful nudge, return an empty string.
+
+Return JSON only.
+"#
+    .trim()
 }
 
 fn synthesis_schema() -> Value {
@@ -596,7 +701,7 @@ mod tests {
 
     #[test]
     fn openai_chat_completions_url_defaults_to_openai() {
-        let _guard = ENV_MUTEX.lock().expect("env mutex");
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|poison| poison.into_inner());
         std::env::remove_var("EXATERM_OPENAI_BASE_URL");
         std::env::remove_var("OPENAI_BASE_URL");
         assert_eq!(
@@ -607,7 +712,7 @@ mod tests {
 
     #[test]
     fn openai_chat_completions_url_uses_configured_base() {
-        let _guard = ENV_MUTEX.lock().expect("env mutex");
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|poison| poison.into_inner());
         std::env::set_var("EXATERM_OPENAI_BASE_URL", "https://example.test/v1/");
         assert_eq!(
             openai_chat_completions_url(),
@@ -790,7 +895,7 @@ mod tests {
     #[test]
     fn fixture_battery_covers_codex_and_claude_shapes() {
         let fixtures = sample_agent_evidence();
-        assert!(fixtures.len() >= 7);
+        assert!(fixtures.len() >= 12);
         assert!(fixtures.iter().any(|(name, _, _)| name.contains("codex")));
         assert!(fixtures.iter().any(|(name, _, _)| name.contains("claude")));
         assert!(fixtures
@@ -802,7 +907,66 @@ mod tests {
     }
 
     #[test]
-    fn live_summary_fixture_battery_when_api_key_is_available() {
+    fn live_summary_fixture_codex_true_autopilot_idle_when_api_key_is_available() {
+        assert_live_summary_fixture("codex_true_autopilot_idle");
+    }
+
+    #[test]
+    fn live_summary_fixture_claude_sweeping_refactor_monitor_when_api_key_is_available() {
+        assert_live_summary_fixture("claude_sweeping_refactor_monitor");
+    }
+
+    #[test]
+    fn live_summary_fixture_codex_mundane_code_review_when_api_key_is_available() {
+        assert_live_summary_fixture("codex_mundane_code_review");
+    }
+
+    #[test]
+    fn live_summary_fixture_claude_turbulent_diagnosis_guide_when_api_key_is_available() {
+        assert_live_summary_fixture("claude_turbulent_diagnosis_guide");
+    }
+
+    #[test]
+    fn live_summary_fixture_claude_repeated_step_monitor_when_api_key_is_available() {
+        assert_live_summary_fixture("claude_repeated_step_monitor");
+    }
+
+    #[test]
+    fn live_summary_fixture_codex_parser_steady_progress_when_api_key_is_available() {
+        assert_live_summary_fixture("codex_parser_steady_progress");
+    }
+
+    #[test]
+    fn live_summary_fixture_claude_waiting_for_nudge_checkpoint_when_api_key_is_available() {
+        assert_live_summary_fixture("claude_waiting_for_nudge_checkpoint");
+    }
+
+    #[test]
+    fn live_summary_fixture_codex_blocked_permission_prompt_when_api_key_is_available() {
+        assert_live_summary_fixture("codex_blocked_permission_prompt");
+    }
+
+    #[test]
+    fn live_summary_fixture_claude_compile_loop_flailing_when_api_key_is_available() {
+        assert_live_summary_fixture("claude_compile_loop_flailing");
+    }
+
+    #[test]
+    fn live_summary_fixture_codex_converged_waiting_when_api_key_is_available() {
+        assert_live_summary_fixture("codex_converged_waiting");
+    }
+
+    #[test]
+    fn live_summary_fixture_claude_risky_shortcuts_when_api_key_is_available() {
+        assert_live_summary_fixture("claude_risky_shortcuts");
+    }
+
+    #[test]
+    fn live_summary_fixture_codex_disk_pressure_extreme_risk_when_api_key_is_available() {
+        assert_live_summary_fixture("codex_disk_pressure_extreme_risk");
+    }
+
+    fn assert_live_summary_fixture(name: &str) {
         if std::env::var("EXATERM_LIVE_OPENAI_TESTS")
             .ok()
             .as_deref()
@@ -811,59 +975,248 @@ mod tests {
             return;
         }
 
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|poison| poison.into_inner());
+
         let Some(config) = super::OpenAiSynthesisConfig::from_env() else {
             return;
         };
 
-        for (name, evidence, expectations) in sample_agent_evidence() {
-            let summary = match super::summarize_blocking(&config, &evidence) {
-                Ok(summary) => summary,
-                Err(error) if error.contains("error sending request for url") => {
-                    eprintln!("skipping live summary fixture {name} due to transport error: {error}");
-                    return;
-                }
-                Err(error) => panic!("live summary call failed for {name}: {error}"),
-            };
+        let (fixture_name, evidence, expectations) = sample_agent_evidence()
+            .into_iter()
+            .find(|(fixture_name, _, _)| *fixture_name == name)
+            .unwrap_or_else(|| panic!("missing live summary fixture: {name}"));
 
-            assert!(
-                summary.headline.is_some(),
-                "{name} should produce a visible headline"
-            );
-
-            assert!(
-                summary.tactical_state_brief.is_some()
-                    && summary.attention_brief.is_some(),
-                "{name} should produce terse justifications for each dimension"
-            );
-
-            eprintln!(
-                "{name}: state={:?} ({:?}) attention={:?} ({:?}) headline={:?}",
-                summary.tactical_state,
-                summary.tactical_state_brief,
-                summary.attention_level,
-                summary.attention_brief,
-                summary.headline,
-            );
-
-            if !expectations.tactical_states.is_empty() {
-                assert!(
-                    expectations.tactical_states.contains(&summary.tactical_state),
-                    "{name} should synthesize one of the expected tactical states, got {:?}",
-                    summary.tactical_state
+        let summary = match super::summarize_blocking(&config, &evidence) {
+            Ok(summary) => summary,
+            Err(error) if error.contains("error sending request for url") => {
+                eprintln!(
+                    "skipping live summary fixture {fixture_name} due to transport error: {error}"
                 );
+                return;
             }
-            if !expectations.attention_levels.is_empty() {
-                assert!(
-                    expectations.attention_levels.contains(&summary.attention_level),
-                    "{name} should synthesize one of the expected attention levels, got {:?}",
-                    summary.attention_level
-                );
-            }
+            Err(error) => panic!("live summary call failed for {fixture_name}: {error}"),
+        };
+
+        assert!(
+            summary.headline.is_some(),
+            "{fixture_name} should produce a visible headline"
+        );
+
+        assert!(
+            summary.tactical_state_brief.is_some() && summary.attention_brief.is_some(),
+            "{fixture_name} should produce terse justifications for each dimension"
+        );
+
+        eprintln!(
+            "{fixture_name}: state={:?} ({:?}) attention={:?} ({:?}) headline={:?}",
+            summary.tactical_state,
+            summary.tactical_state_brief,
+            summary.attention_level,
+            summary.attention_brief,
+            summary.headline,
+        );
+
+        if !expectations.tactical_states.is_empty() {
+            assert!(
+                expectations.tactical_states.contains(&summary.tactical_state),
+                "{fixture_name} should synthesize one of the expected tactical states, got {:?}",
+                summary.tactical_state
+            );
+        }
+        if !expectations.attention_levels.is_empty() {
+            assert!(
+                expectations.attention_levels.contains(&summary.attention_level),
+                "{fixture_name} should synthesize one of the expected attention levels, got {:?}",
+                summary.attention_level
+            );
         }
     }
 
     fn sample_agent_evidence() -> Vec<(&'static str, TacticalEvidence, FixtureExpectations)> {
         vec![
+            (
+                "codex_true_autopilot_idle",
+                TacticalEvidence {
+                    session_name: "Codex Standby".into(),
+                    task_label: "Post-merge parking".into(),
+                    dominant_process: Some("codex".into()),
+                    process_tree_excerpt: Some("bash [S] pid=1201 | codex [S] pid=1202".into()),
+                    recent_files: vec!["src/config.rs".into(), "tests/config.rs".into()],
+                    terminal_status_line: Some("Everything looks clean; parking here until there is another task.".into()),
+                    terminal_status_line_age: Some("142s ago".into()),
+                    recent_terminal_activity: vec![
+                        "[232s ago] • The config fix is merged locally and the last cargo test rerun stayed green.".into(),
+                        "[220s ago] • I checked for follow-up failures and didn’t find any.".into(),
+                        "[201s ago] • There is no meaningful next step pending on this session right now.".into(),
+                        "[181s ago] • I’m parking here until there is another task.".into(),
+                        "[160s ago] • Everything still looks clean.".into(),
+                        "[142s ago] • Parking here until there is another task.".into(),
+                    ],
+                    recent_events: vec![
+                        "Spawned cargo test".into(),
+                        "Process exited with code 0".into(),
+                    ],
+                },
+                FixtureExpectations {
+                    tactical_states: vec![TacticalState::Idle, TacticalState::Stopped],
+                    attention_levels: vec![AttentionLevel::Autopilot],
+                },
+            ),
+            (
+                "claude_sweeping_refactor_monitor",
+                TacticalEvidence {
+                    session_name: "Claude Sweep".into(),
+                    task_label: "Broad workspace cleanup".into(),
+                    dominant_process: Some("claude".into()),
+                    process_tree_excerpt: Some(
+                        "bash [S] pid=1301 | claude [S] pid=1302".into(),
+                    ),
+                    recent_files: vec![
+                        "crates/exaterm/src/ui.rs".into(),
+                        "crates/exaterm/src/widgets.rs".into(),
+                        "crates/exaterm/src/style.rs".into(),
+                        "crates/exaterm/src/layout.rs".into(),
+                    ],
+                    terminal_status_line: Some("cargo check after the frontend refactor pass".into()),
+                    terminal_status_line_age: Some("6s ago".into()),
+                    recent_terminal_activity: vec![
+                        "[118s ago] • I’m doing the frontend split in one pass: ui.rs should shrink, widget builders should move out, and the layout/style helpers need to line up before I validate.".into(),
+                        "[102s ago] $ sed -n '1,260p' crates/exaterm/src/ui.rs".into(),
+                        "[93s ago] $ sed -n '1,220p' crates/exaterm/src/widgets.rs".into(),
+                        "[85s ago] $ sed -n '1,220p' crates/exaterm/src/style.rs".into(),
+                        "[78s ago] $ sed -n '1,220p' crates/exaterm/src/layout.rs".into(),
+                        "[70s ago] • The split touches the headline row, attention rendering, widget construction, and layout thresholds, so I want the whole frontend surface to move together.".into(),
+                        "[61s ago] $ apply_patch <extract widget builders and wire new card header layout>".into(),
+                        "[49s ago] $ apply_patch <move attention styling and headline sizing into style.rs>".into(),
+                        "[39s ago] $ apply_patch <retune battlefield layout helpers after the widget split>".into(),
+                        "[30s ago] $ apply_patch <update ui.rs composition to use the extracted modules>".into(),
+                        "[19s ago] $ cargo check -q -p exaterm".into(),
+                        "[12s ago] • cargo check is running after edits across ui.rs, widgets.rs, style.rs, and layout.rs.".into(),
+                        "[6s ago] cargo check after the frontend refactor pass".into(),
+                    ],
+                    recent_events: vec![],
+                },
+                FixtureExpectations {
+                    tactical_states: vec![TacticalState::Working, TacticalState::Thinking],
+                    attention_levels: vec![AttentionLevel::Monitor],
+                },
+            ),
+            (
+                "claude_turbulent_diagnosis_guide",
+                TacticalEvidence {
+                    session_name: "Claude Diagnose".into(),
+                    task_label: "Intermittent reconnect issue".into(),
+                    dominant_process: Some("claude".into()),
+                    process_tree_excerpt: Some("bash [S] pid=1501 | claude [S] pid=1502".into()),
+                    recent_files: vec!["src/beachhead.rs".into(), "src/remote.rs".into()],
+                    terminal_status_line: Some("Comparing reconnect traces after another failed startup-order theory".into()),
+                    terminal_status_line_age: Some("12s ago".into()),
+                    recent_terminal_activity: vec![
+                        "[30m ago] $ rg -n \"connect_raw_session|forward_remote_socket|control\" crates/exaterm/src/remote.rs crates/exaterm-core/src/daemon.rs".into(),
+                        "[27m ago] • First pass points at the control socket becoming visible before the raw stream settles.".into(),
+                        "[24m ago] $ sed -n '220,340p' crates/exaterm/src/remote.rs".into(),
+                        "[21m ago] • The next failing trace doesn’t fit that ordering as cleanly as I expected.".into(),
+                        "[18m ago] $ sed -n '120,220p' crates/exaterm-core/src/daemon.rs".into(),
+                        "[15m ago] • Switching to the attach-order path because the first theory is weaker on the second trace.".into(),
+                        "[12m ago] $ rg -n \"accept|listener|snapshot\" crates/exaterm-core/src/daemon.rs".into(),
+                        "[9m ago] • That path also leaves gaps in the reconnect timeline and I still don’t have a patch I trust.".into(),
+                        "[6m ago] $ sed -n '220,340p' crates/exaterm/src/remote.rs".into(),
+                        "[3m ago] • I can patch either startup ordering or snapshot timing next, but I’m not confident which one matches the failing traces.".into(),
+                        "[1m ago] $ sed -n '120,220p' crates/exaterm-core/src/daemon.rs".into(),
+                        "[12s ago] Comparing reconnect traces after another failed startup-order theory".into(),
+                    ],
+                    recent_events: vec![],
+                },
+                FixtureExpectations {
+                    tactical_states: vec![TacticalState::Working, TacticalState::Thinking],
+                    attention_levels: vec![AttentionLevel::Guide],
+                },
+            ),
+            (
+                "claude_repeated_step_monitor",
+                TacticalEvidence {
+                    session_name: "Claude Diagnose".into(),
+                    task_label: "Intermittent reconnect issue".into(),
+                    dominant_process: Some("claude".into()),
+                    process_tree_excerpt: Some("bash [S] pid=1551 | claude [S] pid=1552".into()),
+                    recent_files: vec!["src/beachhead.rs".into(), "src/remote.rs".into()],
+                    terminal_status_line: Some("Rerunning reconnect after a remote startup patch".into()),
+                    terminal_status_line_age: Some("12s ago".into()),
+                    recent_terminal_activity: vec![
+                        "[18m ago] $ rg -n \"forward|raw_stream|control\" crates/exaterm/src/remote.rs crates/exaterm-core/src/daemon.rs".into(),
+                        "[17m30s ago] $ sed -n '220,340p' crates/exaterm/src/remote.rs".into(),
+                        "[17m ago] control_ready=41ms raw_ready=73ms".into(),
+                        "[16m30s ago] $ sed -n '120,220p' crates/exaterm-core/src/daemon.rs".into(),
+                        "[16m ago] $ apply_patch <move raw forward setup earlier in remote reconnect path>".into(),
+                        "[15m30s ago] $ apply_patch <move raw forward setup earlier in remote reconnect path>".into(),
+                        "[15m ago] $ cargo test -p exaterm remote::tests::reconnect_reuses_existing_forward -- --nocapture".into(),
+                        "[14m30s ago] ok".into(),
+                        "[14m ago] $ cargo test -p exaterm remote::tests::raw_session_forward_is_lazy -- --nocapture".into(),
+                        "[13m30s ago] $ cargo test -p exaterm remote::tests::raw_session_forward_is_lazy -- --nocapture".into(),
+                        "[13m ago] ok".into(),
+                        "[12m30s ago] trace-2: control socket visible before raw stream attach".into(),
+                        "[12m ago] $ rg -n \"connect_raw_session|forward_remote_socket\" crates/exaterm/src/remote.rs".into(),
+                        "[11m30s ago] $ sed -n '340,430p' crates/exaterm/src/remote.rs".into(),
+                        "[11m ago] $ apply_patch <defer snapshot advertisement until raw listener is prepared>".into(),
+                        "[10m30s ago] $ apply_patch <defer snapshot advertisement until raw listener is prepared>".into(),
+                        "[10m ago] $ cargo test -p exaterm remote::tests -- --nocapture".into(),
+                        "[9m30s ago] 2 tests passed; reconnect trace not reproduced".into(),
+                        "[9m ago] trace-2: control socket visible before raw stream attach".into(),
+                        "[8m30s ago] $ sed -n '220,340p' crates/exaterm/src/remote.rs".into(),
+                        "[8m ago] $ sed -n '120,220p' crates/exaterm-core/src/daemon.rs".into(),
+                        "[7m30s ago] $ sed -n '120,220p' crates/exaterm-core/src/daemon.rs".into(),
+                        "[7m ago] control_ready=41ms raw_ready=73ms".into(),
+                        "[6m30s ago] $ apply_patch <move raw forward setup earlier in remote reconnect path>".into(),
+                        "[6m ago] $ cargo test -p exaterm remote::tests::reconnect_reuses_existing_forward -- --nocapture".into(),
+                        "[5m30s ago] ok".into(),
+                        "[5m ago] $ cargo test -p exaterm remote::tests::raw_session_forward_is_lazy -- --nocapture".into(),
+                        "[4m30s ago] $ cargo test -p exaterm remote::tests::raw_session_forward_is_lazy -- --nocapture".into(),
+                        "[4m ago] ok".into(),
+                        "[3m30s ago] trace-2: control socket visible before raw stream attach".into(),
+                        "[3m ago] $ sed -n '220,340p' crates/exaterm/src/remote.rs".into(),
+                        "[2m30s ago] $ sed -n '120,220p' crates/exaterm-core/src/daemon.rs".into(),
+                        "[2m ago] $ apply_patch <tighten raw-forward ordering around reconnect startup>".into(),
+                        "[90s ago] $ apply_patch <tighten raw-forward ordering around reconnect startup>".into(),
+                        "[60s ago] $ cargo test -p exaterm remote::tests::reconnect_reuses_existing_forward -- --nocapture".into(),
+                        "[30s ago] ok".into(),
+                        "[12s ago] Rerunning reconnect after a remote startup patch".into(),
+                    ],
+                    recent_events: vec![],
+                },
+                FixtureExpectations {
+                    tactical_states: vec![TacticalState::Working, TacticalState::Thinking],
+                    attention_levels: vec![AttentionLevel::Monitor],
+                },
+            ),
+            (
+                "codex_mundane_code_review",
+                TacticalEvidence {
+                    session_name: "Codex Review".into(),
+                    task_label: "Repository code review".into(),
+                    dominant_process: Some("codex".into()),
+                    process_tree_excerpt: Some("bash [S] pid=1601 | codex [S] pid=1602".into()),
+                    recent_files: vec!["crates/exaterm/src/ui.rs".into(), "crates/exaterm/src/widgets.rs".into()],
+                    terminal_status_line: Some("running tests while scanning for state/transport bugs".into()),
+                    terminal_status_line_age: Some("6s ago".into()),
+                    recent_terminal_activity: vec![
+                        "[54s ago] › do a code review of this repo".into(),
+                        "[48s ago] • I’m reviewing the repository as code review, starting with repo state and layout so I can target likely risk areas and identify concrete findings rather than give a generic overview.".into(),
+                        "[37s ago] • I found local modifications in the GTK client files, so I’m checking those first and then validating the current tree with cargo check to separate concrete regressions from broader repo-level concerns.".into(),
+                        "[27s ago] • I’ve isolated the in-progress UI changes; now I’m reading the surrounding widget/state code to see whether those visual tweaks introduced behavioral mismatches rather than just layout differences.".into(),
+                        "[18s ago] • cargo check passes, so I’m moving past compile failures and looking for behavioral issues in the headless/runtime path and session state model, since that’s where repo-level supervisory bugs would hide.".into(),
+                        "[6s ago] • I’ve confirmed the tree has tests, so I’m running them while scanning for state/transport code that can silently misreport sessions, since those failures are higher value than UI-only nits in this repo.".into(),
+                    ],
+                    recent_events: vec![
+                        "Spawned cargo check".into(),
+                        "Process exited with code 0".into(),
+                        "Spawned cargo test".into(),
+                    ],
+                },
+                FixtureExpectations {
+                    tactical_states: vec![TacticalState::Working, TacticalState::Thinking],
+                    attention_levels: vec![AttentionLevel::Autopilot],
+                },
+            ),
             (
                 "codex_parser_steady_progress",
                 TacticalEvidence {
@@ -969,13 +1322,20 @@ mod tests {
                     terminal_status_line: Some("error[E0599]: no method named present on FocusHandle".into()),
                     terminal_status_line_age: Some("4s ago".into()),
                     recent_terminal_activity: vec![
-                        "[90s ago] • I think the next failure is still the focus handoff, so I’m trying another narrow fix.".into(),
-                        "[84s ago] $ cargo test focus_mode -- --nocapture".into(),
-                        "[76s ago] error[E0599]: no method named present on FocusHandle".into(),
-                        "[62s ago] • That patch was wrong; I’m retrying with a different signal hookup.".into(),
-                        "[50s ago] $ cargo test focus_mode -- --nocapture".into(),
-                        "[41s ago] error[E0599]: no method named present on FocusHandle".into(),
-                        "[27s ago] • Still wrong. I’m going to try another approach on the same path.".into(),
+                        "[4m ago] $ rg -n \"FocusHandle|present\\(\" src/ui.rs".into(),
+                        "[3m42s ago] $ sed -n '1180,1245p' src/ui.rs".into(),
+                        "[3m25s ago] $ apply_patch <route focus handoff through the card-local handle>".into(),
+                        "[3m ago] $ cargo test focus_mode -- --nocapture".into(),
+                        "[2m52s ago] error[E0599]: no method named present on FocusHandle".into(),
+                        "[2m28s ago] $ sed -n '1180,1245p' src/ui.rs".into(),
+                        "[2m10s ago] $ apply_patch <switch the focus call to the row signal hookup>".into(),
+                        "[102s ago] $ cargo test focus_mode -- --nocapture".into(),
+                        "[94s ago] error[E0599]: no method named present on FocusHandle".into(),
+                        "[76s ago] $ rg -n \"FocusHandle|present\\(\" src/ui.rs".into(),
+                        "[61s ago] $ apply_patch <move the focus call into the card handoff block>".into(),
+                        "[44s ago] $ cargo test focus_mode -- --nocapture".into(),
+                        "[36s ago] error[E0599]: no method named present on FocusHandle".into(),
+                        "[24s ago] $ sed -n '1180,1245p' src/ui.rs".into(),
                         "[12s ago] $ cargo test focus_mode -- --nocapture".into(),
                         "[4s ago] error[E0599]: no method named present on FocusHandle".into(),
                     ],
@@ -1010,8 +1370,8 @@ mod tests {
                         "[212s ago] • Stable. Standing by.".into(),
                         "[146s ago] • No new failures observed.".into(),
                         "[142s ago] • Stable. Standing by.".into(),
-                        "[66s ago] • Still stable; waiting for the next instruction.".into(),
                         "[97s ago] • Stable. Standing by.".into(),
+                        "[66s ago] • No new failures observed after the last green pass.".into(),
                     ],
                     recent_events: vec![
                         "Spawned cargo test".into(),

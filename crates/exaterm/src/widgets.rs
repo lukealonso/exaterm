@@ -15,6 +15,7 @@ pub(crate) struct SessionCardWidgets {
     pub header: gtk::Box,
     pub title: gtk::Label,
     pub status: gtk::Label,
+    pub headline_row: gtk::Box,
     pub nudge_row: gtk::Box,
     pub nudge_state: gtk::Label,
     pub recency: gtk::Label,
@@ -55,7 +56,7 @@ pub(crate) fn build_segmented_bar(label: &str) -> SegmentedBarWidgets {
         .hexpand(true)
         .build();
     bar.add_css_class("segmented-bar");
-    let segments = (0..4)
+    let segments = (0..5)
         .map(|_| {
             let segment = gtk::Box::builder().hexpand(true).build();
             segment.add_css_class("bar-segment");

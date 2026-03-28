@@ -224,22 +224,7 @@ pub fn build_nudge_evidence(
 }
 
 pub fn synthesis_terminal_activity(observation: &SessionObservation) -> Vec<String> {
-    const SUMMARY_ACTIVITY_HISTORY_WINDOW: usize = 100;
-
-    let mut entries = Vec::new();
-    let now = Instant::now();
-
-    entries.extend(
-        observation
-            .terminal_activity
-            .iter()
-            .rev()
-            .take(SUMMARY_ACTIVITY_HISTORY_WINDOW)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .map(|entry| format_terminal_activity_entry(entry, now)),
-    );
+    let mut entries = model_terminal_history_window(observation);
 
     if let Some(painted) = observation.painted_line.as_deref() {
         let trimmed = painted.trim();
@@ -252,31 +237,11 @@ pub fn synthesis_terminal_activity(observation: &SessionObservation) -> Vec<Stri
 }
 
 pub fn naming_terminal_history(observation: &SessionObservation) -> Vec<String> {
-    let now = Instant::now();
-    observation
-        .terminal_activity
-        .iter()
-        .rev()
-        .take(80)
-        .map(|entry| format_terminal_activity_entry(entry, now))
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect()
+    model_terminal_history_window(observation)
 }
 
 pub fn nudge_terminal_history(observation: &SessionObservation) -> Vec<String> {
-    let now = Instant::now();
-    observation
-        .terminal_activity
-        .iter()
-        .rev()
-        .take(120)
-        .map(|entry| format_terminal_activity_entry(entry, now))
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect()
+    model_terminal_history_window(observation)
 }
 
 pub fn scrollback_fragments(observation: &SessionObservation, limit: usize) -> Vec<String> {
@@ -341,11 +306,35 @@ fn append_terminal_activity(activity: &mut Vec<TerminalActivityEntry>, candidate
         });
     }
 
-    const MAX_ACTIVITY_LINES: usize = 320;
+    const MAX_ACTIVITY_LINES: usize = 4096;
     if activity.len() > MAX_ACTIVITY_LINES {
         let extra = activity.len() - MAX_ACTIVITY_LINES;
         activity.drain(0..extra);
     }
+}
+
+fn model_terminal_history_window(observation: &SessionObservation) -> Vec<String> {
+    const MODEL_HISTORY_MIN_LINES: usize = 256;
+    const MODEL_HISTORY_MIN_AGE: Duration = Duration::from_secs(5 * 60);
+
+    let now = Instant::now();
+    let total = observation.terminal_activity.len();
+    if total == 0 {
+        return Vec::new();
+    }
+
+    let line_start = total.saturating_sub(MODEL_HISTORY_MIN_LINES);
+    let time_start = observation
+        .terminal_activity
+        .iter()
+        .position(|entry| now.duration_since(entry.at) <= MODEL_HISTORY_MIN_AGE)
+        .unwrap_or(total.saturating_sub(1));
+    let start = line_start.min(time_start);
+
+    observation.terminal_activity[start..]
+        .iter()
+        .map(|entry| format_terminal_activity_entry(entry, now))
+        .collect()
 }
 
 pub fn find_git_worktree_root(start: &Path) -> Option<PathBuf> {
@@ -494,37 +483,37 @@ mod tests {
     }
 
     #[test]
-    fn synthesis_activity_uses_large_history_window() {
+    fn synthesis_activity_keeps_at_least_256_lines_when_recent_activity_is_short() {
         let mut observation = SessionObservation::new();
         let now = Instant::now();
-        observation.terminal_activity = (0..120)
+        observation.terminal_activity = (0..300)
             .map(|index| TerminalActivityEntry {
-                at: now - Duration::from_secs((120 - index) as u64),
+                at: now - Duration::from_secs(((300 - index) * 2) as u64),
                 text: format!("line {index}"),
             })
             .collect();
 
         let history = synthesis_terminal_activity(&observation);
-        assert_eq!(history.len(), 100);
-        assert!(history.first().is_some_and(|line| line.ends_with("line 20")));
-        assert!(history.last().is_some_and(|line| line.ends_with("line 119")));
+        assert_eq!(history.len(), 256);
+        assert!(history.first().is_some_and(|line| line.ends_with("line 44")));
+        assert!(history.last().is_some_and(|line| line.ends_with("line 299")));
     }
 
     #[test]
-    fn naming_history_uses_large_timestamped_window() {
+    fn model_history_keeps_more_than_256_lines_when_five_minutes_is_larger() {
         let mut observation = SessionObservation::new();
         let now = Instant::now();
-        observation.terminal_activity = (0..100)
+        observation.terminal_activity = (0..400)
             .map(|index| TerminalActivityEntry {
-                at: now - Duration::from_secs((100 - index) as u64),
+                at: now - Duration::from_secs((400 - index) as u64),
                 text: format!("line {index}"),
             })
             .collect();
 
         let history = naming_terminal_history(&observation);
-        assert_eq!(history.len(), 80);
-        assert!(history.first().is_some_and(|line| line.ends_with("line 20")));
-        assert!(history.last().is_some_and(|line| line.ends_with("line 99")));
+        assert_eq!(history.len(), 299);
+        assert!(history.first().is_some_and(|line| line.ends_with("line 101")));
+        assert!(history.last().is_some_and(|line| line.ends_with("line 399")));
     }
 
     #[test]

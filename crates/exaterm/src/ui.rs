@@ -975,9 +975,13 @@ fn build_battle_card_widgets(
     let headline = gtk::Label::builder()
         .xalign(0.0)
         .wrap(true)
+        .hexpand(true)
+        .halign(gtk::Align::Fill)
         .visible(false)
         .css_classes(vec!["card-headline".to_string()])
         .build();
+    headline.set_lines(2);
+    headline.set_ellipsize(gtk::pango::EllipsizeMode::End);
     let alert = gtk::Label::builder()
         .xalign(0.0)
         .wrap(true)
@@ -988,6 +992,16 @@ fn build_battle_card_widgets(
     alert.set_single_line_mode(true);
     alert.set_ellipsize(gtk::pango::EllipsizeMode::End);
     nudge_row.prepend(&alert);
+    let headline_row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(8)
+        .hexpand(true)
+        .halign(gtk::Align::Fill)
+        .visible(false)
+        .build();
+    headline_row.set_valign(gtk::Align::Start);
+    headline_row.append(&headline);
+    headline_row.append(&nudge_row);
     let momentum_bar = build_segmented_bar("Attention Condition");
     let risk_bar = build_segmented_bar("Unused");
 
@@ -1073,8 +1087,7 @@ fn build_battle_card_widgets(
         .vexpand(true)
         .build();
     content.append(&header);
-    content.append(&headline);
-    content.append(&nudge_row);
+    content.append(&headline_row);
     content.append(&middle_stack);
     content.append(&footer);
 
@@ -1184,6 +1197,7 @@ fn build_battle_card_widgets(
         header,
         title,
         status,
+        headline_row,
         nudge_row,
         nudge_state,
         recency,
@@ -2417,15 +2431,22 @@ fn apply_metric_widgets(
 
 fn apply_segmented_bar(
     bar: &SegmentedBarWidgets,
-    value: Option<&(usize, SignalTone, Option<String>)>,
+    value: Option<&(usize, &'static str, Option<String>)>,
     show_when_empty: bool,
 ) {
-    let Some((fill, tone, reason)) = value else {
+    let Some((fill, css_class, reason)) = value else {
         bar.frame.set_visible(show_when_empty);
         bar.reason.set_label("");
         bar.frame.set_tooltip_text(None::<&str>);
         for segment in &bar.segments {
-            for css in ["bar-calm", "bar-watch", "bar-alert", "bar-empty"] {
+            for css in [
+                "bar-attention-1",
+                "bar-attention-2",
+                "bar-attention-3",
+                "bar-attention-4",
+                "bar-attention-5",
+                "bar-empty",
+            ] {
                 segment.remove_css_class(css);
             }
             segment.add_css_class("bar-empty");
@@ -2440,30 +2461,33 @@ fn apply_segmented_bar(
     bar.frame.set_tooltip_text(reason.as_deref());
 
     for (index, segment) in bar.segments.iter().enumerate() {
-        for css in ["bar-calm", "bar-watch", "bar-alert", "bar-empty"] {
+        for css in [
+            "bar-attention-1",
+            "bar-attention-2",
+            "bar-attention-3",
+            "bar-attention-4",
+            "bar-attention-5",
+            "bar-empty",
+        ] {
             segment.remove_css_class(css);
         }
         if index < *fill {
-            segment.add_css_class(match tone {
-                SignalTone::Calm => "bar-calm",
-                SignalTone::Watch => "bar-watch",
-                SignalTone::Alert => "bar-alert",
-            });
+            segment.add_css_class(css_class);
         } else {
             segment.add_css_class("bar-empty");
         }
     }
 }
 
-fn attention_bar_value(summary: Option<&TacticalSynthesis>) -> Option<(usize, SignalTone, Option<String>)> {
+fn attention_bar_value(summary: Option<&TacticalSynthesis>) -> Option<(usize, &'static str, Option<String>)> {
     if let Some(summary) = summary {
         let hint = summary.attention_brief.clone();
         return Some(match summary.attention_level {
-            AttentionLevel::Autopilot => (1, SignalTone::Calm, hint),
-            AttentionLevel::Monitor => (2, SignalTone::Watch, hint),
-            AttentionLevel::Guide => (3, SignalTone::Watch, hint),
-            AttentionLevel::Intervene => (4, SignalTone::Alert, hint),
-            AttentionLevel::Takeover => (4, SignalTone::Alert, hint),
+            AttentionLevel::Autopilot => (1, "bar-attention-1", hint),
+            AttentionLevel::Monitor => (2, "bar-attention-2", hint),
+            AttentionLevel::Guide => (3, "bar-attention-3", hint),
+            AttentionLevel::Intervene => (4, "bar-attention-4", hint),
+            AttentionLevel::Takeover => (5, "bar-attention-5", hint),
         });
     }
     None
@@ -2725,6 +2749,8 @@ fn apply_summary_chrome_visibility(
     card.headline.set_visible(visibility.headline_visible);
     card.status.set_visible(visibility.status_visible);
     card.header.set_visible(visibility.header_visible);
+    card.headline_row
+        .set_visible(visibility.headline_visible || visibility.nudge_row_visible);
     card.bars.set_visible(visibility.bars_visible);
     card.nudge_state.set_visible(visibility.nudge_state_visible);
     card.nudge_row.set_visible(visibility.nudge_row_visible);
