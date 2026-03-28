@@ -1,7 +1,9 @@
+use crate::file_watch::{spawn_repo_watch, RepoWatchHandle};
 use crate::model::{SessionId, SessionLaunch, WorkspaceState};
 use crate::observation::{
-    apply_stream_update, build_naming_evidence, build_nudge_evidence, build_tactical_evidence,
-    refresh_observation as refresh_session_observation, SessionObservation,
+    apply_file_activity, apply_observation_refresh, apply_stream_update, build_naming_evidence,
+    build_nudge_evidence, build_tactical_evidence, clear_file_activity,
+    compute_observation_refresh, find_git_worktree_root, SessionObservation,
 };
 use crate::proto::{
     ClientMessage, ObservationSnapshot, ServerMessage, SessionSnapshot, WorkspaceSnapshot,
@@ -15,11 +17,12 @@ use crate::synthesis::{
 };
 use portable_pty::PtySize;
 use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs::File;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::process::{Command, ExitCode, Stdio};
@@ -28,11 +31,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const CONTROL_SOCKET_NAME: &str = "beachhead-control.sock";
-const RAW_SOCKET_NAME: &str = "beachhead-stream.sock";
 const CANONICAL_TERMINAL_ROWS: u16 = 40;
 const CANONICAL_TERMINAL_COLS: u16 = 120;
 const REPLAY_BYTES_LIMIT: usize = 8 * 1024 * 1024;
 const REFRESH_INTERVAL: Duration = Duration::from_millis(900);
+const CONTROL_EVENTS_PER_TICK: usize = 128;
 
 struct SummaryWorker {
     requests: mpsc::Sender<SummaryJob>,
@@ -79,6 +82,47 @@ struct NudgeJob {
     evidence: NudgeEvidence,
 }
 
+struct ObservationWorker {
+    requests: mpsc::Sender<ObservationJob>,
+    responses: mpsc::Receiver<ObservationResult>,
+}
+
+struct ObservationJob {
+    session_id: SessionId,
+    session: crate::model::SessionRecord,
+}
+
+struct ObservationResult {
+    session_id: SessionId,
+    session: crate::model::SessionRecord,
+    refresh: crate::observation::ObservationRefreshResult,
+}
+
+#[derive(Clone)]
+struct ControlNotifier {
+    tx: mpsc::Sender<ClientControl>,
+    wake: std::sync::Arc<std::sync::Mutex<UnixStream>>,
+}
+
+impl ControlNotifier {
+    fn send(&self, control: ClientControl) -> Result<(), mpsc::SendError<ClientControl>> {
+        self.tx.send(control)?;
+        self.wake();
+        Ok(())
+    }
+
+    fn wake(&self) {
+        let Ok(mut wake) = self.wake.lock() else {
+            return;
+        };
+        match wake.write(&[1]) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(_) => {}
+        }
+    }
+}
+
 struct NudgeResult {
     session_id: SessionId,
     signature: String,
@@ -90,6 +134,11 @@ struct SummaryCacheEntry {
     completed_signature: Option<String>,
     requested_signature: Option<String>,
     last_summary: Option<TacticalSynthesis>,
+    last_attempt: Option<Instant>,
+    in_flight: bool,
+}
+
+struct ObservationCacheEntry {
     last_attempt: Option<Instant>,
     in_flight: bool,
 }
@@ -124,6 +173,15 @@ impl SummaryCacheEntry {
     }
 }
 
+impl ObservationCacheEntry {
+    fn new() -> Self {
+        Self {
+            last_attempt: None,
+            in_flight: false,
+        }
+    }
+}
+
 impl NamingCacheEntry {
     fn new() -> Self {
         Self {
@@ -152,8 +210,13 @@ impl NudgeCacheEntry {
 struct DaemonState {
     workspace: WorkspaceState,
     observations: BTreeMap<SessionId, SessionObservation>,
+    observation_worker: Option<ObservationWorker>,
+    observation_cache: BTreeMap<SessionId, ObservationCacheEntry>,
     runtimes: BTreeMap<SessionId, SessionRuntime>,
     replay_buffers: BTreeMap<SessionId, Vec<u8>>,
+    session_streams: BTreeMap<SessionId, SessionStreamState>,
+    repo_watches: BTreeMap<PathBuf, RepoWatchState>,
+    session_repo_roots: BTreeMap<SessionId, PathBuf>,
     summary_worker: Option<SummaryWorker>,
     summary_cache: BTreeMap<SessionId, SummaryCacheEntry>,
     naming_worker: Option<NamingWorker>,
@@ -161,14 +224,19 @@ struct DaemonState {
     nudge_worker: Option<NudgeWorker>,
     nudge_cache: BTreeMap<SessionId, NudgeCacheEntry>,
     forwarded_sessions: BTreeSet<SessionId>,
-    pending_input_traces: VecDeque<PendingInputTrace>,
     snapshot_dirty: bool,
 }
 
-struct PendingInputTrace {
-    trace_id: u64,
-    sent_at_us: u64,
-    len: usize,
+struct SessionStreamState {
+    socket_name: String,
+    socket_path: PathBuf,
+    listener: UnixListener,
+    writer: std::sync::Arc<std::sync::Mutex<Option<UnixStream>>>,
+}
+
+struct RepoWatchState {
+    sessions: BTreeSet<SessionId>,
+    handle: RepoWatchHandle,
 }
 
 impl DaemonState {
@@ -176,8 +244,13 @@ impl DaemonState {
         Self {
             workspace: WorkspaceState::new(),
             observations: BTreeMap::new(),
+            observation_worker: spawn_observation_worker(),
+            observation_cache: BTreeMap::new(),
             runtimes: BTreeMap::new(),
             replay_buffers: BTreeMap::new(),
+            session_streams: BTreeMap::new(),
+            repo_watches: BTreeMap::new(),
+            session_repo_roots: BTreeMap::new(),
             summary_worker: spawn_summary_worker(),
             summary_cache: BTreeMap::new(),
             naming_worker: spawn_naming_worker(),
@@ -185,7 +258,6 @@ impl DaemonState {
             nudge_worker: spawn_nudge_worker(),
             nudge_cache: BTreeMap::new(),
             forwarded_sessions: BTreeSet::new(),
-            pending_input_traces: VecDeque::new(),
             snapshot_dirty: false,
         }
     }
@@ -196,9 +268,21 @@ impl DaemonState {
         }
 
         let launch = SessionLaunch::user_shell("Shell 1", "Generic command session");
+        self.add_shell_session_without_watch(launch)?;
+        self.snapshot_dirty = true;
+        Ok(())
+    }
+
+    fn add_shell_session_without_watch(&mut self, launch: SessionLaunch) -> Result<SessionId, String> {
         let session_id = self.workspace.add_session(launch.clone());
-        self.observations.insert(session_id, SessionObservation::new());
+        self.observations
+            .insert(session_id, SessionObservation::new());
+        self.observation_cache
+            .insert(session_id, ObservationCacheEntry::new());
         self.nudge_cache.insert(session_id, NudgeCacheEntry::new());
+        self.replay_buffers.insert(session_id, Vec::new());
+        self.session_streams
+            .insert(session_id, create_session_stream_state(session_id)?);
         let size = PtySize {
             rows: CANONICAL_TERMINAL_ROWS,
             cols: CANONICAL_TERMINAL_COLS,
@@ -210,8 +294,46 @@ impl DaemonState {
             self.workspace.mark_spawned(session_id, pid);
         }
         self.runtimes.insert(session_id, runtime.session_runtime);
-        self.replay_buffers.insert(session_id, Vec::new());
-        self.snapshot_dirty = true;
+        Ok(session_id)
+    }
+
+    fn attach_repo_watch(
+        &mut self,
+        session_id: SessionId,
+        launch: &SessionLaunch,
+        control_tx: &ControlNotifier,
+    ) -> Result<(), String> {
+        let Some(cwd) = launch.cwd.as_deref() else {
+            if let Some(observation) = self.observations.get_mut(&session_id) {
+                clear_file_activity(observation);
+            }
+            return Ok(());
+        };
+        let Some(repo_root) = find_git_worktree_root(cwd) else {
+            if let Some(observation) = self.observations.get_mut(&session_id) {
+                clear_file_activity(observation);
+            }
+            return Ok(());
+        };
+
+        self.session_repo_roots.insert(session_id, repo_root.clone());
+        if let Some(watch) = self.repo_watches.get_mut(&repo_root) {
+            watch.sessions.insert(session_id);
+            return Ok(());
+        }
+
+        let notifier = control_tx.clone();
+        let repo_root_for_thread = repo_root.clone();
+        let handle = spawn_repo_watch(repo_root.clone(), move |relative_path| {
+            let _ = notifier.send(ClientControl::FileActivity {
+                repo_root: repo_root_for_thread.clone(),
+                relative_path,
+            });
+        })?;
+        let mut sessions = BTreeSet::new();
+        sessions.insert(session_id);
+        self.repo_watches
+            .insert(repo_root, RepoWatchState { sessions, handle });
         Ok(())
     }
 
@@ -223,20 +345,25 @@ impl DaemonState {
                 .iter()
                 .cloned()
                 .map(|record| {
+                    let record_id = record.id;
                     let observation = self
                         .observations
-                        .get(&record.id)
+                        .get(&record_id)
                         .map(observation_snapshot)
                         .unwrap_or_default();
                     let summary = self
                         .summary_cache
-                        .get(&record.id)
+                        .get(&record_id)
                         .and_then(|entry| entry.last_summary.clone());
-                    let nudge = self.nudge_cache.get(&record.id);
+                    let nudge = self.nudge_cache.get(&record_id);
                     SessionSnapshot {
                         record,
                         observation,
                         summary,
+                        raw_stream_socket_name: self
+                            .session_streams
+                            .get(&record_id)
+                            .map(|stream| stream.socket_name.clone()),
                         auto_nudge_enabled: nudge.is_some_and(|entry| entry.enabled),
                         last_nudge: nudge.and_then(|entry| entry.last_nudge.clone()),
                         last_sent_age_secs: nudge
@@ -250,7 +377,16 @@ impl DaemonState {
     fn shutdown_workspace(&mut self) {
         self.runtimes.clear();
         self.observations.clear();
+        self.observation_cache.clear();
         self.replay_buffers.clear();
+        for stream in self.session_streams.values() {
+            let _ = fs::remove_file(&stream.socket_path);
+        }
+        self.session_streams.clear();
+        for (_, watch) in std::mem::take(&mut self.repo_watches) {
+            watch.handle.stop();
+        }
+        self.session_repo_roots.clear();
         self.summary_cache.clear();
         self.naming_cache.clear();
         self.nudge_cache.clear();
@@ -263,34 +399,39 @@ impl DaemonState {
 enum ClientControl {
     Message(ClientMessage),
     ControlDisconnected,
-    StreamDisconnected,
+    StreamDisconnected(SessionId),
+    FileActivity {
+        repo_root: PathBuf,
+        relative_path: String,
+    },
     RuntimeEvent(SessionId, RuntimeEvent),
 }
 
 pub struct LocalBeachheadClient {
     pub commands: mpsc::Sender<ClientMessage>,
     pub events: mpsc::Receiver<ServerMessage>,
-    pub raw_writer: std::sync::Arc<std::sync::Mutex<UnixStream>>,
-    pub raw_reader: std::sync::Arc<std::sync::Mutex<Option<UnixStream>>>,
+    event_wake_reader: std::sync::Mutex<UnixStream>,
 }
 
 impl LocalBeachheadClient {
     pub fn connect_or_spawn() -> Result<Self, String> {
-        let (control, raw_stream) = connect_or_spawn_sockets()?;
-        Self::connect_streams(control, raw_stream)
+        let control = connect_or_spawn_control_socket()?;
+        Self::connect_control(control)
     }
 
-    pub fn connect_streams(control: UnixStream, raw_stream: UnixStream) -> Result<Self, String> {
+    pub fn connect_control(control: UnixStream) -> Result<Self, String> {
         let control_reader = control
             .try_clone()
             .map_err(|error| format!("failed to clone beachhead socket: {error}"))?;
         let control_writer = control;
-        let stream_reader = raw_stream
-            .try_clone()
-            .map_err(|error| format!("failed to clone beachhead raw socket: {error}"))?;
-        let stream_writer = raw_stream
-            .try_clone()
-            .map_err(|error| format!("failed to clone beachhead raw writer: {error}"))?;
+        let (event_wake_reader, mut event_wake_writer) =
+            UnixStream::pair().map_err(|error| format!("failed to create event wake socket: {error}"))?;
+        event_wake_reader
+            .set_nonblocking(true)
+            .map_err(|error| format!("failed to set event wake reader nonblocking: {error}"))?;
+        event_wake_writer
+            .set_nonblocking(true)
+            .map_err(|error| format!("failed to set event wake writer nonblocking: {error}"))?;
 
         let (command_tx, command_rx) = mpsc::channel::<ClientMessage>();
         let (event_tx, event_rx) = mpsc::channel::<ServerMessage>();
@@ -320,6 +461,11 @@ impl LocalBeachheadClient {
                                 if event_tx.send(message).is_err() {
                                     break;
                                 }
+                                match event_wake_writer.write(&[1]) {
+                                    Ok(_) => {}
+                                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                                    Err(_) => break,
+                                }
                             }
                             Err(_) => break,
                         }
@@ -334,9 +480,31 @@ impl LocalBeachheadClient {
         Ok(Self {
             commands: command_tx,
             events: event_rx,
-            raw_writer: std::sync::Arc::new(std::sync::Mutex::new(stream_writer)),
-            raw_reader: std::sync::Arc::new(std::sync::Mutex::new(Some(stream_reader))),
+            event_wake_reader: std::sync::Mutex::new(event_wake_reader),
         })
+    }
+
+    pub fn event_wake_fd(&self) -> i32 {
+        self.event_wake_reader
+            .lock()
+            .expect("event wake reader lock poisoned")
+            .as_raw_fd()
+    }
+
+    pub fn drain_event_wake(&self) {
+        let Ok(mut reader) = self.event_wake_reader.lock() else {
+            return;
+        };
+        let mut buf = [0u8; 256];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
     }
 }
 
@@ -352,7 +520,6 @@ pub fn run_local_daemon() -> ExitCode {
 
 fn run_local_daemon_inner() -> Result<(), String> {
     let control_socket_path = control_socket_path()?;
-    let raw_socket_path = raw_socket_path()?;
     if let Some(parent) = control_socket_path.parent() {
         fs::create_dir_all(parent)
             .map_err(|error| format!("failed to create daemon socket dir: {error}"))?;
@@ -360,109 +527,193 @@ fn run_local_daemon_inner() -> Result<(), String> {
     if control_socket_path.exists() {
         let _ = fs::remove_file(&control_socket_path);
     }
-    if raw_socket_path.exists() {
-        let _ = fs::remove_file(&raw_socket_path);
-    }
 
     let control_listener = UnixListener::bind(&control_socket_path)
         .map_err(|error| format!("failed to bind daemon control socket: {error}"))?;
     control_listener
         .set_nonblocking(true)
         .map_err(|error| format!("failed to set daemon control socket nonblocking: {error}"))?;
-    let raw_listener = UnixListener::bind(&raw_socket_path)
-        .map_err(|error| format!("failed to bind daemon raw socket: {error}"))?;
-    raw_listener
-        .set_nonblocking(true)
-        .map_err(|error| format!("failed to set daemon raw socket nonblocking: {error}"))?;
 
     let (control_tx, control_rx) = mpsc::channel::<ClientControl>();
+    let (mut wake_reader, wake_writer) =
+        UnixStream::pair().map_err(|error| format!("failed to create daemon wake socket: {error}"))?;
+    wake_reader
+        .set_nonblocking(true)
+        .map_err(|error| format!("failed to set daemon wake reader nonblocking: {error}"))?;
+    wake_writer
+        .set_nonblocking(true)
+        .map_err(|error| format!("failed to set daemon wake writer nonblocking: {error}"))?;
+    let control_notifier = ControlNotifier {
+        tx: control_tx,
+        wake: std::sync::Arc::new(std::sync::Mutex::new(wake_writer)),
+    };
     let mut client_writer: Option<UnixStream> = None;
-    let raw_writer = std::sync::Arc::new(std::sync::Mutex::new(None::<UnixStream>));
-    let live_input_writer =
-        std::sync::Arc::new(std::sync::Mutex::new(None::<std::sync::Arc<std::sync::Mutex<File>>>));
     let mut state = DaemonState::new();
     let mut last_refresh = Instant::now() - REFRESH_INTERVAL;
     let mut should_exit = false;
 
     while !should_exit {
-        loop {
-            match control_listener.accept() {
-                Ok((stream, _)) => {
-                    if client_writer.is_some() {
-                        let mut stream = stream;
-                        let _ = write_json_line(
-                            &mut stream,
-                            &ServerMessage::Error {
-                                message: "another Exaterm client is already attached".into(),
-                            },
-                        );
-                        continue;
-                    }
-                    let reader = stream
-                        .try_clone()
-                        .map_err(|error| format!("failed to clone client stream: {error}"))?;
-                    spawn_client_reader(reader, control_tx.clone());
-                    client_writer = Some(stream);
+        let control_ready;
+        let wake_ready;
+        let mut ready_session_ids = Vec::new();
+        {
+            let timeout = refresh_timeout_ms(last_refresh.elapsed());
+            let session_ids = state.session_streams.keys().copied().collect::<Vec<_>>();
+            let mut pollfds = vec![
+                libc::pollfd {
+                    fd: control_listener.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: wake_reader.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            for session_id in &session_ids {
+                let stream = state
+                    .session_streams
+                    .get(session_id)
+                    .expect("session stream should exist while polling");
+                pollfds.push(libc::pollfd {
+                    fd: stream.listener.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                });
+            }
+
+            let poll_result =
+                unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, timeout) };
+            if poll_result < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(error) => return Err(format!("daemon control accept failed: {error}")),
+                return Err(format!("daemon poll failed: {error}"));
+            }
+
+            control_ready = pollfds[0].revents & libc::POLLIN != 0;
+            wake_ready = pollfds[1].revents & libc::POLLIN != 0;
+            for (index, session_id) in session_ids.into_iter().enumerate() {
+                if pollfds[index + 2].revents & libc::POLLIN != 0 {
+                    ready_session_ids.push(session_id);
+                }
             }
         }
 
-        loop {
-            match raw_listener.accept() {
-                Ok((stream, _)) => {
-                    if raw_writer.lock().ok().and_then(|guard| guard.as_ref().map(|_| ())).is_some() {
-                        drop(stream);
-                        continue;
+        if control_ready {
+            loop {
+                match control_listener.accept() {
+                    Ok((stream, _)) => {
+                        if client_writer.is_some() {
+                            let mut stream = stream;
+                            let _ = write_json_line(
+                                &mut stream,
+                                &ServerMessage::Error {
+                                    message: "another Exaterm client is already attached".into(),
+                                },
+                            );
+                            continue;
+                        }
+                        let reader = stream
+                            .try_clone()
+                            .map_err(|error| format!("failed to clone client stream: {error}"))?;
+                        spawn_client_reader(reader, control_notifier.clone());
+                        client_writer = Some(stream);
                     }
-                    let reader = stream
-                        .try_clone()
-                        .map_err(|error| format!("failed to clone raw stream: {error}"))?;
-                    spawn_raw_stream_reader(reader, live_input_writer.clone(), control_tx.clone());
-                    if let Ok(mut guard) = raw_writer.lock() {
-                        *guard = Some(stream);
-                        if let Some(writer) = guard.as_mut() {
-                            for replay in state.replay_buffers.values() {
-                                if replay.is_empty() {
-                                    continue;
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(error) => return Err(format!("daemon control accept failed: {error}")),
+                }
+            }
+        }
+
+        if wake_ready {
+            drain_wake_socket(&mut wake_reader);
+        }
+
+        for session_id in ready_session_ids {
+            let Some(stream) = state.session_streams.get(&session_id) else {
+                continue;
+            };
+            loop {
+                match stream.listener.accept() {
+                    Ok((socket, _)) => {
+                        let reader = socket
+                            .try_clone()
+                            .map_err(|error| format!("failed to clone session raw stream: {error}"))?;
+                        let Some(input_writer) = state
+                            .runtimes
+                            .get(&session_id)
+                            .and_then(|runtime| runtime.input_writer.as_ref().cloned())
+                        else {
+                            continue;
+                        };
+                        spawn_raw_stream_reader(
+                            reader,
+                            input_writer,
+                            control_notifier.clone(),
+                            session_id,
+                        );
+                        if let Ok(mut guard) = stream.writer.lock() {
+                            *guard = Some(socket);
+                            if let Some(writer) = guard.as_mut() {
+                                if let Some(replay) = state.replay_buffers.get(&session_id) {
+                                    if !replay.is_empty() {
+                                        let _ = writer.write_all(replay);
+                                    }
                                 }
-                                let _ = writer.write_all(replay);
                             }
                         }
                     }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(error) => {
+                        return Err(format!(
+                            "daemon raw accept failed for session {:?}: {error}",
+                            session_id
+                        ))
+                    }
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(error) => return Err(format!("daemon raw accept failed: {error}")),
             }
         }
 
-        while let Ok(control) = control_rx.try_recv() {
+        for _ in 0..CONTROL_EVENTS_PER_TICK {
+            let Ok(control) = control_rx.try_recv() else {
+                break;
+            };
             match control {
                 ClientControl::Message(message) => {
                     if handle_client_message(
                         &mut state,
                         &mut client_writer,
-                        &raw_writer,
-                        &live_input_writer,
-                        &control_tx,
+                        &control_notifier,
                         message,
                     )? {
                         should_exit = true;
                     }
                 }
                 ClientControl::ControlDisconnected => {
-                    if beachhead_debug_enabled() {
-                        eprintln!("[beachhead-debug] control disconnected");
-                    }
                     client_writer = None;
                 }
-                ClientControl::StreamDisconnected => {
-                    if beachhead_debug_enabled() {
-                        eprintln!("[beachhead-debug] raw stream disconnected");
+                ClientControl::StreamDisconnected(session_id) => {
+                    if let Some(stream) = state.session_streams.get(&session_id) {
+                        if let Ok(mut guard) = stream.writer.lock() {
+                            *guard = None;
+                        }
                     }
-                    if let Ok(mut guard) = raw_writer.lock() {
-                        *guard = None;
+                }
+                ClientControl::FileActivity {
+                    repo_root,
+                    relative_path,
+                } => {
+                    if let Some(watch) = state.repo_watches.get(&repo_root) {
+                        let now = Instant::now();
+                        for session_id in &watch.sessions {
+                            if let Some(observation) = state.observations.get_mut(session_id) {
+                                apply_file_activity(observation, relative_path.clone(), now);
+                            }
+                        }
+                        state.snapshot_dirty = true;
                     }
                 }
                 ClientControl::RuntimeEvent(session_id, event) => {
@@ -490,22 +741,16 @@ fn run_local_daemon_inner() -> Result<(), String> {
             state.snapshot_dirty = false;
         }
 
-        thread::sleep(Duration::from_millis(5));
     }
 
     let _ = fs::remove_file(&control_socket_path);
-    let _ = fs::remove_file(&raw_socket_path);
     Ok(())
 }
 
 fn handle_client_message(
     state: &mut DaemonState,
     client_writer: &mut Option<UnixStream>,
-    raw_writer: &std::sync::Arc<std::sync::Mutex<Option<UnixStream>>>,
-    live_input_writer: &std::sync::Arc<
-        std::sync::Mutex<Option<std::sync::Arc<std::sync::Mutex<File>>>>,
-    >,
-    control_tx: &mpsc::Sender<ClientControl>,
+    control_tx: &ControlNotifier,
     message: ClientMessage,
 ) -> Result<bool, String> {
     match message {
@@ -518,37 +763,35 @@ fn handle_client_message(
         }
         ClientMessage::CreateOrResumeDefaultWorkspace => {
             state.ensure_default_workspace()?;
-            if let Some(session_id) = state.workspace.sessions().first().map(|session| session.id) {
-                ensure_runtime_forwarder(state, session_id, raw_writer.clone(), control_tx.clone());
-                if let Some(writer) = state
-                    .runtimes
-                    .get(&session_id)
-                    .and_then(|runtime| runtime.input_writer.as_ref().cloned())
-                {
-                    if let Ok(mut live_writer) = live_input_writer.lock() {
-                        *live_writer = Some(writer);
-                    }
-                }
+            if let Some(session) = state.workspace.sessions().first().cloned() {
+                state.attach_repo_watch(session.id, &session.launch, control_tx)?;
+                let session_id = session.id;
+                ensure_runtime_forwarder(state, session_id, control_tx.clone());
             }
             state.snapshot_dirty = true;
             Ok(false)
         }
-        ClientMessage::TraceInputSample {
-            trace_id,
-            sent_at_us,
-            len,
-        } => {
-            if beachhead_debug_enabled() {
-                eprintln!(
-                    "[beachhead-debug] trace sample id={} sent_at_us={} len={}",
-                    trace_id, sent_at_us, len
-                );
+        ClientMessage::AddTerminals { source_session } => {
+            let additions = additions_for_session_count(state.workspace.sessions().len());
+            if additions == 0 {
+                return Ok(false);
             }
-            state.pending_input_traces.push_back(PendingInputTrace {
-                trace_id,
-                sent_at_us,
-                len,
-            });
+            let cwd = state
+                .workspace
+                .session(source_session)
+                .and_then(|session| session.launch.cwd.clone());
+            for _ in 0..additions {
+                let number = state.workspace.sessions().len() + 1;
+                let mut launch =
+                    SessionLaunch::user_shell(format!("Shell {number}"), "Generic command session");
+                if let Some(cwd) = cwd.clone() {
+                    launch = launch.with_cwd(cwd);
+                }
+                let session_id = state.add_shell_session_without_watch(launch.clone())?;
+                state.attach_repo_watch(session_id, &launch, control_tx)?;
+                ensure_runtime_forwarder(state, session_id, control_tx.clone());
+            }
+            state.snapshot_dirty = true;
             Ok(false)
         }
         ClientMessage::ResizeTerminal {
@@ -607,13 +850,7 @@ fn handle_client_message(
 fn refresh_state(state: &mut DaemonState) {
     let sessions = state.workspace.sessions().to_vec();
     for session in &sessions {
-        {
-            let observation = state
-                .observations
-                .entry(session.id)
-                .or_insert_with(SessionObservation::new);
-            refresh_session_observation(observation, session, false);
-        }
+        maybe_queue_observation_refresh(state, session);
         let Some(observation) = state.observations.get(&session.id).cloned() else {
             continue;
         };
@@ -635,16 +872,47 @@ fn refresh_state(state: &mut DaemonState) {
     }
 }
 
+fn maybe_queue_observation_refresh(state: &mut DaemonState, session: &crate::model::SessionRecord) {
+    let Some(worker) = state.observation_worker.as_ref() else {
+        return;
+    };
+    let entry = state
+        .observation_cache
+        .entry(session.id)
+        .or_insert_with(ObservationCacheEntry::new);
+    if entry.in_flight {
+        return;
+    }
+    if entry
+        .last_attempt
+        .is_some_and(|attempt| attempt.elapsed() < REFRESH_INTERVAL)
+    {
+        return;
+    }
+    entry.in_flight = true;
+    entry.last_attempt = Some(Instant::now());
+    let _ = worker.requests.send(ObservationJob {
+        session_id: session.id,
+        session: session.clone(),
+    });
+}
+
 fn ensure_runtime_forwarder(
     state: &mut DaemonState,
     session_id: SessionId,
-    raw_writer: std::sync::Arc<std::sync::Mutex<Option<UnixStream>>>,
-    control_tx: mpsc::Sender<ClientControl>,
+    control_tx: ControlNotifier,
 ) {
     if !state.forwarded_sessions.insert(session_id) {
         return;
     }
     let Some(runtime) = state.runtimes.get_mut(&session_id) else {
+        return;
+    };
+    let Some(raw_writer) = state
+        .session_streams
+        .get(&session_id)
+        .map(|stream| stream.writer.clone())
+    else {
         return;
     };
     let (_dead_tx, dead_rx) = mpsc::channel();
@@ -782,6 +1050,40 @@ fn maybe_queue_nudge(
 fn drain_worker_results(state: &mut DaemonState) -> bool {
     let mut changed = false;
 
+    if let Some(worker) = state.observation_worker.as_ref() {
+        while let Ok(result) = worker.responses.try_recv() {
+            let entry = state
+                .observation_cache
+                .entry(result.session_id)
+                .or_insert_with(ObservationCacheEntry::new);
+            entry.in_flight = false;
+            let observation = state
+                .observations
+                .entry(result.session_id)
+                .or_insert_with(SessionObservation::new);
+            let before = (
+                observation.shell_child_command.clone(),
+                observation.dominant_process.clone(),
+                observation.process_tree_excerpt.clone(),
+                observation.recent_files.clone(),
+                observation.work_output_excerpt.clone(),
+                observation.active_command.clone(),
+            );
+            apply_observation_refresh(observation, &result.session, result.refresh);
+            let after = (
+                observation.shell_child_command.clone(),
+                observation.dominant_process.clone(),
+                observation.process_tree_excerpt.clone(),
+                observation.recent_files.clone(),
+                observation.work_output_excerpt.clone(),
+                observation.active_command.clone(),
+            );
+            if before != after {
+                changed = true;
+            }
+        }
+    }
+
     if let Some(worker) = state.summary_worker.as_ref() {
         while let Ok(result) = worker.responses.try_recv() {
             let entry = state
@@ -854,7 +1156,7 @@ fn drain_worker_results(state: &mut DaemonState) -> bool {
 
 fn handle_runtime_event(
     state: &mut DaemonState,
-    client_writer: &mut Option<UnixStream>,
+    _client_writer: &mut Option<UnixStream>,
     session_id: SessionId,
     event: RuntimeEvent,
 ) {
@@ -873,22 +1175,6 @@ fn handle_runtime_event(
                 .or_insert_with(SessionObservation::new);
             apply_stream_update(observation, update);
             state.snapshot_dirty = true;
-
-            if let Some(trace) = state.pending_input_traces.pop_front() {
-                if let Some(writer) = client_writer.as_mut() {
-                    let now = now_unix_us();
-                    let _ = write_json_line(
-                        writer,
-                        &ServerMessage::TraceInputAck {
-                            trace_id: trace.trace_id,
-                            sent_at_us: trace.sent_at_us,
-                            daemon_recv_at_us: now,
-                            daemon_write_done_at_us: now,
-                            len: trace.len,
-                        },
-                    );
-                }
-            }
         }
         RuntimeEvent::Exited(exit_code) => {
             state.workspace.mark_exited(session_id, exit_code);
@@ -1028,7 +1314,28 @@ fn spawn_nudge_worker() -> Option<NudgeWorker> {
     })
 }
 
-fn spawn_client_reader(stream: UnixStream, control_tx: mpsc::Sender<ClientControl>) {
+fn spawn_observation_worker() -> Option<ObservationWorker> {
+    let (request_tx, request_rx) = mpsc::channel::<ObservationJob>();
+    let (result_tx, result_rx) = mpsc::channel::<ObservationResult>();
+
+    thread::spawn(move || {
+        while let Ok(job) = request_rx.recv() {
+            let refresh = compute_observation_refresh(&job.session, false);
+            let _ = result_tx.send(ObservationResult {
+                session_id: job.session_id,
+                session: job.session,
+                refresh,
+            });
+        }
+    });
+
+    Some(ObservationWorker {
+        requests: request_tx,
+        responses: result_rx,
+    })
+}
+
+fn spawn_client_reader(stream: UnixStream, control_tx: ControlNotifier) {
     thread::spawn(move || {
         let mut reader = BufReader::new(stream);
         loop {
@@ -1068,7 +1375,7 @@ fn spawn_runtime_forwarder(
     session_id: SessionId,
     events: mpsc::Receiver<RuntimeEvent>,
     raw_writer: std::sync::Arc<std::sync::Mutex<Option<UnixStream>>>,
-    control_tx: mpsc::Sender<ClientControl>,
+    control_tx: ControlNotifier,
 ) {
     thread::spawn(move || {
         while let Ok(event) = events.recv() {
@@ -1081,10 +1388,7 @@ fn spawn_runtime_forwarder(
                     }
                 }
             }
-            if control_tx
-                .send(ClientControl::RuntimeEvent(session_id, event))
-                .is_err()
-            {
+            if control_tx.send(ClientControl::RuntimeEvent(session_id, event)).is_err() {
                 break;
             }
         }
@@ -1093,10 +1397,9 @@ fn spawn_runtime_forwarder(
 
 fn spawn_raw_stream_reader(
     stream: UnixStream,
-    live_input_writer: std::sync::Arc<
-        std::sync::Mutex<Option<std::sync::Arc<std::sync::Mutex<File>>>>,
-    >,
-    control_tx: mpsc::Sender<ClientControl>,
+    input_writer: std::sync::Arc<std::sync::Mutex<File>>,
+    control_tx: ControlNotifier,
+    session_id: SessionId,
 ) {
     thread::spawn(move || {
         let mut reader = stream;
@@ -1104,26 +1407,20 @@ fn spawn_raw_stream_reader(
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => {
-                    let _ = control_tx.send(ClientControl::StreamDisconnected);
+                    let _ = control_tx.send(ClientControl::StreamDisconnected(session_id));
                     break;
                 }
                 Ok(n) => {
-                    let maybe_writer = live_input_writer
-                        .lock()
-                        .ok()
-                        .and_then(|guard| guard.as_ref().cloned());
-                    if let Some(writer) = maybe_writer {
-                        let Ok(mut writer) = writer.lock() else {
-                            break;
-                        };
-                        if writer.write_all(&buf[..n]).is_err() {
-                            break;
-                        }
+                    let Ok(mut writer) = input_writer.lock() else {
+                        break;
+                    };
+                    if writer.write_all(&buf[..n]).is_err() {
+                        break;
                     }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(_) => {
-                    let _ = control_tx.send(ClientControl::StreamDisconnected);
+                    let _ = control_tx.send(ClientControl::StreamDisconnected(session_id));
                     break;
                 }
             }
@@ -1137,9 +1434,9 @@ fn write_json_line<W: Write, T: Serialize>(writer: &mut W, value: &T) -> std::io
     writer.flush()
 }
 
-fn connect_or_spawn_sockets() -> Result<(UnixStream, UnixStream), String> {
-    if let Ok(sockets) = connect_sockets() {
-        return Ok(sockets);
+fn connect_or_spawn_control_socket() -> Result<UnixStream, String> {
+    if let Ok(control) = connect_control_socket() {
+        return Ok(control);
     }
 
     let current_exe = std::env::current_exe()
@@ -1148,8 +1445,8 @@ fn connect_or_spawn_sockets() -> Result<(UnixStream, UnixStream), String> {
 
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        match connect_sockets() {
-            Ok(sockets) => return Ok(sockets),
+        match connect_control_socket() {
+            Ok(control) => return Ok(control),
             Err(error) if Instant::now() < deadline => {
                 let _ = error;
                 thread::sleep(Duration::from_millis(100));
@@ -1215,22 +1512,56 @@ fn inherit_beachhead_openai_env(command: &mut Command) {
     }
 }
 
-fn connect_sockets() -> Result<(UnixStream, UnixStream), String> {
-    let control = UnixStream::connect(control_socket_path()?)
-        .map_err(|error| format!("failed to connect control socket: {error}"))?;
-    let raw = UnixStream::connect(raw_socket_path()?)
-        .map_err(|error| format!("failed to connect raw socket: {error}"))?;
-    Ok((control, raw))
+fn connect_control_socket() -> Result<UnixStream, String> {
+    UnixStream::connect(control_socket_path()?)
+        .map_err(|error| format!("failed to connect control socket: {error}"))
 }
 
-fn control_socket_path() -> Result<PathBuf, String> {
+pub fn connect_session_stream_socket(socket_name: &str) -> Result<UnixStream, String> {
+    UnixStream::connect(session_raw_socket_path(socket_name)?)
+        .map_err(|error| format!("failed to connect session raw socket: {error}"))
+}
+
+fn additions_for_session_count(count: usize) -> usize {
+    match count {
+        1 => 1,
+        2 | 4 | 6 => 2,
+        8 | 12 => 4,
+        _ => 0,
+    }
+}
+
+fn create_session_stream_state(session_id: SessionId) -> Result<SessionStreamState, String> {
+    let socket_name = session_raw_socket_name(session_id);
+    let socket_path = session_raw_socket_path(&socket_name)?;
+    if socket_path.exists() {
+        let _ = fs::remove_file(&socket_path);
+    }
+    let listener = UnixListener::bind(&socket_path)
+        .map_err(|error| format!("failed to bind session raw socket {:?}: {error}", session_id))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|error| format!("failed to set session raw socket nonblocking {:?}: {error}", session_id))?;
+    Ok(SessionStreamState {
+        socket_name,
+        socket_path,
+        listener,
+        writer: std::sync::Arc::new(std::sync::Mutex::new(None)),
+    })
+}
+
+fn session_raw_socket_name(session_id: SessionId) -> String {
+    format!("session-{}-stream.sock", session_id.0)
+}
+
+pub fn control_socket_path() -> Result<PathBuf, String> {
     let runtime_dir = daemon_runtime_dir();
     Ok(runtime_dir.join("exaterm").join(CONTROL_SOCKET_NAME))
 }
 
-fn raw_socket_path() -> Result<PathBuf, String> {
+pub fn session_raw_socket_path(socket_name: &str) -> Result<PathBuf, String> {
     let runtime_dir = daemon_runtime_dir();
-    Ok(runtime_dir.join("exaterm").join(RAW_SOCKET_NAME))
+    Ok(runtime_dir.join("exaterm").join(socket_name))
 }
 
 fn daemon_runtime_dir() -> PathBuf {
@@ -1243,17 +1574,29 @@ fn daemon_runtime_dir() -> PathBuf {
         })
 }
 
-fn now_unix_us() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_micros() as u64
+fn refresh_timeout_ms(elapsed: Duration) -> i32 {
+    if elapsed >= REFRESH_INTERVAL {
+        return 0;
+    }
+    let remaining = REFRESH_INTERVAL - elapsed;
+    remaining
+        .as_millis()
+        .min(i32::MAX as u128)
+        .try_into()
+        .unwrap_or(i32::MAX)
 }
 
-fn beachhead_debug_enabled() -> bool {
-    env::var("EXATERM_BEACHHEAD_DEBUG")
-        .ok()
-        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes"))
+fn drain_wake_socket(reader: &mut UnixStream) {
+    let mut buf = [0u8; 256];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1295,9 +1638,11 @@ mod tests {
         let runtime_dir = unique_runtime_dir("socket");
         std::env::set_var("EXATERM_RUNTIME_DIR", &runtime_dir);
         let control_path = control_socket_path().expect("control socket path");
-        let raw_path = raw_socket_path().expect("raw socket path");
         assert_eq!(control_path, runtime_dir.join("exaterm").join(CONTROL_SOCKET_NAME));
-        assert_eq!(raw_path, runtime_dir.join("exaterm").join(RAW_SOCKET_NAME));
+        assert_eq!(
+            session_raw_socket_path("session-7-stream.sock").expect("session raw socket path"),
+            runtime_dir.join("exaterm").join("session-7-stream.sock")
+        );
         std::env::remove_var("EXATERM_RUNTIME_DIR");
     }
 
@@ -1311,7 +1656,6 @@ mod tests {
 
         let deadline = Instant::now() + Duration::from_secs(5);
         let control_path = control_socket_path().expect("control socket path");
-        let raw_path = raw_socket_path().expect("raw socket path");
         let mut stream = loop {
             match UnixStream::connect(&control_path) {
                 Ok(stream) => break stream,
@@ -1322,7 +1666,6 @@ mod tests {
                 Err(error) => panic!("failed to connect daemon: {error}"),
             }
         };
-        let _raw_stream = UnixStream::connect(&raw_path).expect("connect raw stream");
         let reader_stream = stream.try_clone().expect("clone stream");
         let mut reader = BufReader::new(reader_stream);
 
@@ -1362,7 +1705,6 @@ mod tests {
 
         let deadline = Instant::now() + Duration::from_secs(5);
         let control_path = control_socket_path().expect("control socket path");
-        let raw_path = raw_socket_path().expect("raw socket path");
         let mut first = loop {
             match UnixStream::connect(&control_path) {
                 Ok(stream) => break stream,
@@ -1373,7 +1715,6 @@ mod tests {
                 Err(error) => panic!("failed to connect daemon: {error}"),
             }
         };
-        let _first_raw = UnixStream::connect(&raw_path).expect("connect first raw");
         write_json_line(&mut first, &ClientMessage::AttachClient).expect("attach first");
 
         let second = UnixStream::connect(&control_path).expect("connect second");
@@ -1392,5 +1733,78 @@ mod tests {
 
         std::env::remove_var("EXATERM_RUNTIME_DIR");
         let _ = fs::remove_dir_all(runtime_dir);
+    }
+
+    #[test]
+    fn repo_watch_events_update_observation_recent_files() {
+        let root = unique_runtime_dir("repo-watch");
+        let repo_root = root.join("repo");
+        let nested = repo_root.join("src");
+        fs::create_dir_all(repo_root.join(".git")).expect("git dir");
+        fs::create_dir_all(&nested).expect("src dir");
+        let tracked = nested.join("lib.rs");
+
+        let (tx, rx) = mpsc::channel();
+        let (wake_reader, wake_writer) = UnixStream::pair().expect("wake pair");
+        let notifier = ControlNotifier {
+            tx,
+            wake: std::sync::Arc::new(std::sync::Mutex::new(wake_writer)),
+        };
+
+        let mut state = DaemonState::new();
+        let launch = SessionLaunch::user_shell("Shell", "watch test").with_cwd(nested.clone());
+        let session_id = state.workspace.add_session(launch.clone());
+        state
+            .observations
+            .insert(session_id, SessionObservation::new());
+        state
+            .observation_cache
+            .insert(session_id, ObservationCacheEntry::new());
+
+        state
+            .attach_repo_watch(session_id, &launch, &notifier)
+            .expect("attach repo watch");
+
+        fs::write(&tracked, "pub fn watched() {}\n").expect("write watched file");
+        let control = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("watcher should publish file activity");
+        drop(wake_reader);
+
+        match control {
+            ClientControl::FileActivity {
+                repo_root: event_root,
+                relative_path,
+            } => {
+                assert_eq!(event_root, repo_root);
+                assert_eq!(relative_path, "src/lib.rs");
+                let now = Instant::now();
+                let sessions = state
+                    .repo_watches
+                    .get(&event_root)
+                    .expect("watch should still exist")
+                    .sessions
+                    .clone();
+                for watched_session in sessions {
+                    let observation = state
+                        .observations
+                        .get_mut(&watched_session)
+                        .expect("observation exists");
+                    apply_file_activity(observation, relative_path.clone(), now);
+                }
+                assert_eq!(
+                    state
+                        .observations
+                        .get(&session_id)
+                        .expect("observation exists")
+                        .recent_files,
+                    vec!["src/lib.rs".to_string()]
+                );
+            }
+            _ => panic!("unexpected control message"),
+        }
+
+        state.shutdown_workspace();
+        let _ = fs::remove_dir_all(root);
     }
 }

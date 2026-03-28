@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/exaterm-types",
     "crates/exaterm-core",
     "crates/exaterm",
     "crates/exatermd",

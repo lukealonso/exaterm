@@ -133,6 +133,7 @@ name = "exaterm"
 version = "0.1.0"
 dependencies = [
  "exaterm-core",
+ "exaterm-types",
  "gio",
  "glib",
  "gtk4",
@@ -149,13 +150,22 @@ dependencies = [
 name = "exaterm-core"
 version = "0.1.0"
 dependencies = [
- "base64",
+ "exaterm-types",
  "libc",
  "portable-pty",
  "reqwest",
  "serde",
  "serde_json",
  "strip-ansi-escapes",
+]
+
+[[package]]
+name = "exaterm-types"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

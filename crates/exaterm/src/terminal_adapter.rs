@@ -1,4 +1,4 @@
-use exaterm_core::model::SessionLaunch;
+use exaterm_types::model::SessionLaunch;
 use exaterm_core::runtime::{RuntimeEvent, SessionRuntime, SpawnedRuntime, StreamRuntimeUpdate};
 use exaterm_core::terminal_stream::TerminalStreamProcessor;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
@@ -372,6 +372,9 @@ fn command_builder(launch: &SessionLaunch) -> CommandBuilder {
     for arg in argv_owned.iter().skip(1) {
         builder.arg(arg);
     }
+    builder.env("TERM", "xterm-256color");
+    builder.env("COLORTERM", "truecolor");
+    builder.env("TERM_PROGRAM", "exaterm");
     if let Some(cwd) = launch.cwd.as_ref() {
         builder.cwd(cwd);
     }

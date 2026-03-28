@@ -1,4 +1,4 @@
-use crate::model::{SessionEvent, SessionId, SessionRecord, SessionStatus};
+use exaterm_types::model::{SessionEvent, SessionId, SessionRecord, SessionStatus};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IntentSource {
@@ -50,12 +50,6 @@ pub struct ObservedActivity {
     pub idle_seconds: Option<u64>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CorrelationSummary {
-    pub narrative: String,
-    pub suspicious_mismatch: bool,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SignalTone {
     Calm,
@@ -90,6 +84,12 @@ pub struct IntentContext {
     pub dominant_process: Option<String>,
     pub work_output_excerpt: Option<String>,
     pub idle_seconds: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CorrelationSummary {
+    pub narrative: String,
+    pub suspicious_mismatch: bool,
 }
 
 pub trait IntentEngine {

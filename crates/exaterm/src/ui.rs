@@ -1,27 +1,30 @@
 use crate::beachhead::{BeachheadConnection, BeachheadTarget};
-use crate::display_runtime::{
+use crate::terminal_adapter::{
     attach_display_runtime, measured_terminal_size_hint, spawn_runtime, terminal_size_hint,
     write_display_output, ClientDisplayRuntime,
 };
-use exaterm_core::model::{
-    SessionId, SessionLaunch, WorkspaceState,
+use crate::supervision::{
+    build_battle_card, BattleCardStatus, BattleCardViewModel, DeterministicIntentEngine,
+    ObservedActivity, SignalTone,
 };
 use exaterm_core::observation::{
     apply_stream_update, build_naming_evidence, build_nudge_evidence, build_tactical_evidence,
     effective_display_name, refresh_observation as refresh_session_observation,
     scrollback_fragments, SessionObservation,
 };
-use exaterm_core::proto::{ClientMessage, ObservationSnapshot, ServerMessage, WorkspaceSnapshot};
 use exaterm_core::runtime::{RuntimeEvent, SessionRuntime};
 use exaterm_core::synthesis::{
     name_signature, nudge_signature, suggest_name_blocking, suggest_nudge_blocking,
-    summary_signature, summarize_blocking, MismatchLevel, MomentumState, NameSuggestion,
-    NamingEvidence, NudgeEvidence, NudgeSuggestion, OpenAiNamingConfig, OpenAiNudgeConfig,
-    OpenAiSynthesisConfig, OperatorAction, ProgressState, RiskPosture, TacticalEvidence,
-    TacticalState, TacticalSynthesis,
+    summary_signature, summarize_blocking, NamingEvidence, NudgeEvidence, OpenAiNamingConfig,
+    OpenAiNudgeConfig, OpenAiSynthesisConfig, TacticalEvidence,
 };
-use exaterm_core::supervision::{
-    build_battle_card, BattleCardStatus, DeterministicIntentEngine, ObservedActivity, SignalTone,
+use exaterm_types::model::{
+    SessionId, SessionLaunch, SessionRecord, WorkspaceState,
+};
+use exaterm_types::proto::{ClientMessage, ObservationSnapshot, ServerMessage, WorkspaceSnapshot};
+use exaterm_types::synthesis::{
+    MismatchLevel, MomentumState, NameSuggestion, NudgeSuggestion, OperatorAction, ProgressState,
+    RiskPosture, TacticalState, TacticalSynthesis,
 };
 use gtk::gdk;
 use gtk::prelude::*;
@@ -33,8 +36,8 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
+use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -49,7 +52,18 @@ const MIN_EMBEDDED_TERMINAL_COLS: i32 = 80;
 const MIN_EMBEDDED_TERMINAL_ROWS: i32 = 24;
 const EMBEDDED_TERMINAL_MIN_WIDTH: i32 = (ESTIMATED_TERMINAL_CELL_WIDTH * MIN_EMBEDDED_TERMINAL_COLS) + 72;
 const EMBEDDED_TERMINAL_MIN_HEIGHT: i32 = (ESTIMATED_TERMINAL_CELL_HEIGHT * MIN_EMBEDDED_TERMINAL_ROWS) + 96;
-static TRACE_INPUT_SEQ: AtomicU64 = AtomicU64::new(1);
+
+fn bundled_icon_search_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets/icons")
+}
+
+fn configure_app_icons() {
+    if let Some(display) = gdk::Display::default() {
+        let icon_theme = gtk::IconTheme::for_display(&display);
+        icon_theme.add_search_path(bundled_icon_search_path());
+    }
+    gtk::Window::set_default_icon_name(APP_ID);
+}
 
 #[derive(Clone)]
 struct SegmentedBarWidgets {
@@ -248,6 +262,7 @@ struct AppContext {
     focus: FocusWidgets,
     session_cards: RefCell<BTreeMap<SessionId, SessionCardWidgets>>,
     observations: RefCell<BTreeMap<SessionId, SessionObservation>>,
+    raw_stream_socket_names: RefCell<BTreeMap<SessionId, String>>,
     runtimes: RefCell<BTreeMap<SessionId, SessionRuntime>>,
     display_runtimes: RefCell<BTreeMap<SessionId, ClientDisplayRuntime>>,
     summary_worker: Option<SummaryWorker>,
@@ -306,21 +321,9 @@ fn daemon_backed(context: &AppContext) -> bool {
     context.beachhead.is_some()
 }
 
-fn transport_trace_enabled() -> bool {
-    std::env::var("EXATERM_BEACHHEAD_TRACE")
-        .ok()
-        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes"))
-}
-
-fn now_unix_us() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_micros() as u64
-}
-
 fn build_ui(app: &gtk::Application, mode: RunMode) {
     load_css();
+    configure_app_icons();
     let beachhead = if visual_gallery_enabled() {
         None
     } else {
@@ -506,6 +509,7 @@ fn build_ui(app: &gtk::Application, mode: RunMode) {
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("Exaterm")
+        .icon_name(APP_ID)
         .default_width(1480)
         .default_height(960)
         .content(&body)
@@ -533,6 +537,7 @@ fn build_ui(app: &gtk::Application, mode: RunMode) {
         },
         session_cards: RefCell::new(BTreeMap::new()),
         observations: RefCell::new(BTreeMap::new()),
+        raw_stream_socket_names: RefCell::new(BTreeMap::new()),
         runtimes: RefCell::new(BTreeMap::new()),
         display_runtimes: RefCell::new(BTreeMap::new()),
         summary_worker: if visual_gallery_enabled() {
@@ -626,9 +631,13 @@ fn build_ui(app: &gtk::Application, mode: RunMode) {
         });
     }
 
-    if context.beachhead.is_some() {
+    if let Some(beachhead) = context.beachhead.as_ref() {
+        let wake_fd = beachhead.event_wake_fd();
         let context = context.clone();
-        glib::timeout_add_local(std::time::Duration::from_millis(33), move || {
+        glib::source::unix_fd_add_local(wake_fd, glib::IOCondition::IN, move |_, _| {
+            if let Some(beachhead) = context.beachhead.as_ref() {
+                beachhead.drain_event_wake();
+            }
             drain_daemon_events(&context);
             glib::ControlFlow::Continue
         });
@@ -717,6 +726,7 @@ fn present_startup_error(app: &gtk::Application, error: &str) {
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("Exaterm")
+        .icon_name(APP_ID)
         .default_width(720)
         .default_height(220)
         .build();
@@ -726,7 +736,6 @@ fn present_startup_error(app: &gtk::Application, error: &str) {
         .title_widget(&title)
         .show_end_title_buttons(true)
         .build();
-    window.set_titlebar(Some(&header));
 
     let content = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -738,7 +747,13 @@ fn present_startup_error(app: &gtk::Application, error: &str) {
         .build();
     content.append(&message);
     content.append(&close_button);
-    window.set_content(Some(&content));
+
+    let body = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .build();
+    body.append(&header);
+    body.append(&content);
+    window.set_content(Some(&body));
 
     let window_for_button = window.clone();
     close_button.connect_clicked(move |_| {
@@ -899,7 +914,7 @@ fn transcript_script(lines: &[&str]) -> String {
 
 fn build_battle_card_widgets(
     context: &Rc<AppContext>,
-    session: &exaterm_core::model::SessionRecord,
+    session: &SessionRecord,
 ) -> SessionCardWidgets {
     let title = gtk::Label::builder()
         .label(&session.launch.name)
@@ -1197,7 +1212,7 @@ fn install_terminal_context_menu(
         .halign(gtk::Align::Fill)
         .build();
     split_terminal_button.add_css_class("flat");
-    split_terminal_button.set_sensitive(!daemon_backed(context));
+    split_terminal_button.set_sensitive(true);
     menu_box.append(&split_terminal_button);
 
     let popover = gtk::Popover::builder()
@@ -1245,9 +1260,7 @@ fn install_terminal_context_menu(
         right_click.connect_pressed(move |gesture, _, x, y| {
             let count = context.state.borrow().sessions().len();
             copy_button.set_sensitive(terminal.has_selection());
-            split_terminal_button.set_sensitive(
-                !daemon_backed(&context) && matches!(count, 1 | 2 | 4 | 6 | 8 | 12),
-            );
+            split_terminal_button.set_sensitive(matches!(count, 1 | 2 | 4 | 6 | 8 | 12));
             let rect = gdk::Rectangle::new(x as i32, y as i32, 1, 1);
             popover.set_pointing_to(Some(&rect));
             popover.popup();
@@ -1332,6 +1345,11 @@ fn set_auto_nudge_hover(context: &Rc<AppContext>, session_id: SessionId, hovered
 
 fn split_terminal_here(context: &Rc<AppContext>, source_session: SessionId) {
     if daemon_backed(context) {
+        if let Some(beachhead) = context.beachhead.as_ref() {
+            let _ = beachhead
+                .commands()
+                .send(ClientMessage::AddTerminals { source_session });
+        }
         return;
     }
     let current_count = context.state.borrow().sessions().len();
@@ -1527,23 +1545,6 @@ fn drain_daemon_events(context: &Rc<AppContext>) {
                 apply_workspace_snapshot(context, snapshot);
                 changed = true;
             }
-            ServerMessage::TraceInputAck {
-                trace_id,
-                sent_at_us,
-                daemon_recv_at_us,
-                daemon_write_done_at_us,
-                len,
-            } => {
-                if transport_trace_enabled() {
-                    let now = now_unix_us();
-                    eprintln!(
-                        "[beachhead-trace] input#{trace_id} len={len} client->daemon={}us daemon_write={}us ack_roundtrip={}us",
-                        daemon_recv_at_us.saturating_sub(sent_at_us),
-                        daemon_write_done_at_us.saturating_sub(daemon_recv_at_us),
-                        now.saturating_sub(sent_at_us),
-                    );
-                }
-            }
             ServerMessage::Error { message } => {
                 eprintln!("beachhead error: {message}");
             }
@@ -1590,6 +1591,7 @@ fn apply_workspace_snapshot(context: &Rc<AppContext>, snapshot: WorkspaceSnapsho
             context.cards.remove(&card.row);
         }
         context.observations.borrow_mut().remove(&session_id);
+        context.raw_stream_socket_names.borrow_mut().remove(&session_id);
         context.display_runtimes.borrow_mut().remove(&session_id);
         context.summary_cache.borrow_mut().remove(&session_id);
         context.naming_cache.borrow_mut().remove(&session_id);
@@ -1597,6 +1599,14 @@ fn apply_workspace_snapshot(context: &Rc<AppContext>, snapshot: WorkspaceSnapsho
     }
 
     for session in snapshot.sessions {
+        {
+            let mut names = context.raw_stream_socket_names.borrow_mut();
+            if let Some(socket_name) = session.raw_stream_socket_name.clone() {
+                names.insert(session.record.id, socket_name);
+            } else {
+                names.remove(&session.record.id);
+            }
+        }
         if !context.session_cards.borrow().contains_key(&session.record.id) {
             let card = build_battle_card_widgets(context, &session.record);
             context.cards.insert(&card.row, -1);
@@ -1604,8 +1614,22 @@ fn apply_workspace_snapshot(context: &Rc<AppContext>, snapshot: WorkspaceSnapsho
                 .session_cards
                 .borrow_mut()
                 .insert(session.record.id, card.clone());
-            if daemon_backed(context) {
-                attach_daemon_display_runtime(context, session.record.id, &card.terminal);
+        }
+        if daemon_backed(context) {
+            if let Some(socket_name) = context
+                .raw_stream_socket_names
+                .borrow()
+                .get(&session.record.id)
+                .cloned()
+            {
+                if let Some(card) = context.session_cards.borrow().get(&session.record.id) {
+                    attach_daemon_display_runtime(
+                        context,
+                        session.record.id,
+                        &card.terminal,
+                        &socket_name,
+                    );
+                }
             }
         }
         context
@@ -1659,7 +1683,6 @@ fn observation_from_snapshot(snapshot: &ObservationSnapshot) -> SessionObservati
         recent_files: snapshot.recent_files.clone(),
         recent_file_activity: BTreeMap::new(),
         work_output_excerpt: snapshot.work_output_excerpt.clone(),
-        file_fingerprints: BTreeMap::new(),
     }
 }
 
@@ -1667,6 +1690,7 @@ fn attach_daemon_display_runtime(
     context: &Rc<AppContext>,
     session_id: SessionId,
     terminal: &vte::Terminal,
+    socket_name: &str,
 ) {
     if context.display_runtimes.borrow().contains_key(&session_id) {
         return;
@@ -1676,45 +1700,44 @@ fn attach_daemon_display_runtime(
         return;
     };
     if let Some(beachhead) = context.beachhead.as_ref() {
-        let raw_writer = beachhead.raw_writer();
-        let raw_reader = beachhead.take_raw_reader();
+        let connector = beachhead.raw_session_connector();
         let output_writer = runtime.output_writer.clone();
-        let command_tx = beachhead.commands().clone();
+        let socket_name = socket_name.to_string();
         thread::spawn(move || {
-            while let Ok(bytes) = input_events.recv() {
-                if transport_trace_enabled() {
-                    let trace_id = TRACE_INPUT_SEQ.fetch_add(1, Ordering::Relaxed);
-                    let _ = command_tx.send(ClientMessage::TraceInputSample {
-                        trace_id,
-                        sent_at_us: now_unix_us(),
-                        len: bytes.len(),
-                    });
-                }
-                let Ok(mut writer) = raw_writer.lock() else {
-                    break;
-                };
-                if writer.write_all(&bytes).is_err() {
-                    break;
-                }
-            }
-        });
-        if let Some(mut reader) = raw_reader {
+            let Ok(raw_reader) = connector.connect_raw_session(session_id, &socket_name) else {
+                return;
+            };
+            let Ok(raw_writer_stream) = raw_reader.try_clone() else {
+                return;
+            };
+            let raw_writer = Arc::new(Mutex::new(raw_writer_stream));
+            let input_raw_writer = raw_writer.clone();
             thread::spawn(move || {
-                let mut buf = [0u8; 8192];
-                loop {
-                    match reader.read(&mut buf) {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            if write_display_output(&output_writer, &buf[..n]).is_err() {
-                                break;
-                            }
-                        }
-                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                        Err(_) => break,
+                while let Ok(bytes) = input_events.recv() {
+                    let Ok(mut writer) = input_raw_writer.lock() else {
+                        break;
+                    };
+                    if writer.write_all(&bytes).is_err() {
+                        break;
                     }
                 }
             });
-        }
+
+            let mut raw_reader = raw_reader;
+            let mut buf = [0u8; 8192];
+            loop {
+                match raw_reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if write_display_output(&output_writer, &buf[..n]).is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
+        });
     }
     context.display_runtimes.borrow_mut().insert(session_id, runtime);
 }
@@ -2009,7 +2032,7 @@ fn drain_summary_results(context: &Rc<AppContext>) {
     }
 }
 
-fn refresh_observation(context: &Rc<AppContext>, session: &exaterm_core::model::SessionRecord) {
+fn refresh_observation(context: &Rc<AppContext>, session: &SessionRecord) {
     if daemon_backed(context) {
         return;
     }
@@ -2023,7 +2046,7 @@ fn refresh_observation(context: &Rc<AppContext>, session: &exaterm_core::model::
 
 fn update_battle_card_widgets(
     context: &Rc<AppContext>,
-    session: &exaterm_core::model::SessionRecord,
+    session: &SessionRecord,
 ) {
     let Some(card) = context.session_cards.borrow().get(&session.id).cloned() else {
         return;
@@ -2141,7 +2164,7 @@ fn maybe_queue_summary(context: &Rc<AppContext>, session_id: SessionId, evidence
 
 fn maybe_queue_nudge(
     context: &Rc<AppContext>,
-    session: &exaterm_core::model::SessionRecord,
+    session: &SessionRecord,
     observation: &SessionObservation,
     summary: Option<&TacticalSynthesis>,
 ) {
@@ -2417,9 +2440,9 @@ fn gallery_mock_summary(context: &Rc<AppContext>, session_id: SessionId) -> Opti
 }
 
 fn apply_tactical_synthesis(
-    mut card_model: exaterm_core::supervision::BattleCardViewModel,
+    mut card_model: BattleCardViewModel,
     summary: TacticalSynthesis,
-) -> exaterm_core::supervision::BattleCardViewModel {
+) -> BattleCardViewModel {
     if let Some(tactical_state) = summary.tactical_state {
         card_model.status = match tactical_state {
             TacticalState::Idle => BattleCardStatus::Idle,
@@ -2453,15 +2476,15 @@ fn apply_tactical_synthesis(
         card_model.evidence_fragments = merged;
     }
     let caution_text = match summary.operator_action {
-        Some(exaterm_core::synthesis::OperatorAction::Intervene) => {
+        Some(OperatorAction::Intervene) => {
             summary.operator_action_brief.clone()
         }
-        Some(exaterm_core::synthesis::OperatorAction::Nudge) => summary.operator_action_brief.clone(),
+        Some(OperatorAction::Nudge) => summary.operator_action_brief.clone(),
         _ if matches!(
             summary.risk_posture,
-            Some(exaterm_core::synthesis::RiskPosture::Watch)
-                | Some(exaterm_core::synthesis::RiskPosture::High)
-                | Some(exaterm_core::synthesis::RiskPosture::Extreme)
+            Some(RiskPosture::Watch)
+                | Some(RiskPosture::High)
+                | Some(RiskPosture::Extreme)
         ) =>
         {
             summary.risk_brief.clone()
@@ -2474,21 +2497,21 @@ fn apply_tactical_synthesis(
         card_model.alignment.text = text;
         card_model.alignment.tone = if matches!(
             summary.risk_posture,
-            Some(exaterm_core::synthesis::RiskPosture::High)
-                | Some(exaterm_core::synthesis::RiskPosture::Extreme)
+            Some(RiskPosture::High)
+                | Some(RiskPosture::Extreme)
         ) || matches!(
             summary.operator_action,
-            Some(exaterm_core::synthesis::OperatorAction::Intervene)
+            Some(OperatorAction::Intervene)
         )
             || matches!(summary.mismatch_level, MismatchLevel::High)
         {
             SignalTone::Alert
         } else if matches!(
             summary.risk_posture,
-            Some(exaterm_core::synthesis::RiskPosture::Watch)
+            Some(RiskPosture::Watch)
         ) || matches!(
             summary.operator_action,
-            Some(exaterm_core::synthesis::OperatorAction::Nudge)
+            Some(OperatorAction::Nudge)
         )
             || matches!(summary.mismatch_level, MismatchLevel::Watch)
         {
@@ -2597,10 +2620,10 @@ fn risk_bar_value(summary: Option<&TacticalSynthesis>) -> Option<(usize, SignalT
         if let Some(risk) = summary.risk_posture {
             let hint = summary.risk_brief.clone();
             return Some(match risk {
-                exaterm_core::synthesis::RiskPosture::Low => (1, SignalTone::Calm, hint),
-                exaterm_core::synthesis::RiskPosture::Watch => (2, SignalTone::Watch, hint),
-                exaterm_core::synthesis::RiskPosture::High => (3, SignalTone::Alert, hint),
-                exaterm_core::synthesis::RiskPosture::Extreme => (4, SignalTone::Alert, hint),
+                RiskPosture::Low => (1, SignalTone::Calm, hint),
+                RiskPosture::Watch => (2, SignalTone::Watch, hint),
+                RiskPosture::High => (3, SignalTone::Alert, hint),
+                RiskPosture::Extreme => (4, SignalTone::Alert, hint),
             });
         }
     }

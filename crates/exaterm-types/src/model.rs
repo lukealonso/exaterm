@@ -1,9 +1,10 @@
 use std::path::PathBuf;
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct SessionId(pub u32);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SessionKind {
     WaitingShell,
     PlanningStream,
@@ -24,7 +25,7 @@ impl SessionKind {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionLaunch {
     pub name: String,
     pub subtitle: String,
@@ -221,17 +222,27 @@ fn preferred_user_shell_launch() -> (String, Vec<String>) {
         .and_then(|name| name.to_str())
         .unwrap_or("bash");
 
-    let args = match shell_name {
-        "bash" => vec!["-il".into()],
-        "zsh" => vec!["-il".into()],
-        "fish" => vec!["--interactive".into(), "--login".into()],
-        _ => vec!["-i".into()],
-    };
+    let mode = std::env::var("EXATERM_SHELL_MODE").unwrap_or_else(|_| "interactive".into());
+    let args = preferred_user_shell_args(shell_name, &mode);
 
     (shell, args)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+fn preferred_user_shell_args(shell_name: &str, mode: &str) -> Vec<String> {
+    match (shell_name, mode) {
+        // Remote SSH-backed sessions should feel like a real login shell.
+        ("bash", "login") => vec!["-il".into()],
+        ("zsh", "login") => vec!["-il".into()],
+        ("fish", "login") => vec!["--interactive".into(), "--login".into()],
+        // Local terminal-emulator behavior should stay rc-driven.
+        ("bash", _) => vec!["-i".into()],
+        ("zsh", _) => vec!["-i".into()],
+        ("fish", _) => vec!["--interactive".into()],
+        (_, _) => vec!["-i".into()],
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SessionStatus {
     Launching,
     Running,
@@ -275,7 +286,7 @@ impl SessionStatus {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProbeLens {
     Output,
     Events,
@@ -292,7 +303,7 @@ impl ProbeLens {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProbeMode {
     Peek,
     Pinned,
@@ -307,7 +318,7 @@ impl ProbeMode {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PresentationMode {
     Battlefield,
     Focused(SessionId),
@@ -319,20 +330,20 @@ impl Default for PresentationMode {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProbeState {
     pub session_id: SessionId,
     pub lens: ProbeLens,
     pub mode: ProbeMode,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionEvent {
     pub sequence: u64,
     pub summary: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionRecord {
     pub id: SessionId,
     pub launch: SessionLaunch,
@@ -372,6 +383,46 @@ impl WorkspaceState {
             ids.push(self.add_session(launch));
         }
         ids
+    }
+
+    pub fn replace_sessions(&mut self, sessions: Vec<SessionRecord>) {
+        let previous_selected = self.selected_session;
+        let previous_focus = self.focused_terminal;
+        let previous_probe = self.open_probe;
+        let previous_presentation = self.presentation_mode;
+
+        self.next_session_id = sessions
+            .iter()
+            .map(|session| session.id.0)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        self.next_event_sequence = sessions
+            .iter()
+            .flat_map(|session| session.events.iter().map(|event| event.sequence))
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        self.sessions = sessions;
+
+        self.selected_session = previous_selected
+            .filter(|session_id| self.sessions.iter().any(|session| session.id == *session_id))
+            .or_else(|| self.sessions.first().map(|session| session.id));
+        self.focused_terminal = previous_focus
+            .filter(|session_id| self.sessions.iter().any(|session| session.id == *session_id));
+        self.open_probe = previous_probe.filter(|probe| {
+            self.sessions
+                .iter()
+                .any(|session| session.id == probe.session_id)
+        });
+        self.presentation_mode = match previous_presentation {
+            PresentationMode::Focused(session_id)
+                if self.sessions.iter().any(|session| session.id == session_id) =>
+            {
+                PresentationMode::Focused(session_id)
+            }
+            _ => PresentationMode::Battlefield,
+        };
     }
 
     pub fn add_session(&mut self, launch: SessionLaunch) -> SessionId {
@@ -592,8 +643,8 @@ impl WorkspaceState {
 #[cfg(test)]
 mod tests {
     use super::{
-        PresentationMode, ProbeLens, ProbeMode, SessionKind, SessionLaunch, SessionStatus,
-        WorkspaceState,
+        preferred_user_shell_args, PresentationMode, ProbeLens, ProbeMode, SessionKind,
+        SessionLaunch, SessionStatus, WorkspaceState,
     };
 
     #[test]
@@ -684,6 +735,38 @@ mod tests {
         assert_eq!(shell.program, "/usr/bin/env");
         assert_eq!(shell.args, vec!["ssh".to_string(), "user@example.com".to_string()]);
         assert_eq!(shell.cwd, None);
+    }
+
+    #[test]
+    fn preferred_shell_args_favor_interactive_rc_loading() {
+        assert_eq!(
+            preferred_user_shell_args("bash", "interactive"),
+            vec!["-i".to_string()]
+        );
+        assert_eq!(
+            preferred_user_shell_args("zsh", "interactive"),
+            vec!["-i".to_string()]
+        );
+        assert_eq!(
+            preferred_user_shell_args("fish", "interactive"),
+            vec!["--interactive".to_string()]
+        );
+    }
+
+    #[test]
+    fn preferred_shell_args_support_login_mode() {
+        assert_eq!(
+            preferred_user_shell_args("bash", "login"),
+            vec!["-il".to_string()]
+        );
+        assert_eq!(
+            preferred_user_shell_args("zsh", "login"),
+            vec!["-il".to_string()]
+        );
+        assert_eq!(
+            preferred_user_shell_args("fish", "login"),
+            vec!["--interactive".to_string(), "--login".to_string()]
+        );
     }
 
     #[test]

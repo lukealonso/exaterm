@@ -1,6 +1,7 @@
 mod beachhead;
-mod display_runtime;
 mod remote;
+mod supervision;
+mod terminal_adapter;
 mod ui;
 
 fn main() -> glib::ExitCode {

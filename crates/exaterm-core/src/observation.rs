@@ -2,7 +2,6 @@ use crate::model::{SessionKind, SessionLaunch, SessionRecord};
 use crate::runtime::StreamRuntimeUpdate;
 use crate::synthesis::{NamingEvidence, NudgeEvidence, TacticalEvidence, TacticalSynthesis};
 use std::collections::BTreeMap;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -19,7 +18,6 @@ pub struct SessionObservation {
     pub recent_files: Vec<String>,
     pub recent_file_activity: BTreeMap<String, Instant>,
     pub work_output_excerpt: Option<String>,
-    pub file_fingerprints: BTreeMap<PathBuf, (u64, u64)>,
 }
 
 #[derive(Clone)]
@@ -42,7 +40,6 @@ impl SessionObservation {
             recent_files: Vec::new(),
             recent_file_activity: BTreeMap::new(),
             work_output_excerpt: None,
-            file_fingerprints: BTreeMap::new(),
         }
     }
 }
@@ -61,35 +58,54 @@ pub fn apply_stream_update(observation: &mut SessionObservation, update: StreamR
     }
 }
 
+pub fn apply_file_activity(
+    observation: &mut SessionObservation,
+    relative_path: String,
+    seen_at: Instant,
+) {
+    observation.recent_file_activity.insert(relative_path, seen_at);
+    observation
+        .recent_file_activity
+        .retain(|_, at| seen_at.duration_since(*at) <= Duration::from_secs(12));
+    let mut recent_files = observation
+        .recent_file_activity
+        .iter()
+        .map(|(path, at)| (path.clone(), *at))
+        .collect::<Vec<_>>();
+    recent_files.sort_by_key(|(_, at)| std::cmp::Reverse(*at));
+    observation.recent_files = recent_files
+        .into_iter()
+        .map(|(path, _)| path)
+        .take(2)
+        .collect();
+}
+
+pub fn clear_file_activity(observation: &mut SessionObservation) {
+    observation.recent_files.clear();
+    observation.recent_file_activity.clear();
+}
+
 pub fn refresh_observation(
     observation: &mut SessionObservation,
     session: &SessionRecord,
     remote_mode: bool,
 ) {
-    let shell_child_command = if remote_mode {
-        None
-    } else {
-        session.pid.and_then(read_shell_child_command)
-    };
-    let dominant_process = if remote_mode {
-        None
-    } else {
-        session.pid.and_then(read_dominant_process_hint)
-    };
-    let process_tree_excerpt = if remote_mode {
-        None
-    } else {
-        session.pid.and_then(read_process_tree_hint)
-    };
+    let refresh = compute_observation_refresh(session, remote_mode);
+    apply_observation_refresh(observation, session, refresh);
+}
 
-    let active_command = infer_active_command_from_lines(&observation.recent_lines)
-        .or(shell_child_command.clone())
-        .or(dominant_process.clone())
+pub fn apply_observation_refresh(
+    observation: &mut SessionObservation,
+    session: &SessionRecord,
+    refresh: ObservationRefreshResult,
+) {
+    observation.shell_child_command = refresh.shell_child_command;
+    observation.dominant_process = refresh.dominant_process;
+    observation.process_tree_excerpt = refresh.process_tree_excerpt;
+    observation.active_command = infer_active_command_from_lines(&observation.recent_lines)
+        .or(observation.shell_child_command.clone())
+        .or(observation.dominant_process.clone())
         .or_else(|| launch_command_hint(&session.launch));
-    observation.shell_child_command = shell_child_command;
-    observation.dominant_process = dominant_process;
-    observation.active_command = active_command;
-    observation.process_tree_excerpt = process_tree_excerpt;
     observation.work_output_excerpt = observation.painted_line.clone().or_else(|| {
         observation
             .recent_lines
@@ -98,34 +114,39 @@ pub fn refresh_observation(
             .find(|line| is_meaningful_output_line(line))
             .cloned()
     });
-    let changed_files = if remote_mode {
-        Vec::new()
+}
+
+#[derive(Clone)]
+pub struct ObservationRefreshResult {
+    pub shell_child_command: Option<String>,
+    pub dominant_process: Option<String>,
+    pub process_tree_excerpt: Option<String>,
+}
+
+pub fn compute_observation_refresh(session: &SessionRecord, remote_mode: bool) -> ObservationRefreshResult {
+    let shell_child_command = if remote_mode {
+        None
     } else {
-        session
-            .launch
-            .cwd
-            .as_deref()
-            .map(|cwd| scan_recent_files(cwd, &mut observation.file_fingerprints))
-            .unwrap_or_default()
+        session.pid.and_then(read_shell_child_command)
     };
-    let now = Instant::now();
-    for file in changed_files {
-        observation.recent_file_activity.insert(file, now);
+
+    let dominant_process = if remote_mode {
+        None
+    } else {
+        session.pid.and_then(read_dominant_process_hint)
+    };
+
+    let process_tree_excerpt = if remote_mode {
+        None
+    } else {
+        session.pid.and_then(read_process_tree_hint)
+    };
+
+    ObservationRefreshResult {
+        shell_child_command,
+        dominant_process,
+        process_tree_excerpt,
     }
-    observation
-        .recent_file_activity
-        .retain(|_, seen_at| seen_at.elapsed() <= Duration::from_secs(12));
-    let mut recent_files = observation
-        .recent_file_activity
-        .iter()
-        .map(|(path, seen_at)| (path.clone(), *seen_at))
-        .collect::<Vec<_>>();
-    recent_files.sort_by_key(|(_, seen_at)| std::cmp::Reverse(*seen_at));
-    observation.recent_files = recent_files
-        .into_iter()
-        .map(|(path, _)| path)
-        .take(2)
-        .collect();
 }
 
 pub fn effective_display_name(session: &SessionRecord) -> String {
@@ -316,61 +337,20 @@ fn append_terminal_activity(activity: &mut Vec<TerminalActivityEntry>, candidate
     }
 }
 
-fn scan_recent_files(root: &Path, fingerprints: &mut BTreeMap<PathBuf, (u64, u64)>) -> Vec<String> {
-    let mut current = BTreeMap::new();
-    let mut changed = Vec::new();
-    collect_file_changes(root, root, fingerprints, &mut current, &mut changed);
-    *fingerprints = current;
-    changed.truncate(2);
-    changed
-}
-
-fn collect_file_changes(
-    root: &Path,
-    path: &Path,
-    previous: &BTreeMap<PathBuf, (u64, u64)>,
-    current: &mut BTreeMap<PathBuf, (u64, u64)>,
-    changed: &mut Vec<String>,
-) {
-    let Ok(entries) = fs::read_dir(path) else {
-        return;
+pub fn find_git_worktree_root(start: &Path) -> Option<PathBuf> {
+    let mut current = if start.is_absolute() {
+        start.to_path_buf()
+    } else {
+        std::env::current_dir().ok()?.join(start)
     };
 
-    for entry in entries.flatten() {
-        let entry_path = entry.path();
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        if file_type.is_symlink() {
-            continue;
+    loop {
+        let dot_git = current.join(".git");
+        if dot_git.is_dir() || dot_git.is_file() {
+            return Some(current);
         }
-        let Ok(metadata) = entry.metadata() else {
-            continue;
-        };
-
-        if metadata.is_dir() {
-            collect_file_changes(root, &entry_path, previous, current, changed);
-            continue;
-        }
-
-        let modified = metadata
-            .modified()
-            .ok()
-            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|duration| duration.as_secs())
-            .unwrap_or_default();
-        let signature = (modified, metadata.len());
-        current.insert(entry_path.clone(), signature);
-
-        let changed_now = previous
-            .get(&entry_path)
-            .map(|existing| *existing != signature)
-            .unwrap_or(true);
-
-        if changed_now {
-            if let Ok(relative) = entry_path.strip_prefix(root) {
-                changed.push(relative.display().to_string());
-            }
+        if !current.pop() {
+            return None;
         }
     }
 }
@@ -457,12 +437,12 @@ fn is_meaningful_output_line(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        append_recent_lines, effective_display_name, naming_terminal_history, scan_recent_files,
+        append_recent_lines, apply_file_activity, compute_observation_refresh,
+        effective_display_name, find_git_worktree_root, naming_terminal_history,
         synthesis_terminal_activity, SessionObservation, TerminalActivityEntry,
     };
     use crate::model::{SessionId, SessionKind, SessionLaunch, SessionRecord, SessionStatus};
     use std::fs;
-    use std::os::unix::fs::symlink;
     use std::path::PathBuf;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -561,19 +541,80 @@ mod tests {
     }
 
     #[test]
-    fn scan_recent_files_skips_symlinked_directories() {
-        let root = tempdir_path("exaterm-observation-symlink");
-        let real_dir = root.join("real");
-        let linked_dir = root.join("linked");
-        fs::create_dir_all(&real_dir).expect("real dir");
-        fs::write(real_dir.join("file.txt"), "hello").expect("real file");
-        symlink(&real_dir, &linked_dir).expect("symlink dir");
+    fn finds_git_directory_root_from_nested_workspace_path() {
+        let root = tempdir_path("exaterm-observation-git-dir");
+        let nested = root.join("src/lib");
+        fs::create_dir_all(&nested).expect("nested dir");
+        fs::create_dir_all(root.join(".git")).expect("git dir");
 
-        let mut fingerprints = std::collections::BTreeMap::new();
-        let changed = scan_recent_files(&root, &mut fingerprints);
+        assert_eq!(find_git_worktree_root(&nested), Some(root));
+    }
 
-        assert_eq!(changed, vec!["real/file.txt".to_string()]);
-        assert_eq!(fingerprints.len(), 1);
+    #[test]
+    fn finds_git_file_root_for_worktree_style_layout() {
+        let root = tempdir_path("exaterm-observation-git-file");
+        let nested = root.join("pkg/app");
+        fs::create_dir_all(&nested).expect("nested dir");
+        fs::write(root.join(".git"), "gitdir: /tmp/fake-worktree").expect("git file");
+
+        assert_eq!(find_git_worktree_root(&nested), Some(root));
+    }
+
+    #[test]
+    fn returns_none_when_path_is_not_inside_git_worktree() {
+        let root = tempdir_path("exaterm-observation-no-git");
+        let nested = root.join("plain/home");
+        fs::create_dir_all(&nested).expect("nested dir");
+
+        assert_eq!(find_git_worktree_root(&nested), None);
+    }
+
+    #[test]
+    fn apply_file_activity_keeps_most_recent_two_paths() {
+        let mut observation = SessionObservation::new();
+        let base = Instant::now();
+        apply_file_activity(&mut observation, "one.rs".to_string(), base);
+        apply_file_activity(&mut observation, "two.rs".to_string(), base + Duration::from_secs(1));
+        apply_file_activity(&mut observation, "three.rs".to_string(), base + Duration::from_secs(2));
+
+        assert_eq!(
+            observation.recent_files,
+            vec!["three.rs".to_string(), "two.rs".to_string()]
+        );
+    }
+
+    #[test]
+    fn compute_observation_refresh_has_no_file_activity_payload() {
+        let session = session_record_with_cwd(SessionId(42), tempdir_path("exaterm-observation-refresh"));
+        let refresh = compute_observation_refresh(&session, false);
+        assert!(refresh.shell_child_command.is_none());
+        assert!(refresh.dominant_process.is_none());
+    }
+
+    #[test]
+    fn apply_file_activity_deduplicates_path_to_latest_timestamp() {
+        let mut observation = SessionObservation::new();
+        let base = Instant::now();
+        apply_file_activity(&mut observation, "same.rs".to_string(), base);
+        apply_file_activity(&mut observation, "same.rs".to_string(), base + Duration::from_secs(1));
+
+        assert_eq!(observation.recent_files, vec!["same.rs".to_string()]);
+        assert_eq!(observation.recent_file_activity.len(), 1);
+    }
+
+    #[test]
+    fn apply_file_activity_prunes_stale_entries() {
+        let mut observation = SessionObservation::new();
+        let base = Instant::now();
+        apply_file_activity(
+            &mut observation,
+            "old.rs".to_string(),
+            base - Duration::from_secs(13),
+        );
+        apply_file_activity(&mut observation, "fresh.rs".to_string(), base);
+
+        assert_eq!(observation.recent_files, vec!["fresh.rs".to_string()]);
+        assert!(!observation.recent_file_activity.contains_key("old.rs"));
     }
 
     fn tempdir_path(prefix: &str) -> PathBuf {
@@ -590,5 +631,17 @@ mod tests {
         let path = std::env::temp_dir().join(unique);
         fs::create_dir_all(&path).expect("temp dir");
         path
+    }
+
+    fn session_record_with_cwd(session_id: SessionId, cwd: PathBuf) -> SessionRecord {
+        let launch = SessionLaunch::user_shell("Shell", "test shell").with_cwd(cwd);
+        SessionRecord {
+            id: session_id,
+            launch,
+            display_name: None,
+            status: SessionStatus::Waiting,
+            pid: None,
+            events: Vec::new(),
+        }
     }
 }

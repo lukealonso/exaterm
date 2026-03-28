@@ -1,8 +1,10 @@
-use crate::remote::{connect_remote, RemoteBeachheadBridge};
-use exaterm_core::daemon::LocalBeachheadClient;
-use exaterm_core::proto::{ClientMessage, ServerMessage};
+use crate::remote::{connect_remote, RemoteBeachheadBridge, RemoteRawSessionConnector};
+use exaterm_core::daemon::{connect_session_stream_socket, LocalBeachheadClient};
+use exaterm_types::model::SessionId;
+use exaterm_types::proto::{ClientMessage, ServerMessage};
 use std::os::unix::net::UnixStream;
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::mpsc;
+use std::sync::Arc;
 
 #[derive(Clone, Debug)]
 pub enum BeachheadTarget {
@@ -10,8 +12,28 @@ pub enum BeachheadTarget {
     Ssh(String),
 }
 
+#[derive(Clone)]
+pub enum RawSessionConnector {
+    Local,
+    Remote(Arc<RemoteRawSessionConnector>),
+}
+
+impl RawSessionConnector {
+    pub fn connect_raw_session(
+        &self,
+        session_id: SessionId,
+        socket_name: &str,
+    ) -> Result<UnixStream, String> {
+        match self {
+            RawSessionConnector::Local => connect_session_stream_socket(socket_name),
+            RawSessionConnector::Remote(bridge) => bridge.connect_raw_session(session_id, socket_name),
+        }
+    }
+}
+
 pub struct BeachheadConnection {
     client: LocalBeachheadClient,
+    raw_sessions: RawSessionConnector,
     _remote_bridge: Option<RemoteBeachheadBridge>,
 }
 
@@ -20,12 +42,14 @@ impl BeachheadConnection {
         match target {
             BeachheadTarget::Local => Ok(Self {
                 client: LocalBeachheadClient::connect_or_spawn()?,
+                raw_sessions: RawSessionConnector::Local,
                 _remote_bridge: None,
             }),
             BeachheadTarget::Ssh(target) => {
                 let (client, bridge) = connect_remote(target)?;
                 Ok(Self {
                     client,
+                    raw_sessions: RawSessionConnector::Remote(bridge.raw_connector()),
                     _remote_bridge: Some(bridge),
                 })
             }
@@ -40,15 +64,15 @@ impl BeachheadConnection {
         &self.client.events
     }
 
-    pub fn raw_writer(&self) -> Arc<Mutex<UnixStream>> {
-        self.client.raw_writer.clone()
+    pub fn event_wake_fd(&self) -> i32 {
+        self.client.event_wake_fd()
     }
 
-    pub fn take_raw_reader(&self) -> Option<UnixStream> {
-        self.client
-            .raw_reader
-            .lock()
-            .ok()
-            .and_then(|mut guard| guard.take())
+    pub fn drain_event_wake(&self) {
+        self.client.drain_event_wake();
+    }
+
+    pub fn raw_session_connector(&self) -> RawSessionConnector {
+        self.raw_sessions.clone()
     }
 }

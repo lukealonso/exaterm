@@ -93,6 +93,9 @@ fn command_builder(launch: &SessionLaunch) -> CommandBuilder {
     for arg in argv_owned.iter().skip(1) {
         builder.arg(arg);
     }
+    builder.env("TERM", "xterm-256color");
+    builder.env("COLORTERM", "truecolor");
+    builder.env("TERM_PROGRAM", "exaterm");
     if let Some(cwd) = launch.cwd.as_ref() {
         builder.cwd(cwd);
     }
