@@ -1,9 +1,10 @@
 use crate::file_watch::{spawn_repo_watch, RepoWatchHandle};
-use crate::model::{SessionId, SessionLaunch, WorkspaceState};
+use crate::model::{user_shell_launch, SessionId, SessionLaunch, WorkspaceStore};
 use crate::observation::{
     apply_file_activity, apply_observation_refresh, apply_stream_update, build_naming_evidence,
     build_nudge_evidence, build_tactical_evidence, clear_file_activity,
-    compute_observation_refresh, find_git_worktree_root, SessionObservation,
+    compute_observation_refresh, find_git_worktree_root, is_bare_waiting_shell,
+    SessionObservation,
 };
 use crate::proto::{
     ClientMessage, ObservationSnapshot, ServerMessage, SessionSnapshot, WorkspaceSnapshot,
@@ -12,8 +13,8 @@ use crate::runtime::{spawn_headless_runtime, RuntimeEvent, SessionRuntime};
 use crate::synthesis::{
     name_signature, nudge_signature, suggest_name_blocking, suggest_nudge_blocking,
     summary_signature, summarize_blocking, NameSuggestion, NamingEvidence, NudgeEvidence,
-    NudgeSuggestion, OpenAiNamingConfig, OpenAiNudgeConfig, OpenAiSynthesisConfig,
-    TacticalState, TacticalSynthesis,
+    NudgeSuggestion, OpenAiNamingConfig, OpenAiNudgeConfig, OpenAiSynthesisConfig, TacticalState,
+    TacticalSynthesis,
 };
 use portable_pty::PtySize;
 use serde::Serialize;
@@ -208,7 +209,7 @@ impl NudgeCacheEntry {
 }
 
 struct DaemonState {
-    workspace: WorkspaceState,
+    workspace: WorkspaceStore,
     observations: BTreeMap<SessionId, SessionObservation>,
     observation_worker: Option<ObservationWorker>,
     observation_cache: BTreeMap<SessionId, ObservationCacheEntry>,
@@ -242,7 +243,7 @@ struct RepoWatchState {
 impl DaemonState {
     fn new() -> Self {
         Self {
-            workspace: WorkspaceState::new(),
+            workspace: WorkspaceStore::new(),
             observations: BTreeMap::new(),
             observation_worker: spawn_observation_worker(),
             observation_cache: BTreeMap::new(),
@@ -267,7 +268,7 @@ impl DaemonState {
             return Ok(());
         }
 
-        let launch = SessionLaunch::user_shell("Shell 1", "Generic command session");
+        let launch = user_shell_launch("Shell 1", "Generic command session");
         self.add_shell_session_without_watch(launch)?;
         self.snapshot_dirty = true;
         Ok(())
@@ -782,8 +783,7 @@ fn handle_client_message(
                 .and_then(|session| session.launch.cwd.clone());
             for _ in 0..additions {
                 let number = state.workspace.sessions().len() + 1;
-                let mut launch =
-                    SessionLaunch::user_shell(format!("Shell {number}"), "Generic command session");
+                let mut launch = user_shell_launch(format!("Shell {number}"), "Generic command session");
                 if let Some(cwd) = cwd.clone() {
                     launch = launch.with_cwd(cwd);
                 }
@@ -854,6 +854,10 @@ fn refresh_state(state: &mut DaemonState) {
         let Some(observation) = state.observations.get(&session.id).cloned() else {
             continue;
         };
+
+        if is_bare_waiting_shell(session, &observation) {
+            continue;
+        }
 
         let evidence = build_tactical_evidence(session, &observation);
         maybe_queue_summary(state, session.id, &evidence);
@@ -1060,7 +1064,7 @@ fn drain_worker_results(state: &mut DaemonState) -> bool {
             let observation = state
                 .observations
                 .entry(result.session_id)
-                .or_insert_with(SessionObservation::new);
+                .or_default();
             let before = (
                 observation.shell_child_command.clone(),
                 observation.dominant_process.clone(),
@@ -1092,13 +1096,10 @@ fn drain_worker_results(state: &mut DaemonState) -> bool {
                 .or_insert_with(SummaryCacheEntry::new);
             entry.in_flight = false;
             entry.requested_signature = None;
-            match result.summary {
-                Ok(summary) => {
-                    entry.completed_signature = Some(result.signature);
-                    entry.last_summary = Some(summary);
-                    changed = true;
-                }
-                Err(_) => {}
+            if let Ok(summary) = result.summary {
+                entry.completed_signature = Some(result.signature);
+                entry.last_summary = Some(summary);
+                changed = true;
             }
         }
     }
@@ -1172,7 +1173,7 @@ fn handle_runtime_event(
             let observation = state
                 .observations
                 .entry(session_id)
-                .or_insert_with(SessionObservation::new);
+                .or_default();
             apply_stream_update(observation, update);
             state.snapshot_dirty = true;
         }
@@ -1489,8 +1490,6 @@ fn exatermd_sibling_path(current_exe: &std::path::Path) -> Option<PathBuf> {
     let file_name = current_exe.file_name()?.to_str()?;
     let sibling = if let Some(stripped) = file_name.strip_suffix(".exe") {
         format!("{stripped}d.exe")
-    } else if file_name == "exaterm" {
-        "exatermd".to_string()
     } else {
         "exatermd".to_string()
     };
@@ -1752,7 +1751,7 @@ mod tests {
         };
 
         let mut state = DaemonState::new();
-        let launch = SessionLaunch::user_shell("Shell", "watch test").with_cwd(nested.clone());
+        let launch = user_shell_launch("Shell", "watch test").with_cwd(nested.clone());
         let session_id = state.workspace.add_session(launch.clone());
         state
             .observations

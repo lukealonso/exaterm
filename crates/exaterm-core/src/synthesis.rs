@@ -52,20 +52,6 @@ pub struct OpenAiSynthesisConfig {
     pub base_url: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct OpenAiUsage {
-    pub prompt_tokens: Option<u64>,
-    pub completion_tokens: Option<u64>,
-    pub total_tokens: Option<u64>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct SummaryResponse {
-    pub summary: TacticalSynthesis,
-    pub usage: Option<OpenAiUsage>,
-    pub response_text: String,
-}
-
 impl OpenAiSynthesisConfig {
     pub fn from_env() -> Option<Self> {
         load_dotenv_file();
@@ -298,13 +284,6 @@ pub fn summarize_blocking(
     config: &OpenAiSynthesisConfig,
     evidence: &TacticalEvidence,
 ) -> Result<TacticalSynthesis, String> {
-    summarize_blocking_with_usage(config, evidence).map(|response| response.summary)
-}
-
-pub fn summarize_blocking_with_usage(
-    config: &OpenAiSynthesisConfig,
-    evidence: &TacticalEvidence,
-) -> Result<SummaryResponse, String> {
     let request_body = json!({
         "model": config.model,
         "messages": [
@@ -353,15 +332,9 @@ pub fn summarize_blocking_with_usage(
 
     let text = extract_response_text(&payload)
         .ok_or_else(|| format!("response did not include parseable text: {payload}"))?;
-    let usage = extract_usage(&payload);
-    let summary = serde_json::from_str::<TacticalSynthesis>(&text)
+    serde_json::from_str::<TacticalSynthesis>(&text)
         .map(TacticalSynthesis::sanitize)
-        .map_err(|error| format!("failed to parse model synthesis: {error}; payload={text}"))?;
-    Ok(SummaryResponse {
-        summary,
-        usage,
-        response_text: text,
-    })
+        .map_err(|error| format!("failed to parse model synthesis: {error}; payload={text}"))
 }
 
 pub fn suggest_name_blocking(
@@ -609,23 +582,13 @@ pub fn extract_response_text(payload: &Value) -> Option<String> {
         })
 }
 
-pub fn extract_usage(payload: &Value) -> Option<OpenAiUsage> {
-    let usage = payload.get("usage")?;
-    Some(OpenAiUsage {
-        prompt_tokens: usage.get("prompt_tokens").and_then(Value::as_u64),
-        completion_tokens: usage.get("completion_tokens").and_then(Value::as_u64),
-        total_tokens: usage.get("total_tokens").and_then(Value::as_u64),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_response_text, extract_usage, name_signature, normalize_naming_model, normalize_summary_model,
-        openai_chat_completions_url,
-        nudge_signature, summary_signature, MomentumState, MismatchLevel, NameSuggestion,
-        NamingEvidence, NudgeEvidence, OperatorAction, RiskPosture, TacticalEvidence,
-        TacticalState, TacticalSynthesis,
+        extract_response_text, name_signature, normalize_naming_model, normalize_summary_model,
+        nudge_signature, openai_chat_completions_url, summary_signature, MomentumState,
+        MismatchLevel, NameSuggestion, NamingEvidence, NudgeEvidence, OperatorAction,
+        RiskPosture, TacticalEvidence, TacticalState, TacticalSynthesis,
     };
     use serde_json::json;
     use std::sync::Mutex;
@@ -688,22 +651,6 @@ mod tests {
 
         let text = extract_response_text(&payload).expect("text should be extracted");
         assert!(text.contains("\"headline\":\"cargo test parser\""));
-    }
-
-    #[test]
-    fn extracts_usage_from_chat_completions_payload() {
-        let payload = json!({
-            "usage": {
-                "prompt_tokens": 321,
-                "completion_tokens": 45,
-                "total_tokens": 366
-            }
-        });
-
-        let usage = extract_usage(&payload).expect("usage should be extracted");
-        assert_eq!(usage.prompt_tokens, Some(321));
-        assert_eq!(usage.completion_tokens, Some(45));
-        assert_eq!(usage.total_tokens, Some(366));
     }
 
     #[test]
