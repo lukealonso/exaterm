@@ -1,3 +1,6 @@
+use crate::presentation::{
+    AttentionPresentation, attention_presentation, combined_focus_summary_text, status_chip_label,
+};
 use crate::supervision::{
     BattleCardStatus, ObservedActivity, build_battle_card, derive_battle_card_status,
 };
@@ -13,18 +16,33 @@ pub struct CardRenderData {
     pub id: SessionId,
     pub title: String,
     pub status: BattleCardStatus,
+    pub status_label: String,
     pub recency: String,
     pub scrollback: Vec<String>,
     /// One-line synthesis headline (e.g. "Parser pass completed").
     pub headline: String,
+    pub combined_headline: String,
     /// Optional detailed synthesis text.
     pub detail: Option<String>,
     /// Optional alert text (operator action recommendation).
     pub alert: Option<String>,
+    pub attention: Option<AttentionPresentation>,
+    pub attention_reason: Option<String>,
     /// Whether auto-nudge is enabled for this session.
     pub auto_nudge_enabled: bool,
     /// Most recent auto-nudge text, if any.
     pub last_nudge: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct FocusRenderData {
+    pub id: SessionId,
+    pub title: String,
+    pub status: BattleCardStatus,
+    pub status_label: String,
+    pub combined_headline: String,
+    pub attention: Option<AttentionPresentation>,
+    pub attention_reason: Option<String>,
 }
 
 /// Extract headline, detail, and alert strings from an optional `TacticalSynthesis`.
@@ -169,15 +187,29 @@ impl AppState {
                     .to_string();
                 let (headline, detail, alert) =
                     extract_synthesis_fields(self.summaries.get(&session.id));
+                let status_label = status_chip_label(card.status, &card.recency_label);
+                let (attention, attention_reason) =
+                    attention_presentation(self.summaries.get(&session.id))
+                        .map(|(presentation, reason)| (Some(presentation), reason))
+                        .unwrap_or((None, None));
                 CardRenderData {
                     id: session.id,
                     title,
                     status: card.status,
+                    status_label,
                     recency: card.recency_label,
                     scrollback,
+                    combined_headline: combined_focus_summary_text(
+                        &headline,
+                        self.summaries
+                            .get(&session.id)
+                            .and_then(|summary| summary.attention_brief.as_deref()),
+                    ),
                     headline,
                     detail,
                     alert,
+                    attention,
+                    attention_reason,
                     auto_nudge_enabled: self
                         .auto_nudge_enabled
                         .get(&session.id)
@@ -187,6 +219,39 @@ impl AppState {
                 }
             })
             .collect()
+    }
+
+    pub fn focus_render_data(&self, session_id: SessionId) -> Option<FocusRenderData> {
+        let session = self.workspace.session(session_id)?;
+        let observed = self
+            .observations
+            .get(&session_id)
+            .cloned()
+            .unwrap_or_default();
+        let card = build_battle_card(session, &observed);
+        let title = session
+            .display_name
+            .as_deref()
+            .unwrap_or(&card.title)
+            .to_string();
+        let summary = self.summaries.get(&session_id);
+        let status_label = status_chip_label(card.status, &card.recency_label);
+        let (headline, _, _) = extract_synthesis_fields(summary);
+        let (attention, attention_reason) = attention_presentation(summary)
+            .map(|(presentation, reason)| (Some(presentation), reason))
+            .unwrap_or((None, None));
+        Some(FocusRenderData {
+            id: session_id,
+            title,
+            status: card.status,
+            status_label,
+            combined_headline: combined_focus_summary_text(
+                &headline,
+                summary.and_then(|s| s.attention_brief.as_deref()),
+            ),
+            attention,
+            attention_reason,
+        })
     }
 
     /// Select the next session in the list (wrapping around).

@@ -3,6 +3,7 @@ pub mod app_state;
 pub mod beachhead;
 pub mod css;
 pub mod layout;
+pub mod presentation;
 pub mod supervision;
 pub mod terminal;
 pub mod theme;

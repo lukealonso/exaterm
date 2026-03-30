@@ -97,10 +97,19 @@ pub fn visible_scrollback_line_capacity(height: i32) -> usize {
 pub const GAP: f64 = 12.0;
 pub const MARGIN: f64 = 12.0;
 pub const CARD_MIN_HEIGHT: f64 = 220.0;
+pub const FOCUS_RAIL_CARD_MIN_HEIGHT: f64 = 148.0;
 
 /// A positioned card rectangle (origin + size) in the view coordinate space.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CardRect {
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TerminalSlotRect {
     pub x: f64,
     pub y: f64,
     pub w: f64,
@@ -142,6 +151,50 @@ pub fn card_layout(card_count: usize, view_w: f64, view_h: f64) -> Vec<CardRect>
         });
     }
     rects
+}
+
+pub fn focus_card_layout(card_count: usize, view_w: f64, view_h: f64) -> Vec<CardRect> {
+    if card_count == 0 {
+        return Vec::new();
+    }
+
+    let card_h = (view_h - MARGIN * 2.0).max(FOCUS_RAIL_CARD_MIN_HEIGHT);
+    let card_w =
+        (view_w - MARGIN * 2.0 - GAP * (card_count.saturating_sub(1)) as f64) / card_count as f64;
+    let mut rects = Vec::with_capacity(card_count);
+    for i in 0..card_count {
+        let x = MARGIN + i as f64 * (card_w + GAP);
+        rects.push(CardRect {
+            x,
+            y: MARGIN,
+            w: card_w.max(0.0),
+            h: card_h,
+        });
+    }
+    rects
+}
+
+pub fn card_terminal_slot_rect(card: &CardRect) -> TerminalSlotRect {
+    const PADDING_X: f64 = 16.0;
+    const TOP_CHROME: f64 = 104.0;
+    const BOTTOM_CHROME: f64 = 18.0;
+    TerminalSlotRect {
+        x: card.x + PADDING_X,
+        y: card.y + TOP_CHROME,
+        w: (card.w - (PADDING_X * 2.0)).max(0.0),
+        h: (card.h - TOP_CHROME - BOTTOM_CHROME).max(0.0),
+    }
+}
+
+pub fn focus_terminal_slot_rect(view_w: i32, view_h: i32) -> TerminalSlotRect {
+    let padding = 18.0;
+    let header = 116.0;
+    TerminalSlotRect {
+        x: padding,
+        y: header,
+        w: (view_w as f64 - padding * 2.0).max(0.0),
+        h: (view_h as f64 - header - padding).max(0.0),
+    }
 }
 
 #[cfg(test)]
@@ -238,5 +291,31 @@ mod tests {
             assert!(r.y >= 0.0);
             assert!(r.x + r.w <= w + 0.01);
         }
+    }
+
+    #[test]
+    fn card_terminal_slot_stays_within_card_bounds() {
+        let card = CardRect {
+            x: 12.0,
+            y: 12.0,
+            w: 600.0,
+            h: 420.0,
+        };
+        let slot = card_terminal_slot_rect(&card);
+        assert!(slot.x >= card.x);
+        assert!(slot.y >= card.y);
+        assert!(slot.x + slot.w <= card.x + card.w + 0.01);
+        assert!(slot.y + slot.h <= card.y + card.h + 0.01);
+    }
+
+    #[test]
+    fn focus_card_layout_keeps_cards_in_single_top_row() {
+        let rects = focus_card_layout(4, 1200.0, 240.0);
+        assert_eq!(rects.len(), 4);
+        assert!(rects.iter().all(|rect| (rect.y - MARGIN).abs() < 0.01));
+        assert!(rects[1].x > rects[0].x);
+        let expected_w = (1200.0 - MARGIN * 2.0 - GAP * 3.0) / 4.0;
+        assert!((rects[0].w - expected_w).abs() < 0.01);
+        assert!((rects[3].x + rects[3].w - (1200.0 - MARGIN)).abs() < 0.01);
     }
 }

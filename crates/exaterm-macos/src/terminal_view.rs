@@ -4,7 +4,6 @@ use std::collections::BTreeMap;
 
 use crate::style::{self, NormalizedColor};
 
-use objc2::AnyThread;
 use objc2::rc::Retained;
 use objc2_app_kit::{NSColor, NSFont};
 
@@ -48,11 +47,13 @@ pub struct TerminalRenderState {
     pub recency_color: Retained<NSColor>,
     pub scrollback_color: Retained<NSColor>,
     pub selected_bg: Retained<NSColor>,
+    pub attention_chip_text: Retained<NSColor>,
 
     // Per-status cached colors: discriminant -> (chip_text_color, chip_bg_color).
     pub status_chip_colors: BTreeMap<u8, (Retained<NSColor>, Retained<NSColor>)>,
     // Per-status card background: discriminant -> card background top color.
     pub card_bg_colors: BTreeMap<u8, Retained<NSColor>>,
+    pub attention_bg_colors: BTreeMap<usize, Retained<NSColor>>,
 }
 
 /// Return a `u8` discriminant for a `BattleCardStatus` variant (used as map key).
@@ -117,10 +118,17 @@ impl TerminalRenderState {
             b: 255,
             a: 0.15,
         });
+        let attention_chip_text = style::color_to_nscolor(&Color {
+            r: 248,
+            g: 250,
+            b: 252,
+            a: 1.0,
+        });
 
         // Per-status cached colors.
         let mut status_chip_colors = BTreeMap::new();
         let mut card_bg_colors = BTreeMap::new();
+        let mut attention_bg_colors = BTreeMap::new();
         for &status in ALL_STATUSES {
             let disc = status_discriminant(status);
             let chip = theme::status_chip_theme(status);
@@ -134,6 +142,51 @@ impl TerminalRenderState {
             let layer = style::card_layer_style(status);
             card_bg_colors.insert(disc, ns_color(&layer.background_top));
         }
+        attention_bg_colors.insert(
+            1,
+            style::color_to_nscolor(&Color {
+                r: 17,
+                g: 88,
+                b: 51,
+                a: 0.24,
+            }),
+        );
+        attention_bg_colors.insert(
+            2,
+            style::color_to_nscolor(&Color {
+                r: 33,
+                g: 82,
+                b: 145,
+                a: 0.22,
+            }),
+        );
+        attention_bg_colors.insert(
+            3,
+            style::color_to_nscolor(&Color {
+                r: 120,
+                g: 87,
+                b: 10,
+                a: 0.22,
+            }),
+        );
+        attention_bg_colors.insert(
+            4,
+            style::color_to_nscolor(&Color {
+                r: 114,
+                g: 28,
+                b: 35,
+                a: 0.24,
+            }),
+        );
+        attention_bg_colors.insert(
+            5,
+            style::color_to_nscolor(&Color {
+                r: 130,
+                g: 35,
+                b: 35,
+                a: 0.32,
+            }),
+        );
 
         Self {
             title_font,
@@ -148,8 +201,10 @@ impl TerminalRenderState {
             recency_color,
             scrollback_color,
             selected_bg,
+            attention_chip_text,
             status_chip_colors,
             card_bg_colors,
+            attention_bg_colors,
         }
     }
 
@@ -166,5 +221,9 @@ impl TerminalRenderState {
     /// Look up the cached card background (top gradient) color for a given status.
     pub fn card_bg(&self, status: BattleCardStatus) -> &Retained<NSColor> {
         &self.card_bg_colors[&status_discriminant(status)]
+    }
+
+    pub fn attention_chip_bg(&self, fill: usize) -> &Retained<NSColor> {
+        &self.attention_bg_colors[&fill.clamp(1, 5)]
     }
 }
