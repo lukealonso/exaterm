@@ -1,0 +1,38 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+language: "en-US"
+enable_free_tier: true
+early_access: false
+tone_instructions: "Use a concise, technical, matter-of-fact tone. Prioritize concrete correctness risks over style commentary."
+
+reviews:
+  profile: "chill"
+  request_changes_workflow: false
+  review_status: true
+  high_level_summary: true
+  auto_review:
+    enabled: true
+    drafts: false
+  path_instructions:
+    - path: "crates/exaterm-core/**"
+      instructions: |
+        Prioritize behavioral regressions in daemon/runtime logic, observation quality, session state semantics, and terminal capture fidelity.
+        Be skeptical of changes that weaken evidence quality or blur the distinction between idle, stopped, blocked, and complete.
+        Treat style-only feedback as low priority unless it hides a correctness or maintainability problem.
+    - path: "crates/exaterm/**"
+      instructions: |
+        Focus on terminal fidelity, GTK/VTE behavior, supervisory clarity, and regressions that add unnecessary UI chrome or dashboard-like complexity.
+        Prefer findings about interaction, layout behavior, and evidence visibility over cosmetic feedback.
+    - path: "crates/exaterm-types/**"
+      instructions: |
+        Focus on contract correctness, protocol compatibility, and state-model clarity.
+        Flag enum or payload changes that could desynchronize the client and daemon.
+    - path: ".github/workflows/**"
+      instructions: |
+        Focus on CI correctness, native dependency coverage, and whether workflows are reliable and minimal for this Rust + GTK/libadwaita/VTE workspace.
+    - path: "docs/**"
+      instructions: |
+        Check for factual consistency with the repository's product philosophy and current behavior.
+        Avoid style-only wording suggestions unless the text is misleading, inaccurate, or omits an important constraint.
+
+chat:
+  auto_reply: true

@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  workspace:
+    name: Workspace
+    runs-on: ubuntu-latest
+    container:
+      image: fedora:43
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install native dependencies
+        run: |
+          dnf install -y --setopt=install_weak_deps=False \
+            curl \
+            gcc \
+            gcc-c++ \
+            git \
+            gtk4-devel \
+            libadwaita-devel \
+            pkgconf-pkg-config \
+            vte291-gtk4-devel
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Check workspace
+        run: cargo check --workspace
+
+      - name: Test workspace
+        run: cargo test --workspace
