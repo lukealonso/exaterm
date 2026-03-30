@@ -251,7 +251,9 @@ impl WorkspaceStore {
     }
 
     pub fn session(&self, session_id: SessionId) -> Option<&SessionRecord> {
-        self.sessions.iter().find(|session| session.id == session_id)
+        self.sessions
+            .iter()
+            .find(|session| session.id == session_id)
     }
 
     pub fn set_display_name(&mut self, session_id: SessionId, display_name: Option<String>) {
@@ -330,8 +332,9 @@ impl WorkspaceStore {
 #[cfg(test)]
 mod tests {
     use super::{
-        blocking_prompt_launch, launch_argv, preferred_user_shell_args, session_status_hint,
-        shell_launch, ssh_shell_launch, user_shell_launch, SessionStatus, WorkspaceStore,
+        SessionStatus, WorkspaceStore, blocking_prompt_launch, launch_argv,
+        preferred_user_shell_args, session_status_hint, shell_launch, ssh_shell_launch,
+        user_shell_launch,
     };
 
     #[test]
@@ -346,7 +349,10 @@ mod tests {
     fn shell_launch_uses_banner_script() {
         let launch = shell_launch("Smoke", "shell", "hello from smoke");
         let argv = launch_argv(&launch);
-        assert!(argv.last().is_some_and(|arg| arg.contains("hello from smoke")));
+        assert!(
+            argv.last()
+                .is_some_and(|arg| arg.contains("hello from smoke"))
+        );
     }
 
     #[test]
@@ -379,7 +385,10 @@ mod tests {
     #[test]
     fn ssh_launch_uses_ssh_target() {
         let launch = ssh_shell_launch("A", "shell", "user@example.com");
-        assert_eq!(launch.args, vec!["ssh".to_string(), "user@example.com".to_string()]);
+        assert_eq!(
+            launch.args,
+            vec!["ssh".to_string(), "user@example.com".to_string()]
+        );
     }
 
     #[test]

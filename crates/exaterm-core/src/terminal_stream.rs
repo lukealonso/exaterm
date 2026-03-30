@@ -111,8 +111,8 @@ pub fn decode_chunk(
                                         index += 1;
                                         break;
                                     }
-                                    0x1b
-                                        if index + 1 < chunk.len() && chunk[index + 1] == b'\\' =>
+                                    0x1b if index + 1 < chunk.len()
+                                        && chunk[index + 1] == b'\\' =>
                                     {
                                         index += 2;
                                         break;
@@ -232,9 +232,8 @@ impl PaintedLineTracker {
                                             index += 1;
                                             break;
                                         }
-                                        0x1b
-                                            if index + 1 < chunk.len()
-                                                && chunk[index + 1] == b'\\' =>
+                                        0x1b if index + 1 < chunk.len()
+                                            && chunk[index + 1] == b'\\' =>
                                         {
                                             index += 2;
                                             break;
@@ -381,8 +380,8 @@ fn looks_consolidated_worthy(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        csi_implies_rewrite, decode_chunk, merge_paint_lines, DecodedLine, PaintConsolidator,
-        PaintedLineTracker,
+        DecodedLine, PaintConsolidator, PaintedLineTracker, csi_implies_rewrite, decode_chunk,
+        merge_paint_lines,
     };
     use std::time::{Duration, Instant};
 

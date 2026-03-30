@@ -1,19 +1,19 @@
 use crate::beachhead::RawSessionConnector;
-use exaterm_types::model::SessionId;
 use exaterm_core::model::launch_argv;
 use exaterm_core::runtime::{RuntimeEvent, SessionRuntime, SpawnedRuntime, StreamRuntimeUpdate};
 use exaterm_core::terminal_stream::TerminalStreamProcessor;
+use exaterm_types::model::SessionId;
 use exaterm_types::model::SessionLaunch;
-use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
-use vte4::prelude::*;
 use vte4 as vte;
+use vte4::prelude::*;
 
 const DEFAULT_PROXY_ROWS: u16 = 40;
 const DEFAULT_PROXY_COLS: u16 = 160;
@@ -353,27 +353,44 @@ fn spawn_proxy_relay_thread(
             let mut fds = [
                 libc::pollfd {
                     fd: display_reader.as_raw_fd(),
-                    events: if to_agent.len() < RELAY_BUF_SIZE { libc::POLLIN } else { 0 },
+                    events: if to_agent.len() < RELAY_BUF_SIZE {
+                        libc::POLLIN
+                    } else {
+                        0
+                    },
                     revents: 0,
                 },
                 libc::pollfd {
                     fd: display_writer.as_raw_fd(),
-                    events: if to_display.is_empty() { 0 } else { libc::POLLOUT },
+                    events: if to_display.is_empty() {
+                        0
+                    } else {
+                        libc::POLLOUT
+                    },
                     revents: 0,
                 },
                 libc::pollfd {
                     fd: agent_reader.as_raw_fd(),
-                    events: if to_display.len() < RELAY_BUF_SIZE { libc::POLLIN } else { 0 },
+                    events: if to_display.len() < RELAY_BUF_SIZE {
+                        libc::POLLIN
+                    } else {
+                        0
+                    },
                     revents: 0,
                 },
                 libc::pollfd {
                     fd: agent_writer.as_raw_fd(),
-                    events: if to_agent.is_empty() { 0 } else { libc::POLLOUT },
+                    events: if to_agent.is_empty() {
+                        0
+                    } else {
+                        libc::POLLOUT
+                    },
                     revents: 0,
                 },
             ];
 
-            let poll_result = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
+            let poll_result =
+                unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
             if poll_result < 0 {
                 let error = std::io::Error::last_os_error();
                 if error.kind() == std::io::ErrorKind::Interrupted {
@@ -467,10 +484,7 @@ fn command_builder(launch: &SessionLaunch) -> CommandBuilder {
     builder
 }
 
-fn spawn_display_input_capture_thread(
-    display_reader: &mut File,
-    input_tx: mpsc::Sender<Vec<u8>>,
-) {
+fn spawn_display_input_capture_thread(display_reader: &mut File, input_tx: mpsc::Sender<Vec<u8>>) {
     let mut display_reader = display_reader
         .try_clone()
         .expect("display reader clone should succeed");

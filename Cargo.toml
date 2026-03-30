@@ -2,8 +2,9 @@
 members = [
     "crates/exaterm-types",
     "crates/exaterm-core",
-    "crates/exaterm",
+    "crates/exaterm-ui",
+    "crates/exaterm-gtk",
     "crates/exatermd",
 ]
-default-members = ["crates/exaterm"]
+default-members = ["crates/exaterm-gtk"]
 resolver = "2"

@@ -1,11 +1,11 @@
 use exaterm_core::daemon::LocalBeachheadClient;
 use exaterm_types::model::SessionId;
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -47,7 +47,9 @@ struct RemoteHostInfo {
     home: String,
 }
 
-pub fn connect_remote(target: &str) -> Result<(LocalBeachheadClient, RemoteBeachheadBridge), String> {
+pub fn connect_remote(
+    target: &str,
+) -> Result<(LocalBeachheadClient, RemoteBeachheadBridge), String> {
     let info = probe_remote_host(target)?;
     ensure_supported_remote(&info)?;
 
@@ -109,11 +111,20 @@ pub fn connect_remote(target: &str) -> Result<(LocalBeachheadClient, RemoteBeach
 
     let control = wait_for_forwarded_control_socket(
         &local_control,
-        cleanup.forward_process.as_mut().expect("forwarder should exist"),
+        cleanup
+            .forward_process
+            .as_mut()
+            .expect("forwarder should exist"),
     )?;
     let client = LocalBeachheadClient::connect_control(control)?;
-    let forward_process = cleanup.forward_process.take().expect("forwarder should exist");
-    let local_socket_dir = cleanup.local_socket_dir.take().expect("socket dir should exist");
+    let forward_process = cleanup
+        .forward_process
+        .take()
+        .expect("forwarder should exist");
+    let local_socket_dir = cleanup
+        .local_socket_dir
+        .take()
+        .expect("socket dir should exist");
     let raw_connector = Arc::new(RemoteRawSessionConnector {
         target: target.to_string(),
         local_socket_dir,
@@ -153,7 +164,10 @@ fn probe_remote_host(target: &str) -> Result<RemoteHostInfo, String> {
 
 fn ensure_supported_remote(info: &RemoteHostInfo) -> Result<(), String> {
     if info.os != "Linux" {
-        return Err(format!("remote beachhead currently supports Linux only, got {}", info.os));
+        return Err(format!(
+            "remote beachhead currently supports Linux only, got {}",
+            info.os
+        ));
     }
     let local_arch = std::env::consts::ARCH;
     if info.arch != local_arch {
@@ -193,7 +207,11 @@ fn ensure_remote_dirs(
     run_remote_shell(target, &script).map(|_| ())
 }
 
-fn upload_remote_exatermd(target: &str, local_exatermd: &Path, remote_bin: &str) -> Result<(), String> {
+fn upload_remote_exatermd(
+    target: &str,
+    local_exatermd: &Path,
+    remote_bin: &str,
+) -> Result<(), String> {
     let remote_tmp = format!("{remote_bin}.upload");
     let output = Command::new("scp")
         .arg(local_exatermd)
@@ -238,10 +256,7 @@ fn launch_remote_daemon(
         "EXATERM_NUDGE_MODEL",
     ] {
         if let Some(value) = std::env::var_os(key) {
-            exports.push(format!(
-                "export {key}={}",
-                shell_quote_os(&value)
-            ));
+            exports.push(format!("export {key}={}", shell_quote_os(&value)));
         }
     }
 
@@ -297,7 +312,9 @@ fn wait_for_forwarded_control_socket(
             Ok(control) => return Ok(control),
             Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
             _ => {
-                return Err("timed out waiting for forwarded remote beachhead control socket".into());
+                return Err(
+                    "timed out waiting for forwarded remote beachhead control socket".into(),
+                );
             }
         }
     }
@@ -335,7 +352,11 @@ impl RemoteRawSessionConnector {
             .arg("StreamLocalBindUnlink=yes")
             .arg("-N")
             .arg("-L")
-            .arg(format!("{}:{}", local_socket_path.display(), remote_socket_path))
+            .arg(format!(
+                "{}:{}",
+                local_socket_path.display(),
+                remote_socket_path
+            ))
             .arg(&self.target)
             .stdin(Stdio::null())
             .stdout(Stdio::null())

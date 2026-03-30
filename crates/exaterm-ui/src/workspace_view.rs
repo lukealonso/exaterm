@@ -47,10 +47,17 @@ impl WorkspaceViewState {
         self.sessions = sessions;
 
         self.selected_session = previous_selected
-            .filter(|session_id| self.sessions.iter().any(|session| session.id == *session_id))
+            .filter(|session_id| {
+                self.sessions
+                    .iter()
+                    .any(|session| session.id == *session_id)
+            })
             .or_else(|| self.sessions.first().map(|session| session.id));
-        self.focused_terminal = previous_focus
-            .filter(|session_id| self.sessions.iter().any(|session| session.id == *session_id));
+        self.focused_terminal = previous_focus.filter(|session_id| {
+            self.sessions
+                .iter()
+                .any(|session| session.id == *session_id)
+        });
         self.presentation_mode = match previous_presentation {
             PresentationMode::Focused(session_id)
                 if self.sessions.iter().any(|session| session.id == session_id) =>
@@ -95,7 +102,9 @@ impl WorkspaceViewState {
     }
 
     pub fn session(&self, session_id: SessionId) -> Option<&SessionRecord> {
-        self.sessions.iter().find(|session| session.id == session_id)
+        self.sessions
+            .iter()
+            .find(|session| session.id == session_id)
     }
 
     pub fn set_display_name(&mut self, session_id: SessionId, display_name: Option<String>) {

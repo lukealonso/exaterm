@@ -2,43 +2,43 @@ use crate::actions::{
     insert_terminal_number, send_runtime_input_line, set_auto_nudge_hover, toggle_auto_nudge,
 };
 use crate::beachhead::{BeachheadConnection, BeachheadTarget};
-use crate::layout::{
-    battlefield_can_embed_terminals, battlefield_columns,
-    visible_scrollback_line_capacity as layout_visible_scrollback_line_capacity,
-};
 use crate::style::{
     apply_battle_card_surface_style, apply_battle_status_style, configure_app_icons, load_css,
     status_chip_label,
 };
 use crate::terminal_adapter::{
-    attach_display_runtime, measured_terminal_size_hint, spawn_daemon_display_bridge,
-    spawn_runtime, terminal_size_hint, ClientDisplayRuntime,
+    ClientDisplayRuntime, attach_display_runtime, measured_terminal_size_hint,
+    spawn_daemon_display_bridge, spawn_runtime, terminal_size_hint,
 };
-use crate::supervision::{
-    build_battle_card, BattleCardStatus, BattleCardViewModel, ObservedActivity, SignalTone,
-};
-use crate::widgets::{build_segmented_bar, FocusWidgets, SegmentedBarWidgets, SessionCardWidgets};
-use crate::workspace_view::WorkspaceViewState;
+use crate::widgets::{FocusWidgets, SegmentedBarWidgets, SessionCardWidgets, build_segmented_bar};
 use exaterm_core::model::{
     blocking_prompt_launch, planning_stream_launch, running_stream_launch, ssh_shell_launch,
     user_shell_launch,
 };
 use exaterm_core::observation::{
-    apply_stream_update, build_naming_evidence, build_nudge_evidence, build_tactical_evidence,
-    is_bare_waiting_shell, refresh_observation as refresh_session_observation,
-    scrollback_fragments, SessionObservation,
+    SessionObservation, apply_stream_update, build_naming_evidence, build_nudge_evidence,
+    build_tactical_evidence, is_bare_waiting_shell,
+    refresh_observation as refresh_session_observation, scrollback_fragments,
 };
 use exaterm_core::runtime::{RuntimeEvent, SessionRuntime};
 use exaterm_core::synthesis::{
-    name_signature, nudge_signature, suggest_name_blocking, suggest_nudge_blocking,
-    summary_signature, summarize_blocking, NamingEvidence, NudgeEvidence, OpenAiNamingConfig,
-    OpenAiNudgeConfig, OpenAiSynthesisConfig, TacticalEvidence,
+    NamingEvidence, NudgeEvidence, OpenAiNamingConfig, OpenAiNudgeConfig, OpenAiSynthesisConfig,
+    TacticalEvidence, name_signature, nudge_signature, suggest_name_blocking,
+    suggest_nudge_blocking, summarize_blocking, summary_signature,
 };
 use exaterm_types::model::{SessionId, SessionLaunch, SessionRecord};
 use exaterm_types::proto::{ClientMessage, ObservationSnapshot, ServerMessage, WorkspaceSnapshot};
 use exaterm_types::synthesis::{
     AttentionLevel, NameSuggestion, NudgeSuggestion, TacticalState, TacticalSynthesis,
 };
+use exaterm_ui::layout::{
+    battlefield_can_embed_terminals, battlefield_columns,
+    visible_scrollback_line_capacity as layout_visible_scrollback_line_capacity,
+};
+use exaterm_ui::supervision::{
+    BattleCardStatus, BattleCardViewModel, ObservedActivity, SignalTone, build_battle_card,
+};
+use exaterm_ui::workspace_view::WorkspaceViewState;
 use gtk::gdk;
 use gtk::prelude::*;
 use libadwaita as adw;
@@ -51,7 +51,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 use vte::prelude::*;
@@ -329,7 +329,8 @@ pub(crate) fn daemon_backed(context: &AppContext) -> bool {
 fn build_ui(app: &gtk::Application, mode: RunMode) {
     load_css();
     configure_app_icons(APP_ID);
-    let missing_openai_key = !visual_gallery_enabled() && OpenAiSynthesisConfig::from_env().is_none();
+    let missing_openai_key =
+        !visual_gallery_enabled() && OpenAiSynthesisConfig::from_env().is_none();
     let beachhead = if visual_gallery_enabled() {
         None
     } else {
@@ -409,7 +410,10 @@ fn build_ui(app: &gtk::Application, mode: RunMode) {
         .wrap(true)
         .hexpand(true)
         .visible(false)
-        .css_classes(vec!["card-headline".to_string(), "focus-headline".to_string()])
+        .css_classes(vec![
+            "card-headline".to_string(),
+            "focus-headline".to_string(),
+        ])
         .build();
     focus_headline.set_lines(2);
     focus_headline.set_ellipsize(gtk::pango::EllipsizeMode::End);
@@ -613,11 +617,14 @@ fn build_ui(app: &gtk::Application, mode: RunMode) {
             let Some(selected_child) = selected.first() else {
                 return;
             };
-            let maybe_session = context
-                .session_cards
-                .borrow()
-                .iter()
-                .find_map(|(session_id, card)| (card.row == *selected_child).then_some(*session_id));
+            let maybe_session =
+                context
+                    .session_cards
+                    .borrow()
+                    .iter()
+                    .find_map(|(session_id, card)| {
+                        (card.row == *selected_child).then_some(*session_id)
+                    });
             if let Some(session_id) = maybe_session {
                 let focused = context.state.borrow().focused_session().is_some();
                 if focused {
@@ -853,7 +860,10 @@ fn append_session_card_with_spawn(
 
     let card = build_battle_card_widgets(context, &session);
     context.cards.insert(&card.row, -1);
-    context.session_cards.borrow_mut().insert(session_id, card.clone());
+    context
+        .session_cards
+        .borrow_mut()
+        .insert(session_id, card.clone());
     context
         .observations
         .borrow_mut()
@@ -989,7 +999,10 @@ fn build_battle_card_widgets(
     let nudge_state = gtk::Label::builder()
         .label("AUTONUDGE OFF")
         .xalign(0.5)
-        .css_classes(vec!["card-control-state".to_string(), "card-control-off".to_string()])
+        .css_classes(vec![
+            "card-control-state".to_string(),
+            "card-control-off".to_string(),
+        ])
         .build();
     nudge_state.set_single_line_mode(true);
     nudge_state.set_wrap(false);
@@ -1530,7 +1543,9 @@ fn split_terminal_here(context: &Rc<AppContext>, source_session: SessionId) {
     }
     refresh_runtime_and_cards(context);
     refresh_workspace(context);
-    if context.state.borrow().focused_session().is_none() && battlefield_embeds_terminal(context, new_session) {
+    if context.state.borrow().focused_session().is_none()
+        && battlefield_embeds_terminal(context, new_session)
+    {
         if let Some(card) = context.session_cards.borrow().get(&new_session) {
             card.terminal.grab_focus();
         }
@@ -1566,7 +1581,6 @@ fn spawn_session(
         .insert(session_id, runtime.session_runtime);
     refresh_runtime_and_cards(context);
 }
-
 
 fn spawn_summary_worker() -> Option<SummaryWorker> {
     let config = OpenAiSynthesisConfig::from_env()?;
@@ -1692,7 +1706,10 @@ fn apply_workspace_snapshot(context: &Rc<AppContext>, snapshot: WorkspaceSnapsho
             context.cards.remove(&card.row);
         }
         context.observations.borrow_mut().remove(&session_id);
-        context.raw_stream_socket_names.borrow_mut().remove(&session_id);
+        context
+            .raw_stream_socket_names
+            .borrow_mut()
+            .remove(&session_id);
         context.display_runtimes.borrow_mut().remove(&session_id);
         if let Ok(mut writers) = context.raw_input_writers.lock() {
             writers.remove(&session_id);
@@ -1711,7 +1728,11 @@ fn apply_workspace_snapshot(context: &Rc<AppContext>, snapshot: WorkspaceSnapsho
                 names.remove(&session.record.id);
             }
         }
-        if !context.session_cards.borrow().contains_key(&session.record.id) {
+        if !context
+            .session_cards
+            .borrow()
+            .contains_key(&session.record.id)
+        {
             let card = build_battle_card_widgets(context, &session.record);
             context.cards.insert(&card.row, -1);
             context
@@ -1736,10 +1757,10 @@ fn apply_workspace_snapshot(context: &Rc<AppContext>, snapshot: WorkspaceSnapsho
                 }
             }
         }
-        context
-            .observations
-            .borrow_mut()
-            .insert(session.record.id, observation_from_snapshot(&session.observation));
+        context.observations.borrow_mut().insert(
+            session.record.id,
+            observation_from_snapshot(&session.observation),
+        );
         {
             let mut summary_cache = context.summary_cache.borrow_mut();
             let cache = summary_cache
@@ -1814,7 +1835,10 @@ fn attach_daemon_display_runtime(
             input_events,
         );
     }
-    context.display_runtimes.borrow_mut().insert(session_id, runtime);
+    context
+        .display_runtimes
+        .borrow_mut()
+        .insert(session_id, runtime);
 }
 
 pub(crate) fn refresh_runtime_and_cards(context: &Rc<AppContext>) {
@@ -1916,13 +1940,14 @@ fn drain_runtime_events(context: &Rc<AppContext>) {
         match event {
             RuntimeEvent::Stream(update) => {
                 let mut observations = context.observations.borrow_mut();
-                let observation = observations
-                    .entry(session_id)
-                    .or_default();
+                let observation = observations.entry(session_id).or_default();
                 apply_stream_update(observation, update);
             }
             RuntimeEvent::Exited(exit_code) => {
-                context.state.borrow_mut().mark_exited(session_id, exit_code);
+                context
+                    .state
+                    .borrow_mut()
+                    .mark_exited(session_id, exit_code);
             }
         }
     }
@@ -2051,16 +2076,11 @@ fn refresh_observation(context: &Rc<AppContext>, session: &SessionRecord) {
     }
     let remote_mode = matches!(context.mode, RunMode::Ssh { .. });
     let mut observations = context.observations.borrow_mut();
-    let observation = observations
-        .entry(session.id)
-        .or_default();
+    let observation = observations.entry(session.id).or_default();
     refresh_session_observation(observation, session, remote_mode);
 }
 
-fn update_battle_card_widgets(
-    context: &Rc<AppContext>,
-    session: &SessionRecord,
-) {
+fn update_battle_card_widgets(context: &Rc<AppContext>, session: &SessionRecord) {
     let Some(card) = context.session_cards.borrow().get(&session.id).cloned() else {
         return;
     };
@@ -2104,8 +2124,10 @@ fn update_battle_card_widgets(
     card.title.set_label(&display_name);
     apply_battle_status_style(&card.status, visual_status);
     apply_battle_card_surface_style(&card.frame, visual_status);
-    card.status
-        .set_label(&status_chip_label(card_model.status, &card_model.recency_label));
+    card.status.set_label(&status_chip_label(
+        card_model.status,
+        &card_model.recency_label,
+    ));
     card.recency.set_label("");
     card.recency.set_visible(false);
     card.headline.set_label(&card_model.headline);
@@ -2114,7 +2136,11 @@ fn update_battle_card_widgets(
         observation,
         visible_scrollback_line_capacity(card.scrollback_band.height()),
     );
-    repopulate_scrollback_band(&card.scrollback_content, &card.scrollback_lines, &scrollback);
+    repopulate_scrollback_band(
+        &card.scrollback_content,
+        &card.scrollback_lines,
+        &scrollback,
+    );
     card.scrollback_band.set_visible(true);
 
     apply_metric_widgets(
@@ -2135,7 +2161,11 @@ fn update_battle_card_widgets(
     );
 }
 
-fn maybe_queue_summary(context: &Rc<AppContext>, session_id: SessionId, evidence: &TacticalEvidence) {
+fn maybe_queue_summary(
+    context: &Rc<AppContext>,
+    session_id: SessionId,
+    evidence: &TacticalEvidence,
+) {
     if daemon_backed(context) {
         return;
     }
@@ -2213,9 +2243,7 @@ fn maybe_queue_nudge(
     };
 
     let mut cache = context.nudge_cache.borrow_mut();
-    let entry = cache
-        .entry(session.id)
-        .or_insert_with(NudgeCacheEntry::new);
+    let entry = cache.entry(session.id).or_insert_with(NudgeCacheEntry::new);
     if !entry.enabled || entry.in_flight {
         return;
     }
@@ -2318,10 +2346,7 @@ fn current_summary(
     entry.last_summary.clone()
 }
 
-fn should_show_summary(
-    context: &Rc<AppContext>,
-    session_id: SessionId,
-) -> bool {
+fn should_show_summary(context: &Rc<AppContext>, session_id: SessionId) -> bool {
     let state = context.state.borrow();
     let observations = context.observations.borrow();
     let Some(session) = state.session(session_id) else {
@@ -2353,7 +2378,10 @@ fn card_chrome_mode_for_session(context: &Rc<AppContext>, session_id: SessionId)
     }
 }
 
-fn gallery_mock_summary(context: &Rc<AppContext>, session_id: SessionId) -> Option<TacticalSynthesis> {
+fn gallery_mock_summary(
+    context: &Rc<AppContext>,
+    session_id: SessionId,
+) -> Option<TacticalSynthesis> {
     let state = context.state.borrow();
     let session = state.session(session_id)?;
     let name = session.launch.name.as_str();
@@ -2362,14 +2390,18 @@ fn gallery_mock_summary(context: &Rc<AppContext>, session_id: SessionId) -> Opti
             tactical_state: TacticalState::Working,
             tactical_state_brief: Some("Narrowing the parser failure with focused reruns".into()),
             attention_level: AttentionLevel::Monitor,
-            attention_brief: Some("The loop is healthy and converging, but it is still worth watching.".into()),
+            attention_brief: Some(
+                "The loop is healthy and converging, but it is still worth watching.".into(),
+            ),
             headline: Some("Tight edit-test loop, still failing but converging.".into()),
         },
         "Agent B" => TacticalSynthesis {
             tactical_state: TacticalState::Stopped,
             tactical_state_brief: Some("Paused after a clean checkpoint".into()),
             attention_level: AttentionLevel::Guide,
-            attention_brief: Some("A simple continue prompt is probably enough to restart useful work.".into()),
+            attention_brief: Some(
+                "A simple continue prompt is probably enough to restart useful work.".into(),
+            ),
             headline: Some("Looks done with this pass and waiting for a nudge.".into()),
         },
         "Agent C" => TacticalSynthesis {
@@ -2383,22 +2415,34 @@ fn gallery_mock_summary(context: &Rc<AppContext>, session_id: SessionId) -> Opti
             tactical_state: TacticalState::Working,
             tactical_state_brief: Some("Retrying the same failing path".into()),
             attention_level: AttentionLevel::Guide,
-            attention_brief: Some("The loop is repeating without a decisive new clue and may need redirection soon.".into()),
+            attention_brief: Some(
+                "The loop is repeating without a decisive new clue and may need redirection soon."
+                    .into(),
+            ),
             headline: Some("Retry loop is repeating without a decisive new clue.".into()),
         },
         "Agent E" => TacticalSynthesis {
             tactical_state: TacticalState::Idle,
             tactical_state_brief: Some("Stable after validation with nothing to resume".into()),
             attention_level: AttentionLevel::Autopilot,
-            attention_brief: Some("This looks stably parked with no meaningful next step pending.".into()),
+            attention_brief: Some(
+                "This looks stably parked with no meaningful next step pending.".into(),
+            ),
             headline: Some("Looks stably parked after validation, not suspiciously idle.".into()),
         },
         "Agent F" => TacticalSynthesis {
             tactical_state: TacticalState::Working,
-            tactical_state_brief: Some("Escalating from disk pressure into risky cleanup ideas".into()),
+            tactical_state_brief: Some(
+                "Escalating from disk pressure into risky cleanup ideas".into(),
+            ),
             attention_level: AttentionLevel::Takeover,
-            attention_brief: Some("Risky cleanup ideas and frustration mean the operator should take direct control.".into()),
-            headline: Some("Blocked on disk space and drifting toward risky cleanup actions.".into()),
+            attention_brief: Some(
+                "Risky cleanup ideas and frustration mean the operator should take direct control."
+                    .into(),
+            ),
+            headline: Some(
+                "Blocked on disk space and drifting toward risky cleanup actions.".into(),
+            ),
         },
         _ => return None,
     })
@@ -2507,7 +2551,9 @@ fn apply_segmented_bar(
     }
 }
 
-fn attention_bar_value(summary: Option<&TacticalSynthesis>) -> Option<(usize, &'static str, Option<String>)> {
+fn attention_bar_value(
+    summary: Option<&TacticalSynthesis>,
+) -> Option<(usize, &'static str, Option<String>)> {
     if let Some(summary) = summary {
         let hint = summary.attention_brief.clone();
         return Some(match summary.attention_level {
@@ -2552,19 +2598,17 @@ fn apply_focus_attention_pill(pill: &gtk::Label, summary: Option<&TacticalSynthe
     pill.set_visible(true);
 }
 
-fn combined_focus_summary_text(
-    headline: &str,
-    attention_brief: Option<&str>,
-) -> String {
+fn combined_focus_summary_text(headline: &str, attention_brief: Option<&str>) -> String {
     let headline = headline.trim();
     let attention_brief = attention_brief.unwrap_or("").trim();
     match (headline.is_empty(), attention_brief.is_empty()) {
         (false, false) => {
-            let separator = if headline.ends_with('.') || headline.ends_with('!') || headline.ends_with('?') {
-                " "
-            } else {
-                ". "
-            };
+            let separator =
+                if headline.ends_with('.') || headline.ends_with('!') || headline.ends_with('?') {
+                    " "
+                } else {
+                    ". "
+                };
             format!("{headline}{separator}{attention_brief}")
         }
         (false, true) => headline.to_string(),
@@ -2652,9 +2696,9 @@ fn refresh_card_styles(context: &Rc<AppContext>) {
         card.row.remove_css_class("selected-card");
         card.row.remove_css_class("focused-card");
         card.frame.remove_css_class("single-card");
-    if focus_mode && selected == Some(*session_id) {
-        card.row.add_css_class("selected-card");
-    }
+        if focus_mode && selected == Some(*session_id) {
+            card.row.add_css_class("selected-card");
+        }
         if focused == Some(*session_id) {
             card.row.add_css_class("focused-card");
         }
@@ -2678,7 +2722,8 @@ fn refresh_card_styles(context: &Rc<AppContext>) {
             focus_mode,
             !card.alert.label().is_empty(),
         );
-        card.headline.set_visible(chrome_visibility.headline_visible);
+        card.headline
+            .set_visible(chrome_visibility.headline_visible);
         card.alert.set_wrap(focus_mode);
         card.alert.set_single_line_mode(!focus_mode);
         card.alert.set_ellipsize(if focus_mode {
@@ -2686,19 +2731,21 @@ fn refresh_card_styles(context: &Rc<AppContext>) {
         } else {
             gtk::pango::EllipsizeMode::End
         });
-    let summary = if focus_mode {
+        let summary = if focus_mode {
             let evidence = context
                 .observations
                 .borrow()
                 .get(session_id)
-                .map(|observation| build_tactical_evidence(
-                    context
-                        .state
-                        .borrow()
-                        .session(*session_id)
-                        .expect("session should exist"),
-                    observation,
-                ));
+                .map(|observation| {
+                    build_tactical_evidence(
+                        context
+                            .state
+                            .borrow()
+                            .session(*session_id)
+                            .expect("session should exist"),
+                        observation,
+                    )
+                });
             evidence.and_then(|evidence| current_summary(context, *session_id, &evidence))
         } else {
             None
@@ -2736,18 +2783,23 @@ fn refresh_card_styles(context: &Rc<AppContext>) {
         card.bars.set_homogeneous(shows_terminal);
         if shows_terminal {
             card.frame.remove_css_class("scrollback-card");
-            card.terminal_slot.remove_css_class("scrollback-terminal-hidden");
+            card.terminal_slot
+                .remove_css_class("scrollback-terminal-hidden");
         } else {
             card.frame.add_css_class("scrollback-card");
-            card.terminal_slot.add_css_class("scrollback-terminal-hidden");
+            card.terminal_slot
+                .add_css_class("scrollback-terminal-hidden");
         }
         if focus_mode {
             card.middle_stack.set_visible_child_name("scrollback");
             card.middle_stack.set_visible(false);
         } else {
             card.middle_stack.set_visible(true);
-            card.middle_stack
-                .set_visible_child_name(if shows_terminal { "terminal" } else { "scrollback" });
+            card.middle_stack.set_visible_child_name(if shows_terminal {
+                "terminal"
+            } else {
+                "scrollback"
+            });
             card.scrollback_band.set_visible(!shows_terminal);
             if single_card_mode {
                 card.frame.add_css_class("single-card");
@@ -2839,10 +2891,10 @@ fn refresh_focus_panel(context: &Rc<AppContext>) {
     context.focus.title.set_visible(chrome_mode.summarized());
     apply_battle_status_style(&context.focus.status, visual_status);
     apply_battle_card_surface_style(&context.focus.frame, visual_status);
-    context
-        .focus
-        .status
-        .set_label(&status_chip_label(card_model.status, &card_model.recency_label));
+    context.focus.status.set_label(&status_chip_label(
+        card_model.status,
+        &card_model.recency_label,
+    ));
     context.focus.status.set_visible(chrome_mode.summarized());
     context
         .focus
@@ -2854,29 +2906,27 @@ fn refresh_focus_panel(context: &Rc<AppContext>) {
         .headline
         .set_label(&combined_focus_summary_text(
             &card_model.headline,
-            live_summary.as_ref().and_then(|summary| summary.attention_brief.as_deref()),
+            live_summary
+                .as_ref()
+                .and_then(|summary| summary.attention_brief.as_deref()),
         ));
     context.focus.headline.set_lines(4);
-    context
-        .focus
-        .headline
-        .set_vexpand(true);
-    context
-        .focus
-        .headline
-        .set_valign(gtk::Align::Start);
+    context.focus.headline.set_vexpand(true);
+    context.focus.headline.set_valign(gtk::Align::Start);
     context
         .focus
         .headline
         .set_visible(chrome_mode.summarized() && !context.focus.headline.label().is_empty());
     apply_focus_attention_pill(&context.focus.attention_pill, live_summary.as_ref());
-    context
-        .focus
-        .summary_box
-        .set_visible(context.focus.headline.is_visible() || context.focus.attention_pill.is_visible());
+    context.focus.summary_box.set_visible(
+        context.focus.headline.is_visible() || context.focus.attention_pill.is_visible(),
+    );
     context.focus.alert.set_label("");
     context.focus.alert.set_visible(false);
-    context.focus.bars.set_orientation(gtk::Orientation::Horizontal);
+    context
+        .focus
+        .bars
+        .set_orientation(gtk::Orientation::Horizontal);
     context.focus.bars.set_visible(false);
     apply_segmented_bar(
         &context.focus.momentum_bar,
@@ -2927,10 +2977,14 @@ fn current_battlefield_columns(context: &Rc<AppContext>) -> usize {
 }
 
 fn focused_embedded_terminal_session(context: &Rc<AppContext>) -> Option<SessionId> {
-    context.session_cards.borrow().iter().find_map(|(session_id, card)| {
-        (battlefield_embeds_terminal(context, *session_id) && card.terminal.has_focus())
-            .then_some(*session_id)
-    })
+    context
+        .session_cards
+        .borrow()
+        .iter()
+        .find_map(|(session_id, card)| {
+            (battlefield_embeds_terminal(context, *session_id) && card.terminal.has_focus())
+                .then_some(*session_id)
+        })
 }
 
 pub(crate) fn update_nudge_widgets(context: &Rc<AppContext>, session_id: SessionId) {
@@ -2939,10 +2993,7 @@ pub(crate) fn update_nudge_widgets(context: &Rc<AppContext>, session_id: Session
     }
 }
 
-fn apply_summary_chrome_visibility(
-    card: &SessionCardWidgets,
-    visibility: CardChromeVisibility,
-) {
+fn apply_summary_chrome_visibility(card: &SessionCardWidgets, visibility: CardChromeVisibility) {
     card.title.set_visible(visibility.title_visible);
     card.headline.set_visible(visibility.headline_visible);
     card.status.set_visible(visibility.status_visible);
@@ -2991,12 +3042,8 @@ fn apply_nudge_pill(
         .get(&session_id)
         .and_then(|entry| entry.last_sent)
         .is_some_and(|sent| sent.elapsed() < Duration::from_secs(120));
-    let hovered = cache
-        .get(&session_id)
-        .is_some_and(|entry| entry.hovered);
-    let enabled = cache
-        .get(&session_id)
-        .is_some_and(|entry| entry.enabled);
+    let hovered = cache.get(&session_id).is_some_and(|entry| entry.hovered);
+    let enabled = cache.get(&session_id).is_some_and(|entry| entry.enabled);
     let (text, css) = if hovered {
         if enabled {
             ("DISARM AUTONUDGE", "card-control-cooldown")
@@ -3059,9 +3106,8 @@ fn reparent_widget_to_box<W: IsA<gtk::Widget>>(widget: &W, target: &gtk::Box) {
 #[cfg(test)]
 mod tests {
     use super::{
-        card_chrome_visibility, CardChromeMode, parse_run_mode, summary_refresh_interval, RunMode,
+        CardChromeMode, RunMode, card_chrome_visibility, parse_run_mode, summary_refresh_interval,
     };
-    use crate::layout::battlefield_can_embed_terminals;
     use std::time::Duration;
 
     #[test]
@@ -3083,27 +3129,38 @@ mod tests {
 
     #[test]
     fn summary_refresh_interval_starts_fast_and_backs_off() {
-        assert_eq!(summary_refresh_interval(Duration::from_secs(0)), Duration::from_secs(5));
-        assert_eq!(summary_refresh_interval(Duration::from_secs(59)), Duration::from_secs(5));
-        assert_eq!(summary_refresh_interval(Duration::from_secs(60)), Duration::from_secs(10));
-        assert_eq!(summary_refresh_interval(Duration::from_secs(179)), Duration::from_secs(10));
-        assert_eq!(summary_refresh_interval(Duration::from_secs(180)), Duration::from_secs(20));
-        assert_eq!(summary_refresh_interval(Duration::from_secs(299)), Duration::from_secs(20));
-        assert_eq!(summary_refresh_interval(Duration::from_secs(300)), Duration::from_secs(30));
-        assert_eq!(summary_refresh_interval(Duration::from_secs(900)), Duration::from_secs(30));
-    }
-
-    #[test]
-    fn four_terminal_interstitial_layout_collapses_to_scrollback() {
-        assert!(!battlefield_can_embed_terminals(4, 2, 1500, 1100));
-        assert!(!battlefield_can_embed_terminals(4, 2, 1600, 1150));
-    }
-
-    #[test]
-    fn embedded_terminals_require_genuinely_roomy_battlefield() {
-        assert!(battlefield_can_embed_terminals(1, 1, 1200, 900));
-        assert!(battlefield_can_embed_terminals(2, 2, 1480, 900));
-        assert!(battlefield_can_embed_terminals(4, 2, 1700, 1300));
+        assert_eq!(
+            summary_refresh_interval(Duration::from_secs(0)),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            summary_refresh_interval(Duration::from_secs(59)),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            summary_refresh_interval(Duration::from_secs(60)),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            summary_refresh_interval(Duration::from_secs(179)),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            summary_refresh_interval(Duration::from_secs(180)),
+            Duration::from_secs(20)
+        );
+        assert_eq!(
+            summary_refresh_interval(Duration::from_secs(299)),
+            Duration::from_secs(20)
+        );
+        assert_eq!(
+            summary_refresh_interval(Duration::from_secs(300)),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            summary_refresh_interval(Duration::from_secs(900)),
+            Duration::from_secs(30)
+        );
     }
 
     #[test]

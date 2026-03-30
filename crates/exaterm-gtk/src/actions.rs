@@ -1,4 +1,4 @@
-use crate::ui::{refresh_runtime_and_cards, update_nudge_widgets, AppContext, NudgeCacheEntry};
+use crate::ui::{AppContext, NudgeCacheEntry, refresh_runtime_and_cards, update_nudge_widgets};
 use exaterm_types::model::SessionId;
 use exaterm_types::proto::ClientMessage;
 use std::fs::File;
@@ -11,9 +11,7 @@ use std::sync::{Arc, Mutex};
 pub(crate) fn toggle_auto_nudge(context: &Rc<AppContext>, session_id: SessionId) {
     let enabled = {
         let mut cache = context.nudge_cache.borrow_mut();
-        let entry = cache
-            .entry(session_id)
-            .or_insert_with(NudgeCacheEntry::new);
+        let entry = cache.entry(session_id).or_insert_with(NudgeCacheEntry::new);
         entry.enabled = !entry.enabled;
         if !entry.enabled {
             entry.in_flight = false;
@@ -34,16 +32,10 @@ pub(crate) fn toggle_auto_nudge(context: &Rc<AppContext>, session_id: SessionId)
     }
 }
 
-pub(crate) fn set_auto_nudge_hover(
-    context: &Rc<AppContext>,
-    session_id: SessionId,
-    hovered: bool,
-) {
+pub(crate) fn set_auto_nudge_hover(context: &Rc<AppContext>, session_id: SessionId, hovered: bool) {
     let changed = {
         let mut cache = context.nudge_cache.borrow_mut();
-        let entry = cache
-            .entry(session_id)
-            .or_insert_with(NudgeCacheEntry::new);
+        let entry = cache.entry(session_id).or_insert_with(NudgeCacheEntry::new);
         let changed = entry.hovered != hovered;
         entry.hovered = hovered;
         changed
@@ -155,7 +147,7 @@ fn write_runtime_input(writer: &Arc<Mutex<File>>, bytes: &[u8]) -> std::io::Resu
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::WriteZero,
                     "short write to runtime input",
-                ))
+                ));
             }
             Ok(n) => offset += n,
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {

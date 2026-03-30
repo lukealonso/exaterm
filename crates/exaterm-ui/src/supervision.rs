@@ -63,7 +63,10 @@ pub struct BattleCardViewModel {
     pub alignment: AlignmentSignal,
 }
 
-pub fn build_battle_card(record: &SessionRecord, observed: &ObservedActivity) -> BattleCardViewModel {
+pub fn build_battle_card(
+    record: &SessionRecord,
+    observed: &ObservedActivity,
+) -> BattleCardViewModel {
     let status = derive_battle_card_status(record.status, observed);
 
     BattleCardViewModel {
@@ -85,7 +88,10 @@ pub fn derive_battle_card_status(
     session_status: SessionStatus,
     observed: &ObservedActivity,
 ) -> BattleCardStatus {
-    let shell_ready = matches!(observed.active_command.as_deref(), Some("Interactive shell ready"));
+    let shell_ready = matches!(
+        observed.active_command.as_deref(),
+        Some("Interactive shell ready")
+    );
     let has_runtime_evidence = observed
         .active_command
         .as_deref()
@@ -132,7 +138,7 @@ fn recency_label(idle_seconds: Option<u64>, status: BattleCardStatus) -> String 
 
 #[cfg(test)]
 mod tests {
-    use super::{build_battle_card, derive_battle_card_status, BattleCardStatus, ObservedActivity};
+    use super::{BattleCardStatus, ObservedActivity, build_battle_card, derive_battle_card_status};
     use exaterm_core::model::user_shell_launch;
     use exaterm_types::model::{SessionId, SessionRecord, SessionStatus};
 
@@ -176,7 +182,10 @@ mod tests {
 
     #[test]
     fn build_battle_card_leaves_text_fields_blank() {
-        let card = build_battle_card(&session(SessionStatus::Running), &ObservedActivity::default());
+        let card = build_battle_card(
+            &session(SessionStatus::Running),
+            &ObservedActivity::default(),
+        );
         assert!(card.headline.is_empty());
         assert!(card.evidence_fragments.is_empty());
         assert!(card.alignment.text.is_empty());

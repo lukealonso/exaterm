@@ -1,13 +1,10 @@
 mod actions;
 mod beachhead;
-mod layout;
 mod remote;
 mod style;
-mod supervision;
 mod terminal_adapter;
 mod ui;
 mod widgets;
-mod workspace_view;
 
 fn main() -> glib::ExitCode {
     if std::env::args().nth(1).as_deref() == Some("--beachhead-daemon") {

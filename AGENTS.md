@@ -170,7 +170,7 @@ Rules:
 
 ## Architecture Guidance
 
-The current intended architecture is a four-part workspace:
+The current intended architecture is a five-part workspace:
 - `crates/exaterm-types`
   - pure shared contract types
   - model records/enums
@@ -189,9 +189,13 @@ The current intended architecture is a four-part workspace:
   - no GTK
   - no VTE
   - owns the canonical session state and LLM work
-- `crates/exaterm`
-  - GTK/VTE client
-  - layout, interaction, local display PTYs, and rendering
+- `crates/exaterm-ui`
+  - shared UI model
+  - layout logic, supervision view state, and workspace view primitives
+  - no GTK, no VTE — pure logic shared between clients
+- `crates/exaterm-gtk`
+  - GTK/VTE client (Linux)
+  - interaction, local display PTYs, and rendering
   - frontend-only supervision and presentation logic
 
 ### Beachhead Rules
@@ -227,8 +231,8 @@ For remote transport, the intended direction is:
 ### Code Placement Rules
 
 In particular:
-- do not let `crates/exaterm/src/ui.rs` absorb more headless runtime logic
-- do not let GTK or VTE leak back into `exaterm-core`
+- do not let `crates/exaterm-gtk/src/ui.rs` absorb more headless runtime logic
+- do not let GTK or VTE leak back into `exaterm-core` or `exaterm-ui`
 - do not let behavior-heavy helpers or execution policy creep into `exaterm-types`
 - keep frontend prose/presentation shaping out of the daemon and shared contract crates
 - prefer testable helpers in core modules instead of burying logic in GTK callbacks

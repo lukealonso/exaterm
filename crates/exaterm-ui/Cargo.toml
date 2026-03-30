@@ -1,0 +1,10 @@
+[package]
+name = "exaterm-ui"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+exaterm-types = { path = "../exaterm-types" }
+
+[dev-dependencies]
+exaterm-core = { path = "../exaterm-core" }

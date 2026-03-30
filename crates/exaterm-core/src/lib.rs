@@ -2,7 +2,7 @@ pub mod daemon;
 pub mod file_watch;
 pub mod model;
 pub mod observation;
-pub mod procfs;
+pub mod process;
 pub mod proto;
 pub mod runtime;
 pub mod synthesis;

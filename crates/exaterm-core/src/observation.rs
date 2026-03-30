@@ -69,7 +69,9 @@ pub fn apply_file_activity(
     relative_path: String,
     seen_at: Instant,
 ) {
-    observation.recent_file_activity.insert(relative_path, seen_at);
+    observation
+        .recent_file_activity
+        .insert(relative_path, seen_at);
     observation
         .recent_file_activity
         .retain(|_, at| seen_at.duration_since(*at) <= Duration::from_secs(12));
@@ -91,12 +93,8 @@ pub fn clear_file_activity(observation: &mut SessionObservation) {
     observation.recent_file_activity.clear();
 }
 
-pub fn is_bare_waiting_shell(
-    session: &SessionRecord,
-    observation: &SessionObservation,
-) -> bool {
-    session.launch.kind == SessionKind::WaitingShell
-        && observation.shell_child_command.is_none()
+pub fn is_bare_waiting_shell(session: &SessionRecord, observation: &SessionObservation) -> bool {
+    session.launch.kind == SessionKind::WaitingShell && observation.shell_child_command.is_none()
 }
 
 pub fn refresh_observation(
@@ -137,23 +135,17 @@ pub struct ObservationRefreshResult {
     pub process_tree_excerpt: Option<String>,
 }
 
-pub fn compute_observation_refresh(session: &SessionRecord, remote_mode: bool) -> ObservationRefreshResult {
-    let shell_child_command = if remote_mode {
-        None
+pub fn compute_observation_refresh(
+    session: &SessionRecord,
+    remote_mode: bool,
+) -> ObservationRefreshResult {
+    let (dominant_process, shell_child_command, process_tree_excerpt) = if remote_mode {
+        (None, None, None)
     } else {
-        session.pid.and_then(read_shell_child_command)
-    };
-
-    let dominant_process = if remote_mode {
-        None
-    } else {
-        session.pid.and_then(read_dominant_process_hint)
-    };
-
-    let process_tree_excerpt = if remote_mode {
-        None
-    } else {
-        session.pid.and_then(read_process_tree_hint)
+        session
+            .pid
+            .map(read_process_hints)
+            .unwrap_or((None, None, None))
     };
 
     ObservationRefreshResult {
@@ -356,7 +348,11 @@ pub fn find_git_worktree_root(start: &Path) -> Option<PathBuf> {
 }
 
 fn format_terminal_activity_entry(entry: &TerminalActivityEntry, now: Instant) -> String {
-    format!("[{}] {}", relative_age_label(now.duration_since(entry.at)), entry.text)
+    format!(
+        "[{}] {}",
+        relative_age_label(now.duration_since(entry.at)),
+        entry.text
+    )
 }
 
 fn relative_age_label(duration: Duration) -> String {
@@ -401,32 +397,28 @@ fn infer_active_command_from_lines(lines: &[String]) -> Option<String> {
     })
 }
 
-fn read_dominant_process_hint(pid: u32) -> Option<String> {
-    crate::procfs::dominant_child_command(pid)
-        .ok()
-        .flatten()
-        .map(|command| command.replace("  ", " ").trim().to_string())
-}
-
-fn read_shell_child_command(pid: u32) -> Option<String> {
-    crate::procfs::direct_child_command(pid)
-        .ok()
-        .flatten()
-        .map(|command| command.replace("  ", " ").trim().to_string())
-}
-
-fn read_process_tree_hint(pid: u32) -> Option<String> {
-    crate::procfs::format_process_tree(pid)
-        .ok()
-        .map(|tree| {
-            tree.lines()
-                .take(4)
-                .map(str::trim)
-                .filter(|line| !line.is_empty())
-                .collect::<Vec<_>>()
-                .join(" | ")
-        })
-        .filter(|tree| !tree.is_empty())
+fn read_process_hints(pid: u32) -> (Option<String>, Option<String>, Option<String>) {
+    let reader = crate::process::default_reader();
+    let entries = match reader.read_process_table() {
+        Ok(e) => e,
+        Err(_) => return (None, None, None),
+    };
+    let dominant = crate::process::dominant_child_command_from_entries(&entries, pid)
+        .map(|c| c.replace("  ", " ").trim().to_string());
+    let direct = crate::process::direct_child_command_from_entries(&entries, pid)
+        .map(|c| c.replace("  ", " ").trim().to_string());
+    let tree = crate::process::format_process_tree_from_entries(&entries, pid);
+    let tree = {
+        let t = tree
+            .lines()
+            .take(4)
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        if t.is_empty() { None } else { Some(t) }
+    };
+    (dominant, direct, tree)
 }
 
 fn is_meaningful_output_line(line: &str) -> bool {
@@ -437,13 +429,12 @@ fn is_meaningful_output_line(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        append_recent_lines, apply_file_activity, compute_observation_refresh,
-        effective_display_name, find_git_worktree_root, naming_terminal_history,
-        is_bare_waiting_shell, synthesis_terminal_activity, SessionObservation,
-        TerminalActivityEntry,
+        SessionObservation, TerminalActivityEntry, append_recent_lines, apply_file_activity,
+        compute_observation_refresh, effective_display_name, find_git_worktree_root,
+        is_bare_waiting_shell, naming_terminal_history, synthesis_terminal_activity,
     };
     use crate::model::{
-        user_shell_launch, SessionId, SessionKind, SessionLaunch, SessionRecord, SessionStatus,
+        SessionId, SessionKind, SessionLaunch, SessionRecord, SessionStatus, user_shell_launch,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -454,7 +445,11 @@ mod tests {
         let mut recent = vec!["first".to_string()];
         append_recent_lines(
             &mut recent,
-            &["first".to_string(), "second".to_string(), "second".to_string()],
+            &[
+                "first".to_string(),
+                "second".to_string(),
+                "second".to_string(),
+            ],
         );
         assert_eq!(recent, vec!["first".to_string(), "second".to_string()]);
     }
@@ -495,8 +490,16 @@ mod tests {
 
         let history = synthesis_terminal_activity(&observation);
         assert_eq!(history.len(), 256);
-        assert!(history.first().is_some_and(|line| line.ends_with("line 44")));
-        assert!(history.last().is_some_and(|line| line.ends_with("line 299")));
+        assert!(
+            history
+                .first()
+                .is_some_and(|line| line.ends_with("line 44"))
+        );
+        assert!(
+            history
+                .last()
+                .is_some_and(|line| line.ends_with("line 299"))
+        );
     }
 
     #[test]
@@ -512,8 +515,16 @@ mod tests {
 
         let history = naming_terminal_history(&observation);
         assert_eq!(history.len(), 299);
-        assert!(history.first().is_some_and(|line| line.ends_with("line 101")));
-        assert!(history.last().is_some_and(|line| line.ends_with("line 399")));
+        assert!(
+            history
+                .first()
+                .is_some_and(|line| line.ends_with("line 101"))
+        );
+        assert!(
+            history
+                .last()
+                .is_some_and(|line| line.ends_with("line 399"))
+        );
     }
 
     #[test]
@@ -577,8 +588,16 @@ mod tests {
         let mut observation = SessionObservation::new();
         let base = Instant::now();
         apply_file_activity(&mut observation, "one.rs".to_string(), base);
-        apply_file_activity(&mut observation, "two.rs".to_string(), base + Duration::from_secs(1));
-        apply_file_activity(&mut observation, "three.rs".to_string(), base + Duration::from_secs(2));
+        apply_file_activity(
+            &mut observation,
+            "two.rs".to_string(),
+            base + Duration::from_secs(1),
+        );
+        apply_file_activity(
+            &mut observation,
+            "three.rs".to_string(),
+            base + Duration::from_secs(2),
+        );
 
         assert_eq!(
             observation.recent_files,
@@ -588,7 +607,8 @@ mod tests {
 
     #[test]
     fn compute_observation_refresh_has_no_file_activity_payload() {
-        let session = session_record_with_cwd(SessionId(42), tempdir_path("exaterm-observation-refresh"));
+        let session =
+            session_record_with_cwd(SessionId(42), tempdir_path("exaterm-observation-refresh"));
         let refresh = compute_observation_refresh(&session, false);
         assert!(refresh.shell_child_command.is_none());
         assert!(refresh.dominant_process.is_none());
@@ -635,7 +655,11 @@ mod tests {
         let mut observation = SessionObservation::new();
         let base = Instant::now();
         apply_file_activity(&mut observation, "same.rs".to_string(), base);
-        apply_file_activity(&mut observation, "same.rs".to_string(), base + Duration::from_secs(1));
+        apply_file_activity(
+            &mut observation,
+            "same.rs".to_string(),
+            base + Duration::from_secs(1),
+        );
 
         assert_eq!(observation.recent_files, vec!["same.rs".to_string()]);
         assert_eq!(observation.recent_file_activity.len(), 1);
@@ -661,12 +685,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("time should be monotonic enough for temp dir names")
             .as_nanos();
-        let unique = format!(
-            "{}-{}-{}",
-            prefix,
-            std::process::id(),
-            nanos
-        );
+        let unique = format!("{}-{}-{}", prefix, std::process::id(), nanos);
         let path = std::env::temp_dir().join(unique);
         fs::create_dir_all(&path).expect("temp dir");
         path

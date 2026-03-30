@@ -2,9 +2,9 @@ pub use exaterm_types::synthesis::{
     AttentionLevel, NameSuggestion, NudgeSuggestion, TacticalState, TacticalSynthesis,
 };
 use serde::Serialize;
-use serde_json::{json, Value};
-use std::error::Error;
+use serde_json::{Value, json};
 use std::env;
+use std::error::Error;
 use std::fs;
 use std::path::Path;
 
@@ -229,7 +229,8 @@ pub fn nudge_signature(evidence: &NudgeEvidence) -> String {
 }
 
 fn normalize_time_annotated_lines(lines: &[String]) -> Vec<String> {
-    lines.iter()
+    lines
+        .iter()
         .map(|line| normalize_time_annotated_line(line))
         .collect()
 }
@@ -252,13 +253,22 @@ fn relative_age_bucket(label: Option<&str>) -> Option<&'static str> {
     if label == "now" {
         return Some("now");
     }
-    if let Some(value) = label.strip_suffix("s ago").and_then(|value| value.trim().parse::<u64>().ok()) {
+    if let Some(value) = label
+        .strip_suffix("s ago")
+        .and_then(|value| value.trim().parse::<u64>().ok())
+    {
         return bucket_duration_seconds(value);
     }
-    if let Some(value) = label.strip_suffix("m ago").and_then(|value| value.trim().parse::<u64>().ok()) {
+    if let Some(value) = label
+        .strip_suffix("m ago")
+        .and_then(|value| value.trim().parse::<u64>().ok())
+    {
         return bucket_duration_seconds(value.saturating_mul(60));
     }
-    if let Some(value) = label.strip_suffix("h ago").and_then(|value| value.trim().parse::<u64>().ok()) {
+    if let Some(value) = label
+        .strip_suffix("h ago")
+        .and_then(|value| value.trim().parse::<u64>().ok())
+    {
         return bucket_duration_seconds(value.saturating_mul(3600));
     }
     None
@@ -669,10 +679,10 @@ pub fn extract_response_text(payload: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_response_text, name_signature, normalize_naming_model, normalize_summary_model,
-        nudge_signature, openai_chat_completions_url, summary_signature, synthesis_schema,
-        tactical_system_prompt, AttentionLevel, NameSuggestion, NamingEvidence, NudgeEvidence,
-        TacticalEvidence, TacticalState, TacticalSynthesis,
+        AttentionLevel, NameSuggestion, NamingEvidence, NudgeEvidence, TacticalEvidence,
+        TacticalState, TacticalSynthesis, extract_response_text, name_signature,
+        normalize_naming_model, normalize_summary_model, nudge_signature,
+        openai_chat_completions_url, summary_signature, synthesis_schema, tactical_system_prompt,
     };
     use serde_json::json;
     use std::sync::Mutex;
@@ -701,7 +711,9 @@ mod tests {
 
     #[test]
     fn openai_chat_completions_url_defaults_to_openai() {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|poison| poison.into_inner());
+        let _guard = ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         std::env::remove_var("EXATERM_OPENAI_BASE_URL");
         std::env::remove_var("OPENAI_BASE_URL");
         assert_eq!(
@@ -712,7 +724,9 @@ mod tests {
 
     #[test]
     fn openai_chat_completions_url_uses_configured_base() {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|poison| poison.into_inner());
+        let _guard = ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         std::env::set_var("EXATERM_OPENAI_BASE_URL", "https://example.test/v1/");
         assert_eq!(
             openai_chat_completions_url(),
@@ -871,8 +885,14 @@ mod tests {
         .sanitize();
 
         assert_eq!(summary.headline.as_deref(), Some("cargo test parser"));
-        assert_eq!(summary.tactical_state_brief.as_deref(), Some("tests are running"));
-        assert_eq!(summary.attention_brief.as_deref(), Some("keep watching this loop"));
+        assert_eq!(
+            summary.tactical_state_brief.as_deref(),
+            Some("tests are running")
+        );
+        assert_eq!(
+            summary.attention_brief.as_deref(),
+            Some("keep watching this loop")
+        );
     }
 
     #[test]
@@ -898,12 +918,16 @@ mod tests {
         assert!(fixtures.len() >= 12);
         assert!(fixtures.iter().any(|(name, _, _)| name.contains("codex")));
         assert!(fixtures.iter().any(|(name, _, _)| name.contains("claude")));
-        assert!(fixtures
-            .iter()
-            .all(|(_, evidence, _)| evidence.recent_terminal_activity.len() >= 6));
-        assert!(fixtures
-            .iter()
-            .any(|(_, _, expectations)| expectations.attention_levels.contains(&AttentionLevel::Takeover)));
+        assert!(
+            fixtures
+                .iter()
+                .all(|(_, evidence, _)| evidence.recent_terminal_activity.len() >= 6)
+        );
+        assert!(fixtures.iter().any(|(_, _, expectations)| {
+            expectations
+                .attention_levels
+                .contains(&AttentionLevel::Takeover)
+        }));
     }
 
     #[test]
@@ -967,15 +991,13 @@ mod tests {
     }
 
     fn assert_live_summary_fixture(name: &str) {
-        if std::env::var("EXATERM_LIVE_OPENAI_TESTS")
-            .ok()
-            .as_deref()
-            != Some("1")
-        {
+        if std::env::var("EXATERM_LIVE_OPENAI_TESTS").ok().as_deref() != Some("1") {
             return;
         }
 
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|poison| poison.into_inner());
+        let _guard = ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
 
         let Some(config) = super::OpenAiSynthesisConfig::from_env() else {
             return;
@@ -1018,14 +1040,18 @@ mod tests {
 
         if !expectations.tactical_states.is_empty() {
             assert!(
-                expectations.tactical_states.contains(&summary.tactical_state),
+                expectations
+                    .tactical_states
+                    .contains(&summary.tactical_state),
                 "{fixture_name} should synthesize one of the expected tactical states, got {:?}",
                 summary.tactical_state
             );
         }
         if !expectations.attention_levels.is_empty() {
             assert!(
-                expectations.attention_levels.contains(&summary.attention_level),
+                expectations
+                    .attention_levels
+                    .contains(&summary.attention_level),
                 "{fixture_name} should synthesize one of the expected attention levels, got {:?}",
                 summary.attention_level
             );
@@ -1462,10 +1488,17 @@ mod tests {
     #[test]
     fn tactical_prompt_requires_real_state_and_high_bar_for_complete() {
         let prompt = tactical_system_prompt();
-        assert!(prompt.contains("You must always choose a real tactical_state and a real attention_level."));
+        assert!(
+            prompt.contains(
+                "You must always choose a real tactical_state and a real attention_level."
+            )
+        );
         assert!(prompt.contains("use complete rarely; the bar is high"));
         assert!(prompt.contains("do not use complete for 'looks good'"));
-        assert!(prompt.contains("when unsure between idle and stopped after recent work, prefer stopped"));
+        assert!(
+            prompt
+                .contains("when unsure between idle and stopped after recent work, prefer stopped")
+        );
     }
 
     #[test]

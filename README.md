@@ -24,7 +24,7 @@ The goal is simple: make it possible to supervise multiple coding agents without
 
 ## Architecture
 
-Exaterm is split into four crates:
+Exaterm is split into five crates:
 
 - `crates/exaterm-types`
   - shared contract types only
@@ -35,8 +35,11 @@ Exaterm is split into four crates:
 - `crates/exatermd`
   - the headless beachhead daemon
   - owns PTYs, session state, summaries, and nudging
-- `crates/exaterm`
-  - the GTK/VTE desktop client
+- `crates/exaterm-ui`
+  - shared UI model
+  - layout logic, supervision view state, and workspace view primitives shared between clients
+- `crates/exaterm-gtk`
+  - the GTK/VTE desktop client (Linux)
   - renders the UI, owns local display PTYs, and talks to the daemon
 
 The UI is intended to always be beachhead-backed in normal operation.

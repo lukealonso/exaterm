@@ -1,11 +1,12 @@
 [package]
-name = "exaterm"
+name = "exaterm-gtk"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
 exaterm-types = { path = "../exaterm-types" }
 exaterm-core = { path = "../exaterm-core" }
+exaterm-ui = { path = "../exaterm-ui" }
 gio = "0.21"
 glib = "0.21"
 gtk = { package = "gtk4", version = "0.10", features = ["v4_20"] }

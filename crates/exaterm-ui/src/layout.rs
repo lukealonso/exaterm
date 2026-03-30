@@ -4,14 +4,14 @@ const MIN_EMBEDDED_TERMINAL_COLS: i32 = 80;
 const MIN_EMBEDDED_TERMINAL_ROWS: i32 = 24;
 const EMBEDDED_TERMINAL_CARD_CHROME_WIDTH: i32 = 72;
 const EMBEDDED_TERMINAL_CARD_CHROME_HEIGHT: i32 = 168;
-const EMBEDDED_TERMINAL_MIN_WIDTH: i32 =
-    (ESTIMATED_TERMINAL_CELL_WIDTH * MIN_EMBEDDED_TERMINAL_COLS)
-        + EMBEDDED_TERMINAL_CARD_CHROME_WIDTH;
-const EMBEDDED_TERMINAL_MIN_HEIGHT: i32 =
-    (ESTIMATED_TERMINAL_CELL_HEIGHT * MIN_EMBEDDED_TERMINAL_ROWS)
-        + EMBEDDED_TERMINAL_CARD_CHROME_HEIGHT;
+const EMBEDDED_TERMINAL_MIN_WIDTH: i32 = (ESTIMATED_TERMINAL_CELL_WIDTH
+    * MIN_EMBEDDED_TERMINAL_COLS)
+    + EMBEDDED_TERMINAL_CARD_CHROME_WIDTH;
+const EMBEDDED_TERMINAL_MIN_HEIGHT: i32 = (ESTIMATED_TERMINAL_CELL_HEIGHT
+    * MIN_EMBEDDED_TERMINAL_ROWS)
+    + EMBEDDED_TERMINAL_CARD_CHROME_HEIGHT;
 
-pub(crate) fn battlefield_columns(total: usize, available_width: i32, focused: bool) -> u32 {
+pub fn battlefield_columns(total: usize, available_width: i32, focused: bool) -> u32 {
     if total == 0 {
         return 0;
     }
@@ -43,11 +43,7 @@ pub(crate) fn battlefield_columns(total: usize, available_width: i32, focused: b
     } else if total == 6 {
         3
     } else if total <= 4 {
-        if available_width >= 1800 {
-            total
-        } else {
-            2
-        }
+        if available_width >= 1800 { total } else { 2 }
     } else if total == 5 {
         ((available_width as usize) / 420).clamp(3, 5)
     } else {
@@ -55,7 +51,7 @@ pub(crate) fn battlefield_columns(total: usize, available_width: i32, focused: b
     }) as u32
 }
 
-pub(crate) fn battlefield_can_embed_terminals(
+pub fn battlefield_can_embed_terminals(
     total: usize,
     columns: usize,
     available_width: i32,
@@ -77,7 +73,7 @@ pub(crate) fn battlefield_can_embed_terminals(
     tile_width >= EMBEDDED_TERMINAL_MIN_WIDTH && tile_height >= EMBEDDED_TERMINAL_MIN_HEIGHT
 }
 
-pub(crate) fn visible_scrollback_line_capacity(height: i32) -> usize {
+pub fn visible_scrollback_line_capacity(height: i32) -> usize {
     const SCROLLBACK_VERTICAL_PADDING: i32 = 16;
     const SCROLLBACK_LINE_HEIGHT: i32 = 14;
     const SCROLLBACK_LINE_SPACING: i32 = 4;

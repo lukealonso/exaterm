@@ -1,11 +1,11 @@
-use crate::model::{launch_argv, SessionLaunch};
+use crate::model::{SessionLaunch, launch_argv};
 use crate::terminal_stream::TerminalStreamProcessor;
-use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::fs::File;
 use std::io::Read;
 use std::os::fd::FromRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
 pub struct SessionRuntime {

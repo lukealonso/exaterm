@@ -1,10 +1,10 @@
-use crate::remote::{connect_remote, RemoteBeachheadBridge, RemoteRawSessionConnector};
-use exaterm_core::daemon::{connect_session_stream_socket, LocalBeachheadClient};
+use crate::remote::{RemoteBeachheadBridge, RemoteRawSessionConnector, connect_remote};
+use exaterm_core::daemon::{LocalBeachheadClient, connect_session_stream_socket};
 use exaterm_types::model::SessionId;
 use exaterm_types::proto::{ClientMessage, ServerMessage};
 use std::os::unix::net::UnixStream;
-use std::sync::mpsc;
 use std::sync::Arc;
+use std::sync::mpsc;
 
 #[derive(Clone, Debug)]
 pub enum BeachheadTarget {
@@ -26,7 +26,9 @@ impl RawSessionConnector {
     ) -> Result<UnixStream, String> {
         match self {
             RawSessionConnector::Local => connect_session_stream_socket(socket_name),
-            RawSessionConnector::Remote(bridge) => bridge.connect_raw_session(session_id, socket_name),
+            RawSessionConnector::Remote(bridge) => {
+                bridge.connect_raw_session(session_id, socket_name)
+            }
         }
     }
 }

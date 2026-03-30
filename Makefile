@@ -1,21 +1,25 @@
-.PHONY: all build run daemon check test test-workspace core-test core-check daemon-check clean help
+.PHONY: all build build-gtk run run-gtk daemon check test test-workspace core-test core-check daemon-check clean help
 
 all: build
 
-build:
-	cargo build -p exaterm -p exatermd
+build: build-gtk
 
-run: build
-	cargo run -p exaterm
+build-gtk:
+	cargo build -p exaterm-gtk -p exatermd
+
+run: run-gtk
+
+run-gtk: build-gtk
+	cargo run -p exaterm-gtk
 
 daemon:
 	cargo run -p exatermd
 
 check:
-	cargo check -p exaterm
+	cargo check -p exaterm-gtk
 
 test:
-	cargo test -p exaterm
+	cargo test -p exaterm-gtk -p exaterm-ui
 
 test-workspace:
 	cargo test --workspace
@@ -34,11 +38,11 @@ clean:
 
 help:
 	@printf '%s\n' \
-		'make            Build exaterm and exatermd' \
-		'make run        Build exaterm/exatermd, then run the GTK app' \
+		'make            Build exaterm-gtk and exatermd' \
+		'make run        Build and run the GTK app' \
 		'make daemon     Run the daemon directly' \
 		'make check      cargo check for the GTK app' \
-		'make test       Run app-package tests' \
+		'make test       Run app and UI tests' \
 		'make test-workspace  Run the full workspace test suite' \
 		'make core-test  Run core library tests' \
 		'make daemon-check    Check the daemon package' \

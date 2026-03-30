@@ -1,27 +1,26 @@
-use crate::file_watch::{spawn_repo_watch, RepoWatchHandle};
-use crate::model::{user_shell_launch, SessionId, SessionLaunch, WorkspaceStore};
+use crate::file_watch::{RepoWatchHandle, spawn_repo_watch};
+use crate::model::{SessionId, SessionLaunch, WorkspaceStore, user_shell_launch};
 use crate::observation::{
-    apply_file_activity, apply_observation_refresh, apply_stream_update, build_naming_evidence,
-    build_nudge_evidence, build_tactical_evidence, clear_file_activity,
+    SessionObservation, apply_file_activity, apply_observation_refresh, apply_stream_update,
+    build_naming_evidence, build_nudge_evidence, build_tactical_evidence, clear_file_activity,
     compute_observation_refresh, find_git_worktree_root, is_bare_waiting_shell,
-    SessionObservation,
 };
 use crate::proto::{
     ClientMessage, ObservationSnapshot, ServerMessage, SessionSnapshot, WorkspaceSnapshot,
 };
-use crate::runtime::{spawn_headless_runtime, RuntimeEvent, SessionRuntime};
+use crate::runtime::{RuntimeEvent, SessionRuntime, spawn_headless_runtime};
 use crate::synthesis::{
-    name_signature, nudge_signature, suggest_name_blocking, suggest_nudge_blocking,
-    summary_signature, summarize_blocking, NameSuggestion, NamingEvidence, NudgeEvidence,
-    NudgeSuggestion, OpenAiNamingConfig, OpenAiNudgeConfig, OpenAiSynthesisConfig, TacticalState,
-    TacticalSynthesis,
+    NameSuggestion, NamingEvidence, NudgeEvidence, NudgeSuggestion, OpenAiNamingConfig,
+    OpenAiNudgeConfig, OpenAiSynthesisConfig, TacticalState, TacticalSynthesis, name_signature,
+    nudge_signature, suggest_name_blocking, suggest_nudge_blocking, summarize_blocking,
+    summary_signature,
 };
 use portable_pty::PtySize;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
-use std::fs::File;
 use std::fs;
+use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -274,7 +273,10 @@ impl DaemonState {
         Ok(())
     }
 
-    fn add_shell_session_without_watch(&mut self, launch: SessionLaunch) -> Result<SessionId, String> {
+    fn add_shell_session_without_watch(
+        &mut self,
+        launch: SessionLaunch,
+    ) -> Result<SessionId, String> {
         let session_id = self.workspace.add_session(launch.clone());
         self.observations
             .insert(session_id, SessionObservation::new());
@@ -317,7 +319,8 @@ impl DaemonState {
             return Ok(());
         };
 
-        self.session_repo_roots.insert(session_id, repo_root.clone());
+        self.session_repo_roots
+            .insert(session_id, repo_root.clone());
         if let Some(watch) = self.repo_watches.get_mut(&repo_root) {
             watch.sessions.insert(session_id);
             return Ok(());
@@ -425,8 +428,8 @@ impl LocalBeachheadClient {
             .try_clone()
             .map_err(|error| format!("failed to clone beachhead socket: {error}"))?;
         let control_writer = control;
-        let (event_wake_reader, mut event_wake_writer) =
-            UnixStream::pair().map_err(|error| format!("failed to create event wake socket: {error}"))?;
+        let (event_wake_reader, mut event_wake_writer) = UnixStream::pair()
+            .map_err(|error| format!("failed to create event wake socket: {error}"))?;
         event_wake_reader
             .set_nonblocking(true)
             .map_err(|error| format!("failed to set event wake reader nonblocking: {error}"))?;
@@ -464,7 +467,8 @@ impl LocalBeachheadClient {
                                 }
                                 match event_wake_writer.write(&[1]) {
                                     Ok(_) => {}
-                                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                                    Err(error)
+                                        if error.kind() == std::io::ErrorKind::WouldBlock => {}
                                     Err(_) => break,
                                 }
                             }
@@ -536,8 +540,8 @@ fn run_local_daemon_inner() -> Result<(), String> {
         .map_err(|error| format!("failed to set daemon control socket nonblocking: {error}"))?;
 
     let (control_tx, control_rx) = mpsc::channel::<ClientControl>();
-    let (mut wake_reader, wake_writer) =
-        UnixStream::pair().map_err(|error| format!("failed to create daemon wake socket: {error}"))?;
+    let (mut wake_reader, wake_writer) = UnixStream::pair()
+        .map_err(|error| format!("failed to create daemon wake socket: {error}"))?;
     wake_reader
         .set_nonblocking(true)
         .map_err(|error| format!("failed to set daemon wake reader nonblocking: {error}"))?;
@@ -640,9 +644,9 @@ fn run_local_daemon_inner() -> Result<(), String> {
             loop {
                 match stream.listener.accept() {
                     Ok((socket, _)) => {
-                        let reader = socket
-                            .try_clone()
-                            .map_err(|error| format!("failed to clone session raw stream: {error}"))?;
+                        let reader = socket.try_clone().map_err(|error| {
+                            format!("failed to clone session raw stream: {error}")
+                        })?;
                         let Some(input_writer) = state
                             .runtimes
                             .get(&session_id)
@@ -672,7 +676,7 @@ fn run_local_daemon_inner() -> Result<(), String> {
                         return Err(format!(
                             "daemon raw accept failed for session {:?}: {error}",
                             session_id
-                        ))
+                        ));
                     }
                 }
             }
@@ -741,7 +745,6 @@ fn run_local_daemon_inner() -> Result<(), String> {
             }
             state.snapshot_dirty = false;
         }
-
     }
 
     let _ = fs::remove_file(&control_socket_path);
@@ -783,7 +786,8 @@ fn handle_client_message(
                 .and_then(|session| session.launch.cwd.clone());
             for _ in 0..additions {
                 let number = state.workspace.sessions().len() + 1;
-                let mut launch = user_shell_launch(format!("Shell {number}"), "Generic command session");
+                let mut launch =
+                    user_shell_launch(format!("Shell {number}"), "Generic command session");
                 if let Some(cwd) = cwd.clone() {
                     launch = launch.with_cwd(cwd);
                 }
@@ -960,11 +964,7 @@ fn maybe_queue_summary(
     });
 }
 
-fn maybe_queue_name(
-    state: &mut DaemonState,
-    session_id: SessionId,
-    evidence: &NamingEvidence,
-) {
+fn maybe_queue_name(state: &mut DaemonState, session_id: SessionId, evidence: &NamingEvidence) {
     let Some(worker) = state.naming_worker.as_ref() else {
         return;
     };
@@ -1061,10 +1061,7 @@ fn drain_worker_results(state: &mut DaemonState) -> bool {
                 .entry(result.session_id)
                 .or_insert_with(ObservationCacheEntry::new);
             entry.in_flight = false;
-            let observation = state
-                .observations
-                .entry(result.session_id)
-                .or_default();
+            let observation = state.observations.entry(result.session_id).or_default();
             let before = (
                 observation.shell_child_command.clone(),
                 observation.dominant_process.clone(),
@@ -1164,16 +1161,10 @@ fn handle_runtime_event(
     match event {
         RuntimeEvent::Stream(update) => {
             append_replay_buffer(
-                state
-                    .replay_buffers
-                    .entry(session_id)
-                    .or_default(),
+                state.replay_buffers.entry(session_id).or_default(),
                 &update.output_bytes,
             );
-            let observation = state
-                .observations
-                .entry(session_id)
-                .or_default();
+            let observation = state.observations.entry(session_id).or_default();
             apply_stream_update(observation, update);
             state.snapshot_dirty = true;
         }
@@ -1389,7 +1380,10 @@ fn spawn_runtime_forwarder(
                     }
                 }
             }
-            if control_tx.send(ClientControl::RuntimeEvent(session_id, event)).is_err() {
+            if control_tx
+                .send(ClientControl::RuntimeEvent(session_id, event))
+                .is_err()
+            {
                 break;
             }
         }
@@ -1536,11 +1530,18 @@ fn create_session_stream_state(session_id: SessionId) -> Result<SessionStreamSta
     if socket_path.exists() {
         let _ = fs::remove_file(&socket_path);
     }
-    let listener = UnixListener::bind(&socket_path)
-        .map_err(|error| format!("failed to bind session raw socket {:?}: {error}", session_id))?;
-    listener
-        .set_nonblocking(true)
-        .map_err(|error| format!("failed to set session raw socket nonblocking {:?}: {error}", session_id))?;
+    let listener = UnixListener::bind(&socket_path).map_err(|error| {
+        format!(
+            "failed to bind session raw socket {:?}: {error}",
+            session_id
+        )
+    })?;
+    listener.set_nonblocking(true).map_err(|error| {
+        format!(
+            "failed to set session raw socket nonblocking {:?}: {error}",
+            session_id
+        )
+    })?;
     Ok(SessionStreamState {
         socket_name,
         socket_path,
@@ -1655,7 +1656,10 @@ mod tests {
         let runtime_dir = unique_runtime_dir("socket");
         std::env::set_var("EXATERM_RUNTIME_DIR", &runtime_dir);
         let control_path = control_socket_path().expect("control socket path");
-        assert_eq!(control_path, runtime_dir.join("exaterm").join(CONTROL_SOCKET_NAME));
+        assert_eq!(
+            control_path,
+            runtime_dir.join("exaterm").join(CONTROL_SOCKET_NAME)
+        );
         assert_eq!(
             session_raw_socket_path("session-7-stream.sock").expect("session raw socket path"),
             runtime_dir.join("exaterm").join("session-7-stream.sock")
