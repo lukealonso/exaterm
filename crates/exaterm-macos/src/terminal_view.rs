@@ -7,6 +7,7 @@ use crate::style::{self, NormalizedColor};
 use objc2::rc::Retained;
 use objc2_app_kit::{NSColor, NSFont};
 
+use exaterm_ui::presentation::NudgeStateTone;
 use exaterm_ui::supervision::BattleCardStatus;
 use exaterm_ui::theme::{self as theme, Color};
 
@@ -39,6 +40,8 @@ pub struct TerminalRenderState {
     pub headline_font: Retained<NSFont>,
     pub alert_font: Retained<NSFont>,
     pub scrollback_font: Retained<NSFont>,
+    pub bar_caption_font: Retained<NSFont>,
+    pub bar_reason_font: Retained<NSFont>,
 
     // Card UI colors (from theme CSS values).
     pub title_color: Retained<NSColor>,
@@ -48,12 +51,18 @@ pub struct TerminalRenderState {
     pub scrollback_color: Retained<NSColor>,
     pub selected_bg: Retained<NSColor>,
     pub attention_chip_text: Retained<NSColor>,
+    pub transcript_bg: Retained<NSColor>,
+    pub transcript_border: Retained<NSColor>,
+    pub bar_caption_color: Retained<NSColor>,
+    pub bar_reason_color: Retained<NSColor>,
+    pub bar_empty: Retained<NSColor>,
 
     // Per-status cached colors: discriminant -> (chip_text_color, chip_bg_color).
     pub status_chip_colors: BTreeMap<u8, (Retained<NSColor>, Retained<NSColor>)>,
     // Per-status card background: discriminant -> card background top color.
     pub card_bg_colors: BTreeMap<u8, Retained<NSColor>>,
     pub attention_bg_colors: BTreeMap<usize, Retained<NSColor>>,
+    pub nudge_colors: BTreeMap<u8, (Retained<NSColor>, Retained<NSColor>)>,
 }
 
 /// Return a `u8` discriminant for a `BattleCardStatus` variant (used as map key).
@@ -80,6 +89,8 @@ impl TerminalRenderState {
         let headline_font = style::font_from_spec(&theme::card_headline_font());
         let alert_font = style::font_from_spec(&theme::card_alert_font());
         let scrollback_font = style::font_from_spec(&theme::scrollback_line_font());
+        let bar_caption_font = style::font_from_spec(&theme::bar_caption_font());
+        let bar_reason_font = style::font_from_spec(&theme::bar_reason_font());
 
         // Card UI colors from theme CSS values.
         let title_color = style::color_to_nscolor(&Color {
@@ -124,11 +135,42 @@ impl TerminalRenderState {
             b: 252,
             a: 1.0,
         });
+        let transcript_bg = style::color_to_nscolor(&Color {
+            r: 24,
+            g: 31,
+            b: 40,
+            a: 0.52,
+        });
+        let transcript_border = style::color_to_nscolor(&Color {
+            r: 78,
+            g: 91,
+            b: 108,
+            a: 0.38,
+        });
+        let bar_caption_color = style::color_to_nscolor(&Color {
+            r: 186,
+            g: 200,
+            b: 214,
+            a: 0.62,
+        });
+        let bar_reason_color = style::color_to_nscolor(&Color {
+            r: 186,
+            g: 200,
+            b: 214,
+            a: 0.56,
+        });
+        let bar_empty = style::color_to_nscolor(&Color {
+            r: 163,
+            g: 175,
+            b: 194,
+            a: 0.14,
+        });
 
         // Per-status cached colors.
         let mut status_chip_colors = BTreeMap::new();
         let mut card_bg_colors = BTreeMap::new();
         let mut attention_bg_colors = BTreeMap::new();
+        let mut nudge_colors = BTreeMap::new();
         for &status in ALL_STATUSES {
             let disc = status_discriminant(status);
             let chip = theme::status_chip_theme(status);
@@ -187,6 +229,57 @@ impl TerminalRenderState {
                 a: 0.32,
             }),
         );
+        nudge_colors.insert(
+            0,
+            (
+                style::color_to_nscolor(&Color {
+                    r: 214,
+                    g: 222,
+                    b: 230,
+                    a: 0.84,
+                }),
+                style::color_to_nscolor(&Color {
+                    r: 84,
+                    g: 97,
+                    b: 112,
+                    a: 0.18,
+                }),
+            ),
+        );
+        nudge_colors.insert(
+            1,
+            (
+                style::color_to_nscolor(&Color {
+                    r: 253,
+                    g: 230,
+                    b: 138,
+                    a: 1.0,
+                }),
+                style::color_to_nscolor(&Color {
+                    r: 120,
+                    g: 87,
+                    b: 10,
+                    a: 0.22,
+                }),
+            ),
+        );
+        nudge_colors.insert(
+            2,
+            (
+                style::color_to_nscolor(&Color {
+                    r: 147,
+                    g: 197,
+                    b: 253,
+                    a: 1.0,
+                }),
+                style::color_to_nscolor(&Color {
+                    r: 33,
+                    g: 82,
+                    b: 145,
+                    a: 0.22,
+                }),
+            ),
+        );
 
         Self {
             title_font,
@@ -195,6 +288,8 @@ impl TerminalRenderState {
             headline_font,
             alert_font,
             scrollback_font,
+            bar_caption_font,
+            bar_reason_font,
             title_color,
             headline_color,
             alert_color,
@@ -202,9 +297,15 @@ impl TerminalRenderState {
             scrollback_color,
             selected_bg,
             attention_chip_text,
+            transcript_bg,
+            transcript_border,
+            bar_caption_color,
+            bar_reason_color,
+            bar_empty,
             status_chip_colors,
             card_bg_colors,
             attention_bg_colors,
+            nudge_colors,
         }
     }
 
@@ -225,5 +326,25 @@ impl TerminalRenderState {
 
     pub fn attention_chip_bg(&self, fill: usize) -> &Retained<NSColor> {
         &self.attention_bg_colors[&fill.clamp(1, 5)]
+    }
+
+    pub fn nudge_text_color(&self, tone: NudgeStateTone) -> &Retained<NSColor> {
+        &self.nudge_colors[&nudge_discriminant(tone)].0
+    }
+
+    pub fn nudge_bg_color(&self, tone: NudgeStateTone) -> &Retained<NSColor> {
+        &self.nudge_colors[&nudge_discriminant(tone)].1
+    }
+
+    pub fn attention_bar_fill(&self, fill: usize) -> &Retained<NSColor> {
+        self.attention_chip_bg(fill)
+    }
+}
+
+fn nudge_discriminant(tone: NudgeStateTone) -> u8 {
+    match tone {
+        NudgeStateTone::Off => 0,
+        NudgeStateTone::Armed => 1,
+        NudgeStateTone::Cooldown => 2,
     }
 }

@@ -109,6 +109,18 @@ fn draw_focus(frame: NSRect) {
             NSPoint::new(pad_x, y),
             NSSize::new((card_rect.size.width - 36.0).max(0.0), 56.0),
         ));
+        y += 64.0;
+    }
+
+    if let Some(attention_bar) = data.attention_bar {
+        draw_attention_bar(
+            pad_x,
+            y,
+            (card_rect.size.width - 36.0).max(0.0),
+            attention_bar.fill,
+            data.attention_bar_reason.as_deref(),
+            &render,
+        );
     }
 
     let slot = focus_terminal_slot_rect(frame.size.width as i32, frame.size.height as i32);
@@ -144,6 +156,50 @@ fn draw_chip(
     bg.setFill();
     chip_path.fill();
     build_simple_attr_string(label, font, text).drawAtPoint(NSPoint::new(x + 9.0, y + 3.0));
+}
+
+fn draw_attention_bar(
+    x: f64,
+    y: f64,
+    width: f64,
+    fill: usize,
+    reason: Option<&str>,
+    render: &TerminalRenderState,
+) {
+    build_simple_attr_string(
+        "ATTENTION CONDITION",
+        &render.bar_caption_font,
+        &render.bar_caption_color,
+    )
+    .drawAtPoint(NSPoint::new(x, y));
+
+    let segment_y = y + 18.0;
+    let gap = 4.0;
+    let segment_width = ((width - (gap * 4.0)).max(0.0)) / 5.0;
+    for index in 0..5 {
+        let segment_x = x + (index as f64 * (segment_width + gap));
+        let rect = NSRect::new(
+            NSPoint::new(segment_x, segment_y),
+            NSSize::new(segment_width, 8.0),
+        );
+        let path = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(rect, 4.0, 4.0);
+        if index < fill {
+            render.attention_bar_fill(fill).setFill();
+        } else {
+            render.bar_empty.setFill();
+        }
+        path.fill();
+    }
+
+    if let Some(reason) = reason {
+        if !reason.is_empty() {
+            build_simple_attr_string(reason, &render.bar_reason_font, &render.bar_reason_color)
+                .drawInRect(NSRect::new(
+                    NSPoint::new(x, segment_y + 14.0),
+                    NSSize::new(width, 42.0),
+                ));
+        }
+    }
 }
 
 fn ns_color(c: Color) -> Retained<NSColor> {

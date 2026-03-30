@@ -43,7 +43,11 @@ pub fn battlefield_columns(total: usize, available_width: i32, focused: bool) ->
     } else if total == 6 {
         3
     } else if total <= 4 {
-        if available_width >= 1800 { total } else { 2 }
+        if available_width >= 1800 {
+            total
+        } else {
+            2
+        }
     } else if total == 5 {
         ((available_width as usize) / 420).clamp(3, 5)
     } else {
@@ -188,7 +192,7 @@ pub fn card_terminal_slot_rect(card: &CardRect) -> TerminalSlotRect {
 
 pub fn focus_terminal_slot_rect(view_w: i32, view_h: i32) -> TerminalSlotRect {
     let padding = 18.0;
-    let header = 116.0;
+    let header = 208.0;
     TerminalSlotRect {
         x: padding,
         y: header,

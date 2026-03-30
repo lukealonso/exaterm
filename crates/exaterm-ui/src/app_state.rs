@@ -1,8 +1,10 @@
 use crate::presentation::{
-    AttentionPresentation, attention_presentation, combined_focus_summary_text, status_chip_label,
+    attention_bar_presentation, attention_presentation, combined_focus_summary_text,
+    nudge_state_presentation, status_chip_label, AttentionPresentation, NudgeStatePresentation,
+    SegmentedBarPresentation,
 };
 use crate::supervision::{
-    BattleCardStatus, ObservedActivity, build_battle_card, derive_battle_card_status,
+    build_battle_card, derive_battle_card_status, BattleCardStatus, ObservedActivity,
 };
 use crate::workspace_view::WorkspaceViewState;
 use exaterm_types::model::SessionId;
@@ -28,9 +30,9 @@ pub struct CardRenderData {
     pub alert: Option<String>,
     pub attention: Option<AttentionPresentation>,
     pub attention_reason: Option<String>,
-    /// Whether auto-nudge is enabled for this session.
-    pub auto_nudge_enabled: bool,
-    /// Most recent auto-nudge text, if any.
+    pub attention_bar: Option<SegmentedBarPresentation>,
+    pub attention_bar_reason: Option<String>,
+    pub nudge_state: NudgeStatePresentation,
     pub last_nudge: Option<String>,
 }
 
@@ -43,6 +45,8 @@ pub struct FocusRenderData {
     pub combined_headline: String,
     pub attention: Option<AttentionPresentation>,
     pub attention_reason: Option<String>,
+    pub attention_bar: Option<SegmentedBarPresentation>,
+    pub attention_bar_reason: Option<String>,
 }
 
 /// Extract headline, detail, and alert strings from an optional `TacticalSynthesis`.
@@ -75,6 +79,7 @@ pub struct AppState {
     pub summaries: BTreeMap<SessionId, TacticalSynthesis>,
     pub auto_nudge_enabled: BTreeMap<SessionId, bool>,
     pub last_nudges: BTreeMap<SessionId, String>,
+    pub last_nudge_sent_age_secs: BTreeMap<SessionId, u64>,
 }
 
 impl AppState {
@@ -87,6 +92,7 @@ impl AppState {
             summaries: BTreeMap::new(),
             auto_nudge_enabled: BTreeMap::new(),
             last_nudges: BTreeMap::new(),
+            last_nudge_sent_age_secs: BTreeMap::new(),
         }
     }
 
@@ -136,6 +142,11 @@ impl AppState {
             } else {
                 self.last_nudges.remove(&session.record.id);
             }
+            if let Some(age) = session.last_sent_age_secs {
+                self.last_nudge_sent_age_secs.insert(session.record.id, age);
+            } else {
+                self.last_nudge_sent_age_secs.remove(&session.record.id);
+            }
         }
 
         // Remove observations, socket names, and summaries for sessions no longer present.
@@ -148,6 +159,8 @@ impl AppState {
         self.auto_nudge_enabled
             .retain(|id, _| session_ids.contains(id));
         self.last_nudges.retain(|id, _| session_ids.contains(id));
+        self.last_nudge_sent_age_secs
+            .retain(|id, _| session_ids.contains(id));
 
         // Update workspace state with the latest session records.
         let records = snapshot.sessions.iter().map(|s| s.record.clone()).collect();
@@ -192,6 +205,20 @@ impl AppState {
                     attention_presentation(self.summaries.get(&session.id))
                         .map(|(presentation, reason)| (Some(presentation), reason))
                         .unwrap_or((None, None));
+                let (attention_bar, attention_bar_reason) =
+                    attention_bar_presentation(self.summaries.get(&session.id))
+                        .map(|(presentation, reason)| (Some(presentation), reason))
+                        .unwrap_or((None, None));
+                let auto_nudge_enabled = self
+                    .auto_nudge_enabled
+                    .get(&session.id)
+                    .copied()
+                    .unwrap_or(false);
+                let cooldown_active = self
+                    .last_nudge_sent_age_secs
+                    .get(&session.id)
+                    .copied()
+                    .is_some_and(|age| age < 120);
                 CardRenderData {
                     id: session.id,
                     title,
@@ -210,11 +237,13 @@ impl AppState {
                     alert,
                     attention,
                     attention_reason,
-                    auto_nudge_enabled: self
-                        .auto_nudge_enabled
-                        .get(&session.id)
-                        .copied()
-                        .unwrap_or(false),
+                    attention_bar,
+                    attention_bar_reason,
+                    nudge_state: nudge_state_presentation(
+                        auto_nudge_enabled,
+                        cooldown_active,
+                        false,
+                    ),
                     last_nudge: self.last_nudges.get(&session.id).cloned(),
                 }
             })
@@ -240,6 +269,9 @@ impl AppState {
         let (attention, attention_reason) = attention_presentation(summary)
             .map(|(presentation, reason)| (Some(presentation), reason))
             .unwrap_or((None, None));
+        let (attention_bar, attention_bar_reason) = attention_bar_presentation(summary)
+            .map(|(presentation, reason)| (Some(presentation), reason))
+            .unwrap_or((None, None));
         Some(FocusRenderData {
             id: session_id,
             title,
@@ -251,6 +283,8 @@ impl AppState {
             ),
             attention,
             attention_reason,
+            attention_bar,
+            attention_bar_reason,
         })
     }
 
@@ -486,6 +520,33 @@ mod tests {
     }
 
     #[test]
+    fn card_render_data_uses_attention_bar_and_cooldown_nudge_state() {
+        use exaterm_types::synthesis::{AttentionLevel, TacticalState, TacticalSynthesis};
+
+        let mut state = AppState::new();
+        let mut snap = make_session_snapshot(1, "Shell 1", SessionStatus::Running);
+        snap.summary = Some(TacticalSynthesis {
+            tactical_state: TacticalState::Working,
+            tactical_state_brief: Some("Routine setup".into()),
+            attention_level: AttentionLevel::Guide,
+            attention_brief: Some("Operator should keep watching this setup.".into()),
+            headline: Some("Setup is moving but still deserves active supervision.".into()),
+        });
+        snap.auto_nudge_enabled = true;
+        snap.last_sent_age_secs = Some(30);
+
+        state.apply_snapshot(&make_snapshot(vec![snap]));
+
+        let cards = state.card_render_data();
+        assert_eq!(cards[0].attention_bar.unwrap().fill, 3);
+        assert_eq!(
+            cards[0].attention_bar_reason.as_deref(),
+            Some("Operator should keep watching this setup.")
+        );
+        assert_eq!(cards[0].nudge_state.label, "AUTONUDGE COOLDOWN");
+    }
+
+    #[test]
     fn select_next_session_cycles_forward() {
         let mut state = AppState::new();
         let snapshot = make_snapshot(vec![
@@ -693,5 +754,30 @@ mod tests {
 
         let summaries = state.session_summaries();
         assert_eq!(summaries[0].2, BattleCardStatus::Idle);
+    }
+
+    #[test]
+    fn focus_render_data_includes_attention_bar() {
+        use exaterm_types::synthesis::{AttentionLevel, TacticalState, TacticalSynthesis};
+
+        let mut state = AppState::new();
+        let mut snap = make_session_snapshot(1, "Shell", SessionStatus::Running);
+        snap.summary = Some(TacticalSynthesis {
+            tactical_state: TacticalState::Blocked,
+            tactical_state_brief: Some("Waiting on operator".into()),
+            attention_level: AttentionLevel::Intervene,
+            attention_brief: Some("Operator action is required before progress can resume.".into()),
+            headline: Some("Hard stop waiting on operator input.".into()),
+        });
+
+        state.apply_snapshot(&make_snapshot(vec![snap]));
+
+        let focus = state.focus_render_data(SessionId(1)).unwrap();
+        assert_eq!(focus.attention.unwrap().label, "INTERVENE");
+        assert_eq!(focus.attention_bar.unwrap().fill, 4);
+        assert_eq!(
+            focus.attention_bar_reason.as_deref(),
+            Some("Operator action is required before progress can resume.")
+        );
     }
 }

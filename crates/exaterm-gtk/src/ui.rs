@@ -4,40 +4,43 @@ use crate::actions::{
 use crate::beachhead::BeachheadConnection;
 use crate::style::{
     apply_battle_card_surface_style, apply_battle_status_style, configure_app_icons, load_css,
-    status_chip_label,
 };
 use crate::terminal_adapter::{
-    ClientDisplayRuntime, attach_display_runtime, measured_terminal_size_hint,
-    spawn_daemon_display_bridge, spawn_runtime, terminal_size_hint,
+    attach_display_runtime, measured_terminal_size_hint, spawn_daemon_display_bridge,
+    spawn_runtime, terminal_size_hint, ClientDisplayRuntime,
 };
-use crate::widgets::{FocusWidgets, SegmentedBarWidgets, SessionCardWidgets, build_segmented_bar};
+use crate::widgets::{build_segmented_bar, FocusWidgets, SegmentedBarWidgets, SessionCardWidgets};
 use exaterm_core::model::{
     blocking_prompt_launch, planning_stream_launch, running_stream_launch, ssh_shell_launch,
     user_shell_launch,
 };
 use exaterm_core::observation::{
-    SessionObservation, apply_stream_update, build_naming_evidence, build_nudge_evidence,
-    build_tactical_evidence, is_bare_waiting_shell,
-    refresh_observation as refresh_session_observation, scrollback_fragments,
+    apply_stream_update, build_naming_evidence, build_nudge_evidence, build_tactical_evidence,
+    is_bare_waiting_shell, refresh_observation as refresh_session_observation,
+    scrollback_fragments, SessionObservation,
 };
 use exaterm_core::runtime::{RuntimeEvent, SessionRuntime};
 use exaterm_core::synthesis::{
-    NamingEvidence, NudgeEvidence, OpenAiNamingConfig, OpenAiNudgeConfig, OpenAiSynthesisConfig,
-    TacticalEvidence, name_signature, nudge_signature, suggest_name_blocking,
-    suggest_nudge_blocking, summarize_blocking, summary_signature,
+    name_signature, nudge_signature, suggest_name_blocking, suggest_nudge_blocking,
+    summarize_blocking, summary_signature, NamingEvidence, NudgeEvidence, OpenAiNamingConfig,
+    OpenAiNudgeConfig, OpenAiSynthesisConfig, TacticalEvidence,
 };
 use exaterm_types::model::{SessionId, SessionLaunch, SessionRecord};
 use exaterm_types::proto::{ClientMessage, ObservationSnapshot, ServerMessage, WorkspaceSnapshot};
 use exaterm_types::synthesis::{
     AttentionLevel, NameSuggestion, NudgeSuggestion, TacticalState, TacticalSynthesis,
 };
-use exaterm_ui::beachhead::{BeachheadTarget, RunMode, parse_run_mode};
+use exaterm_ui::beachhead::{parse_run_mode, BeachheadTarget, RunMode};
 use exaterm_ui::layout::{
     battlefield_can_embed_terminals, battlefield_columns,
     visible_scrollback_line_capacity as layout_visible_scrollback_line_capacity,
 };
+use exaterm_ui::presentation::{
+    attention_bar_presentation, chrome_visibility, combined_focus_summary_text,
+    nudge_state_presentation, status_chip_label, ChromeVisibility as CardChromeVisibility,
+};
 use exaterm_ui::supervision::{
-    BattleCardStatus, BattleCardViewModel, ObservedActivity, SignalTone, build_battle_card,
+    build_battle_card, BattleCardStatus, BattleCardViewModel, ObservedActivity, SignalTone,
 };
 use exaterm_ui::workspace_view::WorkspaceViewState;
 use gtk::gdk;
@@ -52,7 +55,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use vte::prelude::*;
@@ -218,34 +221,12 @@ impl CardChromeMode {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct CardChromeVisibility {
-    title_visible: bool,
-    headline_visible: bool,
-    status_visible: bool,
-    header_visible: bool,
-    bars_visible: bool,
-    nudge_state_visible: bool,
-    nudge_row_visible: bool,
-}
-
 fn card_chrome_visibility(
     chrome_mode: CardChromeMode,
     focus_mode: bool,
     has_operator_summary: bool,
 ) -> CardChromeVisibility {
-    let summarized = chrome_mode.summarized();
-    let title_visible = summarized;
-    let status_visible = summarized;
-    CardChromeVisibility {
-        title_visible,
-        headline_visible: summarized,
-        status_visible,
-        header_visible: title_visible || status_visible,
-        bars_visible: summarized && !focus_mode,
-        nudge_state_visible: summarized && !focus_mode,
-        nudge_row_visible: has_operator_summary || (summarized && !focus_mode),
-    }
+    chrome_visibility(chrome_mode.summarized(), focus_mode, has_operator_summary)
 }
 
 pub(crate) struct AppContext {
@@ -2474,17 +2455,20 @@ fn apply_metric_widgets(
     summary: Option<&TacticalSynthesis>,
     _idle_seconds: Option<u64>,
 ) {
-    let attention = attention_bar_value(summary);
+    let attention = attention_bar_presentation(summary);
     apply_segmented_bar(&card.momentum_bar, attention.as_ref(), summary.is_some());
     apply_segmented_bar(&card.risk_bar, None, false);
 }
 
 fn apply_segmented_bar(
     bar: &SegmentedBarWidgets,
-    value: Option<&(usize, &'static str, Option<String>)>,
+    value: Option<&(
+        exaterm_ui::presentation::SegmentedBarPresentation,
+        Option<String>,
+    )>,
     show_when_empty: bool,
 ) {
-    let Some((fill, css_class, reason)) = value else {
+    let Some((presentation, reason)) = value else {
         bar.frame.set_visible(show_when_empty);
         bar.reason.set_label("");
         bar.frame.set_tooltip_text(None::<&str>);
@@ -2521,28 +2505,12 @@ fn apply_segmented_bar(
         ] {
             segment.remove_css_class(css);
         }
-        if index < *fill {
-            segment.add_css_class(css_class);
+        if index < presentation.fill {
+            segment.add_css_class(presentation.css_class);
         } else {
             segment.add_css_class("bar-empty");
         }
     }
-}
-
-fn attention_bar_value(
-    summary: Option<&TacticalSynthesis>,
-) -> Option<(usize, &'static str, Option<String>)> {
-    if let Some(summary) = summary {
-        let hint = summary.attention_brief.clone();
-        return Some(match summary.attention_level {
-            AttentionLevel::Autopilot => (1, "bar-attention-1", hint),
-            AttentionLevel::Monitor => (2, "bar-attention-2", hint),
-            AttentionLevel::Guide => (3, "bar-attention-3", hint),
-            AttentionLevel::Intervene => (4, "bar-attention-4", hint),
-            AttentionLevel::Takeover => (5, "bar-attention-5", hint),
-        });
-    }
-    None
 }
 
 fn apply_focus_attention_pill(pill: &gtk::Label, summary: Option<&TacticalSynthesis>) {
@@ -2574,25 +2542,6 @@ fn apply_focus_attention_pill(pill: &gtk::Label, summary: Option<&TacticalSynthe
     pill.add_css_class(css);
     pill.set_tooltip_text(summary.attention_brief.as_deref());
     pill.set_visible(true);
-}
-
-fn combined_focus_summary_text(headline: &str, attention_brief: Option<&str>) -> String {
-    let headline = headline.trim();
-    let attention_brief = attention_brief.unwrap_or("").trim();
-    match (headline.is_empty(), attention_brief.is_empty()) {
-        (false, false) => {
-            let separator =
-                if headline.ends_with('.') || headline.ends_with('!') || headline.ends_with('?') {
-                    " "
-                } else {
-                    ". "
-                };
-            format!("{headline}{separator}{attention_brief}")
-        }
-        (false, true) => headline.to_string(),
-        (true, false) => attention_brief.to_string(),
-        (true, true) => String::new(),
-    }
 }
 
 fn apply_attention_pill(pill: &gtk::Label, summary: Option<&TacticalSynthesis>) {
@@ -2908,7 +2857,7 @@ fn refresh_focus_panel(context: &Rc<AppContext>) {
     context.focus.bars.set_visible(false);
     apply_segmented_bar(
         &context.focus.momentum_bar,
-        attention_bar_value(live_summary.as_ref()).as_ref(),
+        attention_bar_presentation(live_summary.as_ref()).as_ref(),
         live_summary.is_some(),
     );
     apply_segmented_bar(&context.focus.risk_bar, None, false);
@@ -3022,19 +2971,7 @@ fn apply_nudge_pill(
         .is_some_and(|sent| sent.elapsed() < Duration::from_secs(120));
     let hovered = cache.get(&session_id).is_some_and(|entry| entry.hovered);
     let enabled = cache.get(&session_id).is_some_and(|entry| entry.enabled);
-    let (text, css) = if hovered {
-        if enabled {
-            ("DISARM AUTONUDGE", "card-control-cooldown")
-        } else {
-            ("ARM AUTONUDGE", "card-control-off")
-        }
-    } else if cooldown_active {
-        ("AUTONUDGE COOLDOWN", "card-control-cooldown")
-    } else if enabled {
-        ("AUTONUDGE ARMED", "card-control-armed")
-    } else {
-        ("AUTONUDGE OFF", "card-control-off")
-    };
+    let presentation = nudge_state_presentation(enabled, cooldown_active, hovered);
 
     for candidate in [
         "card-control-off",
@@ -3044,8 +2981,8 @@ fn apply_nudge_pill(
     ] {
         state.remove_css_class(candidate);
     }
-    state.add_css_class(css);
-    state.set_label(text);
+    state.add_css_class(presentation.css_class);
+    state.set_label(presentation.label);
     state.set_visible(true);
 }
 
@@ -3084,7 +3021,7 @@ fn reparent_widget_to_box<W: IsA<gtk::Widget>>(widget: &W, target: &gtk::Box) {
 #[cfg(test)]
 mod tests {
     use super::{
-        CardChromeMode, RunMode, card_chrome_visibility, parse_run_mode, summary_refresh_interval,
+        card_chrome_visibility, parse_run_mode, summary_refresh_interval, CardChromeMode, RunMode,
     };
     use std::time::Duration;
 

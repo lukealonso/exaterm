@@ -20,8 +20,9 @@ use crate::style;
 use crate::terminal_view::TerminalRenderState;
 use exaterm_types::model::SessionId;
 use exaterm_ui::layout::{
-    CardRect, MARGIN, card_layout, card_terminal_slot_rect, focus_card_layout,
+    card_layout, card_terminal_slot_rect, focus_card_layout, CardRect, MARGIN,
 };
+use exaterm_ui::presentation::NudgeStateTone;
 
 // ---------------------------------------------------------------------------
 // Thread-local data bridge (main thread only)
@@ -225,6 +226,7 @@ fn draw_card(
     let pad_x = 16.0;
     let pad_y = 14.0;
     let mut y_cursor = rect.y + pad_y;
+    let content_width = rect.w - 32.0;
 
     // Title.
     let title_str = build_simple_attr_string(&card.title, &render.title_font, &render.title_color);
@@ -245,7 +247,7 @@ fn draw_card(
         draw_attention_chip(
             attention.label,
             attention.fill,
-            rect.x + rect.w - 140.0,
+            rect.x + rect.w - 132.0,
             &mut y_cursor,
             render,
         );
@@ -282,16 +284,30 @@ fn draw_card(
         };
     }
 
+    if let Some(ref detail) = card.detail {
+        if !detail.is_empty() && !embedded_terminal {
+            let detail_str =
+                build_simple_attr_string(detail, &render.alert_font, &render.alert_color);
+            detail_str.drawInRect(NSRect::new(
+                NSPoint::new(rect.x + pad_x, y_cursor),
+                NSSize::new(content_width, 36.0),
+            ));
+            y_cursor += 28.0;
+        }
+    }
+
     // Alert.
     if let Some(ref alert_text) = card.alert {
-        let alert_line = format!("\u{26a0} {}", alert_text);
-        let alert_str =
-            build_simple_attr_string(&alert_line, &render.alert_font, &render.alert_color);
-        alert_str.drawAtPoint(NSPoint {
-            x: rect.x + pad_x,
-            y: y_cursor,
-        });
-        y_cursor += 18.0;
+        if !alert_text.is_empty() {
+            let alert_line = format!("! {}", alert_text);
+            let alert_str =
+                build_simple_attr_string(&alert_line, &render.alert_font, &render.alert_color);
+            alert_str.drawInRect(NSRect::new(
+                NSPoint::new(rect.x + pad_x, y_cursor),
+                NSSize::new(content_width, 32.0),
+            ));
+            y_cursor += 24.0;
+        }
     }
 
     // Recency.
@@ -302,20 +318,14 @@ fn draw_card(
             x: rect.x + pad_x,
             y: y_cursor,
         });
-        y_cursor += 18.0;
-
-        let nudge_label = if card.auto_nudge_enabled {
-            "AUTONUDGE ON"
-        } else {
-            "AUTONUDGE OFF"
-        };
-        let nudge_str =
-            build_simple_attr_string(nudge_label, &render.recency_font, &render.recency_color);
-        nudge_str.drawAtPoint(NSPoint {
-            x: rect.x + pad_x,
-            y: y_cursor,
-        });
-        y_cursor += 18.0;
+        draw_nudge_chip(
+            card.nudge_state.label,
+            card.nudge_state.tone,
+            rect.x + rect.w - 164.0,
+            y_cursor - 2.0,
+            render,
+        );
+        y_cursor += 26.0;
     }
 
     if embedded_terminal {
@@ -329,39 +339,43 @@ fn draw_card(
         let label =
             build_simple_attr_string("LIVE TERMINAL", &render.recency_font, &render.recency_color);
         label.drawAtPoint(NSPoint::new(slot.x + 10.0, slot.y + 8.0));
+        if let Some(attention_bar) = card.attention_bar {
+            draw_attention_condition_bar(
+                rect.x + pad_x,
+                (slot.y - 52.0).max(y_cursor),
+                content_width,
+                attention_bar.fill,
+                card.attention_bar_reason.as_deref(),
+                render,
+            );
+        }
         NSGraphicsContext::restoreGraphicsState_class();
         return;
     }
 
-    if !focused_mode {
-        if let Some(ref nudge) = card.last_nudge {
-            let nudge_preview = format!("Nudge: {}", nudge);
-            let nudge_preview_str = build_simple_attr_string(
-                &nudge_preview,
-                &render.scrollback_font,
-                &render.scrollback_color,
-            );
-            nudge_preview_str.drawAtPoint(NSPoint {
-                x: rect.x + pad_x,
-                y: y_cursor,
-            });
-            y_cursor += 16.0;
-        }
+    let transcript_lines = transcript_lines(card);
+    if !transcript_lines.is_empty() {
+        let transcript_height = (transcript_lines.len() as f64 * 18.0) + 16.0;
+        draw_transcript_block(
+            rect.x + pad_x,
+            y_cursor,
+            content_width,
+            transcript_height,
+            &transcript_lines,
+            render,
+        );
+        y_cursor += transcript_height + 10.0;
     }
 
-    // Scrollback lines.
-    let max_y = rect.y + rect.h - 8.0;
-    for line in &card.scrollback {
-        if y_cursor > max_y {
-            break;
-        }
-        let line_str =
-            build_simple_attr_string(line, &render.scrollback_font, &render.scrollback_color);
-        line_str.drawAtPoint(NSPoint {
-            x: rect.x + pad_x,
-            y: y_cursor,
-        });
-        y_cursor += if focused_mode { 14.0 } else { 16.0 };
+    if let Some(attention_bar) = card.attention_bar {
+        draw_attention_condition_bar(
+            rect.x + pad_x,
+            y_cursor,
+            content_width,
+            attention_bar.fill,
+            card.attention_bar_reason.as_deref(),
+            render,
+        );
     }
 
     NSGraphicsContext::restoreGraphicsState_class();
@@ -425,6 +439,104 @@ fn draw_attention_chip(
         x: x + 8.0,
         y: *y_cursor + 2.0,
     });
+}
+
+fn draw_nudge_chip(
+    label: &str,
+    tone: NudgeStateTone,
+    x: f64,
+    y: f64,
+    render: &TerminalRenderState,
+) {
+    let chip_w = label.len() as f64 * 6.9 + 18.0;
+    let chip_rect = NSRect::new(NSPoint::new(x, y), NSSize::new(chip_w, 22.0));
+    let chip_path = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(chip_rect, 10.0, 10.0);
+    render.nudge_bg_color(tone).setFill();
+    chip_path.fill();
+    let chip_str =
+        build_simple_attr_string(label, &render.status_font, render.nudge_text_color(tone));
+    chip_str.drawAtPoint(NSPoint::new(x + 9.0, y + 3.0));
+}
+
+fn draw_transcript_block(
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    lines: &[String],
+    render: &TerminalRenderState,
+) {
+    let rect = NSRect::new(NSPoint::new(x, y), NSSize::new(width, height));
+    let path = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(rect, 12.0, 12.0);
+    render.transcript_bg.setFill();
+    path.fill();
+    render.transcript_border.setStroke();
+    path.setLineWidth(1.0);
+    path.stroke();
+
+    let mut line_y = y + 10.0;
+    for line in lines {
+        let line_str =
+            build_simple_attr_string(line, &render.scrollback_font, &render.scrollback_color);
+        line_str.drawAtPoint(NSPoint::new(x + 10.0, line_y));
+        line_y += 18.0;
+    }
+}
+
+fn draw_attention_condition_bar(
+    x: f64,
+    y: f64,
+    width: f64,
+    fill: usize,
+    reason: Option<&str>,
+    render: &TerminalRenderState,
+) {
+    let caption = build_simple_attr_string(
+        "ATTENTION CONDITION",
+        &render.bar_caption_font,
+        &render.bar_caption_color,
+    );
+    caption.drawAtPoint(NSPoint::new(x, y));
+
+    let segment_y = y + 18.0;
+    let gap = 4.0;
+    let segment_width = ((width - (gap * 4.0)).max(0.0)) / 5.0;
+    for index in 0..5 {
+        let segment_x = x + (index as f64 * (segment_width + gap));
+        let rect = NSRect::new(
+            NSPoint::new(segment_x, segment_y),
+            NSSize::new(segment_width, 8.0),
+        );
+        let path = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(rect, 4.0, 4.0);
+        if index < fill {
+            render.attention_bar_fill(fill).setFill();
+        } else {
+            render.bar_empty.setFill();
+        }
+        path.fill();
+    }
+
+    if let Some(reason) = reason {
+        if !reason.is_empty() {
+            let reason_str =
+                build_simple_attr_string(reason, &render.bar_reason_font, &render.bar_reason_color);
+            reason_str.drawInRect(NSRect::new(
+                NSPoint::new(x, segment_y + 14.0),
+                NSSize::new(width, 42.0),
+            ));
+        }
+    }
+}
+
+fn transcript_lines(card: &CardRenderData) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(nudge) = card.last_nudge.as_deref() {
+        if !nudge.is_empty() {
+            lines.push(format!("Nudge: {nudge}"));
+        }
+    }
+    lines.extend(card.scrollback.iter().take(4).cloned());
+    lines
 }
 
 #[cfg(test)]
