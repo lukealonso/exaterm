@@ -1,8 +1,6 @@
 mod app_delegate;
 mod app_state;
 mod battlefield_view;
-mod beachhead;
-mod event_bridge;
 mod key_map;
 mod menu;
 mod session_io;
@@ -12,9 +10,12 @@ mod window;
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 fn main() {
-    if std::env::args().nth(1).as_deref() == Some("--beachhead-daemon") {
+    let argv = std::env::args().collect::<Vec<_>>();
+    if argv.get(1).map(|s| s.as_str()) == Some("--beachhead-daemon") {
         let code = exaterm_core::run_local_daemon();
         std::process::exit(if code == std::process::ExitCode::SUCCESS {
             0
@@ -22,10 +23,18 @@ fn main() {
             1
         });
     }
-    run_app();
+    let mode = match exaterm_ui::beachhead::parse_run_mode(argv.into_iter().skip(1)) {
+        Ok(mode) => mode,
+        Err(error) => {
+            eprintln!("{error}");
+            eprintln!("usage: exaterm [--ssh user@host]");
+            std::process::exit(2);
+        }
+    };
+    run_app(mode);
 }
 
-fn run_app() {
+fn run_app(mode: exaterm_ui::beachhead::RunMode) {
     use objc2::rc::Retained;
     use objc2::runtime::ProtocolObject;
     use objc2::{MainThreadMarker, MainThreadOnly};
@@ -45,27 +54,30 @@ fn run_app() {
     app.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
 
     // Connect to the daemon.
-    let beachhead = match exaterm_core::daemon::LocalBeachheadClient::connect_or_spawn() {
+    let target = exaterm_ui::beachhead::BeachheadTarget::from(&mode);
+    let beachhead = match exaterm_ui::beachhead::BeachheadConnection::connect(&target) {
         Ok(client) => client,
         Err(error) => {
-            eprintln!("exaterm: failed to connect to daemon: {error}");
+            present_startup_error(mtm, &error);
             std::process::exit(1);
         }
     };
 
     // Request the default workspace.
     let _ = beachhead
-        .commands
+        .commands()
         .send(exaterm_types::proto::ClientMessage::CreateOrResumeDefaultWorkspace);
 
     // Store command sender for menu actions (thread-local, used by AppDelegate).
-    app_delegate::set_command_sender(beachhead.commands.clone());
+    app_delegate::set_command_sender(beachhead.commands().clone());
 
     let beachhead = Rc::new(beachhead);
 
     // Shared mutable state.
     let state = Rc::new(RefCell::new(app_state::AppState::new()));
     let session_ios = Rc::new(RefCell::new(session_io::SessionIOMap::new()));
+    let sync_inputs_enabled = Arc::new(AtomicBool::new(false));
+    app_delegate::set_sync_inputs_state(sync_inputs_enabled.clone());
 
     // Create and configure the main window.
     let style_mask = NSWindowStyleMask::Titled
@@ -148,6 +160,20 @@ fn run_app() {
     terminal_view.setFrame(content_view.frame());
     battlefield_view.setFrame(content_view.frame());
 
+    let battlefield_state = Rc::clone(&state);
+    let battlefield_window = main_window.clone();
+    let battlefield_terminal_view = terminal_view.clone();
+    battlefield_view::set_interaction_handler(move |interaction| match interaction {
+        battlefield_view::BattlefieldInteraction::Select(session_id) => {
+            battlefield_state.borrow_mut().workspace.select_session(session_id);
+            battlefield_window.makeFirstResponder(None);
+        }
+        battlefield_view::BattlefieldInteraction::Focus(session_id) => {
+            battlefield_state.borrow_mut().workspace.enter_focus_mode(session_id);
+            battlefield_window.makeFirstResponder(Some(&*battlefield_terminal_view));
+        }
+    });
+
     content_view.addSubview(&terminal_view);
     content_view.addSubview(&battlefield_view);
     main_window.setContentView(Some(&content_view));
@@ -183,10 +209,15 @@ fn run_app() {
     // Wire the SwiftTerm input handler so keystrokes reach the PTY.
     let input_ios = Rc::clone(&session_ios);
     let input_state = Rc::clone(&state);
+    let input_sync = sync_inputs_enabled.clone();
     timer_bridge.set_input_handler(move |bytes: &[u8]| {
-        let focused = input_state.borrow().workspace.focused_session();
-        if let Some(id) = focused {
-            input_ios.borrow_mut().write_input(&id, bytes);
+        if input_sync.load(std::sync::atomic::Ordering::Relaxed) {
+            input_ios.borrow_mut().write_input_all(bytes);
+        } else {
+            let focused = input_state.borrow().workspace.focused_session();
+            if let Some(id) = focused {
+                input_ios.borrow_mut().write_input(&id, bytes);
+            }
         }
     });
 
@@ -196,7 +227,7 @@ fn run_app() {
     timer_bridge.set_size_handler(move |size| {
         let focused = resize_state.borrow().workspace.focused_session();
         if let Some(session_id) = focused {
-            let _ = resize_beachhead.commands.send(
+            let _ = resize_beachhead.commands().send(
                 exaterm_types::proto::ClientMessage::ResizeTerminal {
                     session_id,
                     rows: size.rows,
@@ -209,7 +240,7 @@ fn run_app() {
     let timer_displayed_focus = Rc::clone(&displayed_focus);
     let timer_block = block2::StackBlock::new(move |_timer: std::ptr::NonNull<objc2_foundation::NSTimer>| {
         // Drain all pending events from the daemon.
-        while let Ok(message) = timer_beachhead.events.try_recv() {
+        while let Ok(message) = timer_beachhead.events().try_recv() {
             match message {
                 exaterm_types::proto::ServerMessage::WorkspaceSnapshot { snapshot } => {
                     timer_state.borrow_mut().apply_snapshot(&snapshot);
@@ -220,20 +251,25 @@ fn run_app() {
             }
             timer_beachhead.drain_event_wake();
 
-            // Update the first session ID for menu actions (e.g., New Shell).
-            let first_id = timer_state
-                .borrow()
-                .workspace
-                .sessions()
-                .first()
-                .map(|s| s.id);
-            app_delegate::set_first_session(first_id);
+        // Update the first session ID for menu actions (e.g., New Shell).
+        let borrowed_state = timer_state.borrow();
+        let first_id = borrowed_state.workspace.sessions().first().map(|s| s.id);
+        app_delegate::set_first_session(first_id);
+        app_delegate::set_selected_session(borrowed_state.workspace.selected_session());
+        app_delegate::set_has_sessions(!borrowed_state.workspace.sessions().is_empty());
+        let selected_auto_nudge = borrowed_state
+            .workspace
+            .selected_session()
+            .and_then(|id| borrowed_state.auto_nudge_enabled.get(&id).copied())
+            .unwrap_or(false);
+        app_delegate::set_selected_auto_nudge(selected_auto_nudge);
+        drop(borrowed_state);
 
         // Connect to any new session raw streams.
         {
             let borrowed = timer_state.borrow();
             let mut ios = timer_ios.borrow_mut();
-            ios.connect_new_sessions(&borrowed.raw_socket_names);
+            ios.connect_new_sessions(&timer_beachhead.raw_session_connector(), &borrowed.raw_socket_names);
 
             let borrowed = timer_state.borrow();
             let focused = borrowed.workspace.focused_session();
@@ -246,7 +282,7 @@ fn run_app() {
                 timer_bridge.clear();
                 if let Some(session_id) = focused {
                     let size = timer_bridge.terminal_size();
-                    let _ = timer_beachhead.commands.send(
+                    let _ = timer_beachhead.commands().send(
                         exaterm_types::proto::ClientMessage::ResizeTerminal {
                             session_id,
                             rows: size.rows,
@@ -309,9 +345,6 @@ fn run_app() {
             let flags = event_ref.modifierFlags();
 
             let modifiers = key_map::Modifiers {
-                shift: flags.contains(objc2_app_kit::NSEventModifierFlags::Shift),
-                control: flags.contains(objc2_app_kit::NSEventModifierFlags::Control),
-                option: flags.contains(objc2_app_kit::NSEventModifierFlags::Option),
                 command: flags.contains(objc2_app_kit::NSEventModifierFlags::Command),
             };
 
@@ -381,12 +414,47 @@ fn run_app() {
     // Show the window.
     main_window.makeKeyAndOrderFront(None);
     app.activate();
+    if exaterm_core::synthesis::OpenAiSynthesisConfig::from_env().is_none() {
+        present_openai_key_warning(mtm, &main_window);
+    }
 
     // Keep everything alive for the lifetime of the app.
     std::mem::forget(main_window);
     std::mem::forget(beachhead);
     std::mem::forget(state);
     std::mem::forget(session_ios);
+    std::mem::forget(sync_inputs_enabled);
 
     app.run();
+}
+
+fn present_startup_error(mtm: objc2::MainThreadMarker, error: &str) {
+    use objc2_app_kit::{NSAlert, NSAlertStyle};
+    use objc2_foundation::NSString;
+
+    let alert = NSAlert::new(mtm);
+    alert.setAlertStyle(NSAlertStyle::Critical);
+    let message = NSString::from_str("Exaterm could not start a live beachhead connection.");
+    let info = NSString::from_str(error);
+    alert.setMessageText(&message);
+    alert.setInformativeText(&info);
+    alert.runModal();
+}
+
+fn present_openai_key_warning(
+    mtm: objc2::MainThreadMarker,
+    _window: &objc2_app_kit::NSWindow,
+) {
+    use objc2_app_kit::{NSAlert, NSAlertStyle};
+    use objc2_foundation::NSString;
+
+    let alert = NSAlert::new(mtm);
+    alert.setAlertStyle(NSAlertStyle::Warning);
+    let message = NSString::from_str("OpenAI API key missing");
+    let info = NSString::from_str(
+        "Exaterm started, but OPENAI_API_KEY is not set. Tactical summaries, naming, and auto-nudge are disabled until you provide a key.",
+    );
+    alert.setMessageText(&message);
+    alert.setInformativeText(&info);
+    alert.runModal();
 }

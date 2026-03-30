@@ -1,5 +1,6 @@
 pub mod action;
 pub mod app_state;
+pub mod beachhead;
 pub mod css;
 pub mod layout;
 pub mod supervision;
