@@ -424,10 +424,10 @@ impl LocalBeachheadClient {
     }
 
     pub fn connect_control(control: UnixStream) -> Result<Self, String> {
-        let control_reader = control
+        let control_writer = control
             .try_clone()
             .map_err(|error| format!("failed to clone beachhead socket: {error}"))?;
-        let control_writer = control;
+        let control_reader = control;
         let (event_wake_reader, mut event_wake_writer) = UnixStream::pair()
             .map_err(|error| format!("failed to create event wake socket: {error}"))?;
         event_wake_reader
@@ -611,6 +611,9 @@ fn run_local_daemon_inner() -> Result<(), String> {
             loop {
                 match control_listener.accept() {
                     Ok((stream, _)) => {
+                        // Accepted sockets inherit non-blocking on macOS; reset to blocking
+                        // so the client reader thread can use blocking read_line.
+                        let _ = stream.set_nonblocking(false);
                         if client_writer.is_some() {
                             let mut stream = stream;
                             let _ = write_json_line(
@@ -644,6 +647,8 @@ fn run_local_daemon_inner() -> Result<(), String> {
             loop {
                 match stream.listener.accept() {
                     Ok((socket, _)) => {
+                        // Accepted sockets inherit non-blocking on macOS; reset to blocking.
+                        let _ = socket.set_nonblocking(false);
                         let reader = socket.try_clone().map_err(|error| {
                             format!("failed to clone session raw stream: {error}")
                         })?;

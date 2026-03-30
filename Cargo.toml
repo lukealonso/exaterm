@@ -4,6 +4,7 @@ members = [
     "crates/exaterm-core",
     "crates/exaterm-ui",
     "crates/exaterm-gtk",
+    "crates/exaterm-macos",
     "crates/exatermd",
 ]
 default-members = ["crates/exaterm-gtk"]

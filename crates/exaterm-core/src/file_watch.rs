@@ -3,14 +3,24 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 
 pub struct RepoWatchHandle {
-    _watcher: RecommendedWatcher,
+    _watcher: Option<RecommendedWatcher>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl RepoWatchHandle {
     pub fn stop(mut self) {
         // Drop the watcher first to close the sender, unblocking the receiver thread
-        drop(self._watcher);
+        drop(self._watcher.take());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for RepoWatchHandle {
+    fn drop(&mut self) {
+        // Drop the watcher first to close the sender, unblocking the receiver thread
+        drop(self._watcher.take());
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -40,6 +50,7 @@ where
 
     // Canonicalize so strip_prefix works when the OS reports canonical paths
     // (e.g., macOS resolves /tmp → /private/tmp in FSEvents)
+    let original_root = root.clone();
     let watch_root = root.canonicalize().unwrap_or(root);
     let thread = std::thread::spawn(move || {
         for result in rx {
@@ -63,7 +74,10 @@ where
                 // Canonicalize the event path too, since on some platforms
                 // the event path may use a different form than the watch root
                 let canonical_path = path.canonicalize().unwrap_or_else(|_| path.clone());
-                if let Ok(relative) = canonical_path.strip_prefix(&watch_root) {
+                let relative = canonical_path
+                    .strip_prefix(&watch_root)
+                    .or_else(|_| canonical_path.strip_prefix(&original_root));
+                if let Ok(relative) = relative {
                     let rel_str = relative.display().to_string();
                     if !rel_str.is_empty() {
                         on_event(rel_str);
@@ -74,7 +88,7 @@ where
     });
 
     Ok(RepoWatchHandle {
-        _watcher: watcher,
+        _watcher: Some(watcher),
         thread: Some(thread),
     })
 }

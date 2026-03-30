@@ -1,0 +1,54 @@
+[package]
+name = "exaterm-macos"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+exaterm-types = { path = "../exaterm-types" }
+exaterm-core = { path = "../exaterm-core" }
+exaterm-ui = { path = "../exaterm-ui" }
+libc = "0.2"
+objc2 = "0.6"
+block2 = "0.6"
+objc2-foundation = { version = "0.3", features = [
+    "NSRunLoop",
+    "NSTimer",
+    "NSDate",
+    "NSString",
+    "NSArray",
+    "NSThread",
+    "NSProcessInfo",
+    "NSNotification",
+    "NSDictionary",
+    "NSAttributedString",
+    "block2",
+] }
+objc2-app-kit = { version = "0.3", features = [
+    "NSApplication",
+    "NSRunningApplication",
+    "NSWindow",
+    "NSView",
+    "NSColor",
+    "NSControl",
+    "NSFont",
+    "NSFontDescriptor",
+    "NSEvent",
+    "NSMenu",
+    "NSMenuItem",
+    "NSPasteboard",
+    "NSTextField",
+    "NSScrollView",
+    "NSResponder",
+    "NSAppearance",
+    "NSGraphics",
+    "NSGraphicsContext",
+    "NSAttributedString",
+    "NSBezierPath",
+    "NSShadow",
+    "NSStringDrawing",
+    "block2",
+] }
+objc2-core-foundation = "0.3"
+alacritty_terminal = "0.25"
+portable-pty = "0.8"
+serde_json = "1"
