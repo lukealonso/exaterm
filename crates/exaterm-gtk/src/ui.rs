@@ -1,7 +1,7 @@
 use crate::actions::{
     insert_terminal_number, send_runtime_input_line, set_auto_nudge_hover, toggle_auto_nudge,
 };
-use crate::beachhead::{BeachheadConnection, BeachheadTarget};
+use crate::beachhead::BeachheadConnection;
 use crate::style::{
     apply_battle_card_surface_style, apply_battle_status_style, configure_app_icons, load_css,
     status_chip_label,
@@ -31,6 +31,7 @@ use exaterm_types::proto::{ClientMessage, ObservationSnapshot, ServerMessage, Wo
 use exaterm_types::synthesis::{
     AttentionLevel, NameSuggestion, NudgeSuggestion, TacticalState, TacticalSynthesis,
 };
+use exaterm_ui::beachhead::{BeachheadTarget, RunMode, parse_run_mode};
 use exaterm_ui::layout::{
     battlefield_can_embed_terminals, battlefield_columns,
     visible_scrollback_line_capacity as layout_visible_scrollback_line_capacity,
@@ -197,12 +198,6 @@ impl NudgeCacheEntry {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum RunMode {
-    Local,
-    Ssh { target: String },
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CardChromeMode {
     SparseShell,
@@ -303,23 +298,6 @@ pub fn run() -> glib::ExitCode {
         .cloned()
         .unwrap_or_else(|| "exaterm".to_string());
     app.run_with_args(&[program])
-}
-
-fn parse_run_mode(args: impl IntoIterator<Item = String>) -> Result<RunMode, String> {
-    let mut args = args.into_iter();
-    match args.next().as_deref() {
-        None => Ok(RunMode::Local),
-        Some("--ssh") => {
-            let Some(target) = args.next() else {
-                return Err("--ssh requires a target like user@host".into());
-            };
-            if args.next().is_some() {
-                return Err("unexpected extra arguments after --ssh target".into());
-            }
-            Ok(RunMode::Ssh { target })
-        }
-        Some(other) => Err(format!("unknown argument: {other}")),
-    }
 }
 
 pub(crate) fn daemon_backed(context: &AppContext) -> bool {

@@ -4,8 +4,8 @@ use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::sync::mpsc;
 
-use exaterm_core::daemon::connect_session_stream_socket;
 use exaterm_types::model::SessionId;
+use exaterm_ui::beachhead::RawSessionConnector;
 
 /// Bidirectional I/O bridge for a single session's raw PTY stream.
 pub struct SessionIO {
@@ -16,8 +16,12 @@ pub struct SessionIO {
 
 impl SessionIO {
     /// Connect to a session's raw stream socket and spawn a background reader thread.
-    pub fn connect(socket_name: &str) -> Result<Self, String> {
-        let stream = connect_session_stream_socket(socket_name)?;
+    pub fn connect(
+        connector: &RawSessionConnector,
+        session_id: SessionId,
+        socket_name: &str,
+    ) -> Result<Self, String> {
+        let stream = connector.connect_raw_session(session_id, socket_name)?;
         let reader_stream = stream
             .try_clone()
             .map_err(|e| format!("clone stream: {e}"))?;
@@ -69,13 +73,17 @@ impl SessionIOMap {
     }
 
     /// Attempt to connect any sessions whose raw socket name is known but not yet connected.
-    pub fn connect_new_sessions(&mut self, raw_socket_names: &BTreeMap<SessionId, String>) {
+    pub fn connect_new_sessions(
+        &mut self,
+        connector: &RawSessionConnector,
+        raw_socket_names: &BTreeMap<SessionId, String>,
+    ) {
         for (id, socket_name) in raw_socket_names {
             if self.connected_sockets.contains_key(id) {
                 continue;
             }
             self.connected_sockets.insert(*id, socket_name.clone());
-            match SessionIO::connect(socket_name) {
+            match SessionIO::connect(connector, *id, socket_name) {
                 Ok(session_io) => {
                     self.sessions.insert(*id, session_io);
                 }
@@ -93,14 +101,6 @@ impl SessionIOMap {
             .retain(|id, _| active_ids.contains(id));
     }
 
-    /// Drain raw output for a specific session. Returns empty vec if not connected.
-    pub fn drain_session_output(&mut self, id: &SessionId) -> Vec<u8> {
-        self.sessions
-            .get_mut(id)
-            .map(|s| s.drain_raw_output())
-            .unwrap_or_default()
-    }
-
     /// Drain raw output for all sessions, returning a map of session id to bytes.
     pub fn drain_all_output(&mut self) -> BTreeMap<SessionId, Vec<u8>> {
         let mut result = BTreeMap::new();
@@ -113,11 +113,6 @@ impl SessionIOMap {
         result
     }
 
-    /// Get the first connected session id (for single-session display).
-    pub fn first_session_id(&self) -> Option<SessionId> {
-        self.sessions.keys().next().copied()
-    }
-
     /// Write input bytes to a specific session.
     pub fn write_input(&mut self, id: &SessionId, bytes: &[u8]) {
         if let Some(session_io) = self.sessions.get_mut(id) {
@@ -125,9 +120,8 @@ impl SessionIOMap {
         }
     }
 
-    /// Write input bytes to the first connected session.
-    pub fn write_input_first(&mut self, bytes: &[u8]) {
-        if let Some(session_io) = self.sessions.values_mut().next() {
+    pub fn write_input_all(&mut self, bytes: &[u8]) {
+        for session_io in self.sessions.values_mut() {
             session_io.write_input(bytes);
         }
     }
@@ -159,12 +153,6 @@ fn spawn_output_reader(stream: UnixStream) -> mpsc::Receiver<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn session_io_map_starts_empty() {
-        let map = SessionIOMap::new();
-        assert!(map.first_session_id().is_none());
-    }
 
     #[test]
     fn retain_sessions_removes_absent_ids() {

@@ -21,6 +21,10 @@ pub struct CardRenderData {
     pub detail: Option<String>,
     /// Optional alert text (operator action recommendation).
     pub alert: Option<String>,
+    /// Whether auto-nudge is enabled for this session.
+    pub auto_nudge_enabled: bool,
+    /// Most recent auto-nudge text, if any.
+    pub last_nudge: Option<String>,
 }
 
 /// Extract headline, detail, and alert strings from an optional `TacticalSynthesis`.
@@ -51,6 +55,8 @@ pub struct AppState {
     pub recent_lines: BTreeMap<SessionId, Vec<String>>,
     pub raw_socket_names: BTreeMap<SessionId, String>,
     pub summaries: BTreeMap<SessionId, TacticalSynthesis>,
+    pub auto_nudge_enabled: BTreeMap<SessionId, bool>,
+    pub last_nudges: BTreeMap<SessionId, String>,
 }
 
 impl AppState {
@@ -61,6 +67,8 @@ impl AppState {
             recent_lines: BTreeMap::new(),
             raw_socket_names: BTreeMap::new(),
             summaries: BTreeMap::new(),
+            auto_nudge_enabled: BTreeMap::new(),
+            last_nudges: BTreeMap::new(),
         }
     }
 
@@ -101,6 +109,17 @@ impl AppState {
             }
         }
 
+        for session in &snapshot.sessions {
+            self.auto_nudge_enabled
+                .insert(session.record.id, session.auto_nudge_enabled);
+            if let Some(ref last_nudge) = session.last_nudge {
+                self.last_nudges
+                    .insert(session.record.id, last_nudge.clone());
+            } else {
+                self.last_nudges.remove(&session.record.id);
+            }
+        }
+
         // Remove observations, socket names, and summaries for sessions no longer present.
         let session_ids: Vec<_> = snapshot.sessions.iter().map(|s| s.record.id).collect();
         self.observations.retain(|id, _| session_ids.contains(id));
@@ -108,6 +127,9 @@ impl AppState {
         self.raw_socket_names
             .retain(|id, _| session_ids.contains(id));
         self.summaries.retain(|id, _| session_ids.contains(id));
+        self.auto_nudge_enabled
+            .retain(|id, _| session_ids.contains(id));
+        self.last_nudges.retain(|id, _| session_ids.contains(id));
 
         // Update workspace state with the latest session records.
         let records = snapshot.sessions.iter().map(|s| s.record.clone()).collect();
@@ -156,6 +178,12 @@ impl AppState {
                     headline,
                     detail,
                     alert,
+                    auto_nudge_enabled: self
+                        .auto_nudge_enabled
+                        .get(&session.id)
+                        .copied()
+                        .unwrap_or(false),
+                    last_nudge: self.last_nudges.get(&session.id).cloned(),
                 }
             })
             .collect()

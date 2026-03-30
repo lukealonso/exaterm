@@ -5,6 +5,6 @@ edition = "2021"
 
 [dependencies]
 exaterm-types = { path = "../exaterm-types" }
+exaterm-core = { path = "../exaterm-core" }
 
 [dev-dependencies]
-exaterm-core = { path = "../exaterm-core" }

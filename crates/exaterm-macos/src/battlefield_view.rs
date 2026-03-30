@@ -10,7 +10,7 @@ use objc2::define_class;
 use objc2::rc::Retained;
 use objc2::{AnyThread, MainThreadOnly};
 use objc2_app_kit::{
-    NSAttributedStringNSStringDrawing, NSBezierPath, NSColor, NSGraphicsContext, NSView,
+    NSAttributedStringNSStringDrawing, NSBezierPath, NSColor, NSEvent, NSGraphicsContext, NSView,
 };
 use objc2_foundation::{NSAttributedString, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString};
 
@@ -28,6 +28,13 @@ thread_local! {
     static CARDS: RefCell<Vec<CardRenderData>> = const { RefCell::new(Vec::new()) };
     static SELECTED: Cell<Option<SessionId>> = const { Cell::new(None) };
     static RENDER: RefCell<Option<Rc<TerminalRenderState>>> = RefCell::new(None);
+    static INTERACTION: RefCell<Option<Rc<dyn Fn(BattlefieldInteraction)>>> = RefCell::new(None);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BattlefieldInteraction {
+    Select(SessionId),
+    Focus(SessionId),
 }
 
 /// Push new card data for the next drawRect: cycle.
@@ -39,6 +46,13 @@ pub fn set_battlefield_data(
     CARDS.with(|c| *c.borrow_mut() = cards);
     SELECTED.with(|s| s.set(selected));
     RENDER.with(|r| *r.borrow_mut() = Some(render));
+}
+
+pub fn set_interaction_handler<F>(handler: F)
+where
+    F: Fn(BattlefieldInteraction) + 'static,
+{
+    INTERACTION.with(|slot| *slot.borrow_mut() = Some(Rc::new(handler)));
 }
 
 // ---------------------------------------------------------------------------
@@ -58,6 +72,24 @@ define_class!(
         #[unsafe(method(drawRect:))]
         fn draw_rect(&self, _dirty_rect: NSRect) {
             draw_battlefield(self.frame());
+        }
+
+        #[unsafe(method(mouseDown:))]
+        fn mouse_down(&self, event: &NSEvent) {
+            let point = self.convertPoint_fromView(event.locationInWindow(), None);
+            if let Some(session_id) = session_at_point(self.frame(), point) {
+                let interaction = if event.clickCount() >= 2 {
+                    BattlefieldInteraction::Focus(session_id)
+                } else {
+                    BattlefieldInteraction::Select(session_id)
+                };
+                INTERACTION.with(|slot| {
+                    if let Some(handler) = slot.borrow().as_ref() {
+                        handler(interaction);
+                    }
+                });
+                self.setNeedsDisplay(true);
+            }
         }
 
         #[unsafe(method(isFlipped))]
@@ -98,6 +130,23 @@ fn draw_battlefield(frame: NSRect) {
         let is_selected = selected == Some(card.id);
         draw_card(card, rect, is_selected, &render);
     }
+}
+
+fn session_at_point(frame: NSRect, point: NSPoint) -> Option<SessionId> {
+    let cards = CARDS.with(|c| c.borrow().clone());
+    let rects = card_layout(cards.len(), frame.size.width, frame.size.height);
+    cards
+        .iter()
+        .zip(rects.iter())
+        .find(|(_, rect)| point_in_rect(point, rect))
+        .map(|(card, _)| card.id)
+}
+
+fn point_in_rect(point: NSPoint, rect: &CardRect) -> bool {
+    point.x >= rect.x
+        && point.x <= rect.x + rect.w
+        && point.y >= rect.y
+        && point.y <= rect.y + rect.h
 }
 
 fn draw_card(
@@ -195,6 +244,33 @@ fn draw_card(
     });
     y_cursor += 18.0;
 
+    let nudge_label = if card.auto_nudge_enabled {
+        "AUTONUDGE ON"
+    } else {
+        "AUTONUDGE OFF"
+    };
+    let nudge_str =
+        build_simple_attr_string(nudge_label, &render.recency_font, &render.recency_color);
+    nudge_str.drawAtPoint(NSPoint {
+        x: rect.x + pad_x,
+        y: y_cursor,
+    });
+    y_cursor += 18.0;
+
+    if let Some(ref nudge) = card.last_nudge {
+        let nudge_preview = format!("Nudge: {}", nudge);
+        let nudge_preview_str = build_simple_attr_string(
+            &nudge_preview,
+            &render.scrollback_font,
+            &render.scrollback_color,
+        );
+        nudge_preview_str.drawAtPoint(NSPoint {
+            x: rect.x + pad_x,
+            y: y_cursor,
+        });
+        y_cursor += 16.0;
+    }
+
     // Scrollback lines.
     let max_y = rect.y + rect.h - 8.0;
     for line in &card.scrollback {
@@ -243,6 +319,34 @@ fn draw_status_chip(
         y: *y_cursor + 2.0,
     });
     *y_cursor += chip_h + 4.0;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn point_in_rect_accepts_interior_point() {
+        let rect = CardRect {
+            x: 10.0,
+            y: 20.0,
+            w: 100.0,
+            h: 80.0,
+        };
+        assert!(point_in_rect(NSPoint::new(50.0, 60.0), &rect));
+    }
+
+    #[test]
+    fn point_in_rect_rejects_exterior_point() {
+        let rect = CardRect {
+            x: 10.0,
+            y: 20.0,
+            w: 100.0,
+            h: 80.0,
+        };
+        assert!(!point_in_rect(NSPoint::new(5.0, 60.0), &rect));
+        assert!(!point_in_rect(NSPoint::new(50.0, 105.0), &rect));
+    }
 }
 
 /// Build an NSAttributedString with a single font + color.

@@ -18,7 +18,7 @@ unsafe extern "C" {
 /// # Safety
 /// Must be called on the main thread.
 pub unsafe fn bridge_new(frame: NSRect) -> Retained<NSObject> {
-    exaterm_terminal_bridge_force_link();
+    unsafe { exaterm_terminal_bridge_force_link() };
     let cls = objc2::runtime::AnyClass::get(c"ExatermTerminalBridge")
         .expect("ExatermTerminalBridge class not found — is the Swift library linked?");
     let obj: Retained<NSObject> = msg_send![cls, new];
