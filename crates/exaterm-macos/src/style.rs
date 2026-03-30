@@ -18,10 +18,6 @@ pub struct LayerStyle {
     pub corner_radius: f64,
     pub border_color: NormalizedColor,
     pub background_top: NormalizedColor,
-    pub background_bottom: NormalizedColor,
-    pub shadow_offset_y: f64,
-    pub shadow_blur: f64,
-    pub shadow_color: NormalizedColor,
 }
 
 /// Convert a theme `Color` (u8 channels + f32 alpha) to normalized 0.0-1.0 doubles.
@@ -41,10 +37,6 @@ pub fn card_layer_style(status: BattleCardStatus) -> LayerStyle {
         corner_radius: f64::from(ct.border_radius),
         border_color: normalize_color(&ct.border_color),
         background_top: normalize_color(&ct.background.top),
-        background_bottom: normalize_color(&ct.background.bottom),
-        shadow_offset_y: f64::from(ct.shadow.offset_y),
-        shadow_blur: f64::from(ct.shadow.blur),
-        shadow_color: normalize_color(&ct.shadow.color),
     }
 }
 
@@ -99,24 +91,6 @@ pub fn color_to_nscolor(c: &Color) -> Retained<NSColor> {
         f64::from(c.b) / 255.0,
         f64::from(c.a),
     )
-}
-
-/// Map a `BattleCardStatus` to the CSS class name used in the web UI.
-///
-/// This is useful for native-side code that needs to identify card states by
-/// the same canonical string key as the CSS layer.
-pub fn css_class_for_status(status: BattleCardStatus) -> &'static str {
-    match status {
-        BattleCardStatus::Idle => "card-idle",
-        BattleCardStatus::Stopped => "card-stopped",
-        BattleCardStatus::Active => "card-active",
-        BattleCardStatus::Thinking => "card-thinking",
-        BattleCardStatus::Working => "card-working",
-        BattleCardStatus::Blocked => "card-blocked",
-        BattleCardStatus::Failed => "card-failed",
-        BattleCardStatus::Complete => "card-complete",
-        BattleCardStatus::Detached => "card-detached",
-    }
 }
 
 #[cfg(test)]
@@ -234,30 +208,6 @@ mod tests {
             a: 0.98,
         });
         assert_eq!(style.background_top, expected_top);
-        // Active bottom: Color { r: 9, g: 18, b: 31, a: 0.97 }
-        let expected_bottom = normalize_color(&Color {
-            r: 9,
-            g: 18,
-            b: 31,
-            a: 0.97,
-        });
-        assert_eq!(style.background_bottom, expected_bottom);
-    }
-
-    #[test]
-    fn card_layer_style_shadow_values() {
-        let style = card_layer_style(BattleCardStatus::Idle);
-        assert!((style.shadow_offset_y - 24.0).abs() < f64::EPSILON);
-        assert!((style.shadow_blur - 46.0).abs() < f64::EPSILON);
-        assert_eq!(
-            style.shadow_color,
-            normalize_color(&Color {
-                r: 0,
-                g: 0,
-                b: 0,
-                a: 0.28
-            }),
-        );
     }
 
     #[test]
@@ -390,33 +340,5 @@ mod tests {
             b: 255,
             a: 1.0,
         });
-    }
-
-    // ---- css_class_for_status ----
-
-    #[test]
-    fn css_class_maps_all_variants() {
-        let expected = &[
-            (BattleCardStatus::Idle, "card-idle"),
-            (BattleCardStatus::Stopped, "card-stopped"),
-            (BattleCardStatus::Active, "card-active"),
-            (BattleCardStatus::Thinking, "card-thinking"),
-            (BattleCardStatus::Working, "card-working"),
-            (BattleCardStatus::Blocked, "card-blocked"),
-            (BattleCardStatus::Failed, "card-failed"),
-            (BattleCardStatus::Complete, "card-complete"),
-            (BattleCardStatus::Detached, "card-detached"),
-        ];
-        for &(status, class) in expected {
-            assert_eq!(css_class_for_status(status), class);
-        }
-    }
-
-    #[test]
-    fn css_class_covers_all_statuses() {
-        // Ensure no panic for every variant.
-        for &status in ALL_STATUSES {
-            let _class = css_class_for_status(status);
-        }
     }
 }
