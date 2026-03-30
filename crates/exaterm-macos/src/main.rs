@@ -3,12 +3,10 @@ mod app_state;
 mod battlefield_view;
 mod beachhead;
 mod event_bridge;
-mod grid_renderer;
 mod key_map;
 mod menu;
 mod session_io;
 mod style;
-mod terminal_state;
 mod terminal_view;
 mod window;
 
@@ -70,7 +68,7 @@ fn run_app() {
     let session_ios = Rc::new(RefCell::new(session_io::SessionIOMap::new()));
 
     // Create and configure the main window.
-    let style = NSWindowStyleMask::Titled
+    let style_mask = NSWindowStyleMask::Titled
         | NSWindowStyleMask::Closable
         | NSWindowStyleMask::Miniaturizable
         | NSWindowStyleMask::Resizable;
@@ -84,7 +82,7 @@ fn run_app() {
         NSWindow::initWithContentRect_styleMask_backing_defer(
             NSWindow::alloc(mtm),
             content_rect,
-            style,
+            style_mask,
             NSBackingStoreType::Buffered,
             false,
         )
@@ -107,8 +105,7 @@ fn run_app() {
     let bg = style::color_to_nscolor(&window::window_background());
     main_window.setBackgroundColor(Some(&bg));
 
-    // Create a text field for terminal (focus mode) and a custom view for battlefield.
-    // We toggle visibility between them based on presentation mode.
+    // Create views: SwiftTerm bridge for focus mode, BattlefieldView for card grid.
     use objc2::msg_send;
     use objc2_app_kit::NSView;
 
@@ -120,7 +117,14 @@ fn run_app() {
         ),
     );
 
-    let terminal_label = create_session_label(mtm);
+    // Create the SwiftTerm-backed terminal view for focus mode.
+    let terminal_frame = NSRect::new(
+        NSPoint::new(0.0, 0.0),
+        NSSize::new(window::WINDOW_DEFAULT_WIDTH, window::WINDOW_DEFAULT_HEIGHT),
+    );
+    let terminal_bridge = exaterm_swiftterm::TerminalBridge::new(terminal_frame);
+    let terminal_view = terminal_bridge.view();
+
     let battlefield_view: Retained<battlefield_view::BattlefieldView> = unsafe {
         let frame = NSRect::new(
             NSPoint::new(0.0, 0.0),
@@ -129,11 +133,11 @@ fn run_app() {
         msg_send![battlefield_view::BattlefieldView::alloc(mtm), initWithFrame: frame]
     };
 
-    terminal_label.setHidden(true);
+    terminal_view.setHidden(true);
     battlefield_view.setHidden(false);
 
     // Use autoresizing masks so both views fill the content view.
-    terminal_label.setAutoresizingMask(
+    terminal_view.setAutoresizingMask(
         objc2_app_kit::NSAutoresizingMaskOptions::ViewWidthSizable
             | objc2_app_kit::NSAutoresizingMaskOptions::ViewHeightSizable,
     );
@@ -141,10 +145,10 @@ fn run_app() {
         objc2_app_kit::NSAutoresizingMaskOptions::ViewWidthSizable
             | objc2_app_kit::NSAutoresizingMaskOptions::ViewHeightSizable,
     );
-    terminal_label.setFrame(content_view.frame());
+    terminal_view.setFrame(content_view.frame());
     battlefield_view.setFrame(content_view.frame());
 
-    content_view.addSubview(&terminal_label);
+    content_view.addSubview(&terminal_view);
     content_view.addSubview(&battlefield_view);
     main_window.setContentView(Some(&content_view));
 
@@ -154,35 +158,64 @@ fn run_app() {
 
     // Set up a 100ms repeating timer to drain daemon events, session output, and refresh display.
     let timer_state = Rc::clone(&state);
-    let timer_terminal_label = terminal_label.clone();
+    let timer_terminal_view = terminal_view.clone();
     let timer_battlefield_view = battlefield_view.clone();
     let timer_ios = Rc::clone(&session_ios);
-    let render_state = Rc::new(terminal_view::TerminalRenderState::new(14.0));
-
-    // Track last known content view size for resize detection.
-    let last_size: Rc<RefCell<(f64, f64)>> = Rc::new(RefCell::new((
-        window::WINDOW_DEFAULT_WIDTH,
-        window::WINDOW_DEFAULT_HEIGHT,
-    )));
-    let timer_content_view = content_view.clone();
-    let timer_last_size = Rc::clone(&last_size);
-
-    // Cell dimensions for Menlo 14pt (standard values).
-    const CELL_W: f64 = 8.4;
-    const CELL_H: f64 = 17.0;
+    let render_state = Rc::new(terminal_view::TerminalRenderState::new());
 
     let timer_beachhead = Rc::clone(&beachhead);
-    let timer_block = block2::StackBlock::new(
-        move |_timer: std::ptr::NonNull<objc2_foundation::NSTimer>| {
-            // Drain all pending events from the daemon.
-            while let Ok(message) = timer_beachhead.events.try_recv() {
-                match message {
-                    exaterm_types::proto::ServerMessage::WorkspaceSnapshot { snapshot } => {
-                        timer_state.borrow_mut().apply_snapshot(&snapshot);
-                    }
-                    exaterm_types::proto::ServerMessage::Error { message } => {
-                        eprintln!("exaterm: daemon error: {message}");
-                    }
+
+    // The terminal bridge is !Send, so we wrap it in Rc for shared access on the main thread.
+    let timer_bridge = Rc::new(terminal_bridge);
+    let displayed_focus =
+        Rc::new(RefCell::new(None::<exaterm_types::model::SessionId>));
+
+    let terminal_font = exaterm_ui::theme::terminal_font();
+    let terminal_appearance = exaterm_swiftterm::TerminalAppearance {
+        font_name: style::font_family(&terminal_font).to_string(),
+        font_size: terminal_font.size as f64,
+        foreground: exaterm_ui::theme::terminal_foreground_color(),
+        background: exaterm_ui::theme::terminal_background_color(),
+        cursor: exaterm_ui::theme::terminal_cursor_color(),
+    };
+    timer_bridge.set_appearance(&terminal_appearance);
+
+    // Wire the SwiftTerm input handler so keystrokes reach the PTY.
+    let input_ios = Rc::clone(&session_ios);
+    let input_state = Rc::clone(&state);
+    timer_bridge.set_input_handler(move |bytes: &[u8]| {
+        let focused = input_state.borrow().workspace.focused_session();
+        if let Some(id) = focused {
+            input_ios.borrow_mut().write_input(&id, bytes);
+        }
+    });
+
+    // Wire the SwiftTerm resize handler so the daemon gets resize messages.
+    let resize_beachhead = Rc::clone(&beachhead);
+    let resize_state = Rc::clone(&state);
+    timer_bridge.set_size_handler(move |size| {
+        let focused = resize_state.borrow().workspace.focused_session();
+        if let Some(session_id) = focused {
+            let _ = resize_beachhead.commands.send(
+                exaterm_types::proto::ClientMessage::ResizeTerminal {
+                    session_id,
+                    rows: size.rows,
+                    cols: size.cols,
+                },
+            );
+        }
+    });
+
+    let timer_displayed_focus = Rc::clone(&displayed_focus);
+    let timer_block = block2::StackBlock::new(move |_timer: std::ptr::NonNull<objc2_foundation::NSTimer>| {
+        // Drain all pending events from the daemon.
+        while let Ok(message) = timer_beachhead.events.try_recv() {
+            match message {
+                exaterm_types::proto::ServerMessage::WorkspaceSnapshot { snapshot } => {
+                    timer_state.borrow_mut().apply_snapshot(&snapshot);
+                }
+                exaterm_types::proto::ServerMessage::Error { message } => {
+                    eprintln!("exaterm: daemon error: {message}");
                 }
             }
             timer_beachhead.drain_event_wake();
@@ -196,93 +229,62 @@ fn run_app() {
                 .map(|s| s.id);
             app_delegate::set_first_session(first_id);
 
-            // Check for window resize and update terminal dimensions.
-            {
-                let frame = timer_content_view.frame();
-                let (cur_w, cur_h) = (frame.size.width, frame.size.height);
-                let mut last = timer_last_size.borrow_mut();
-                if (cur_w - last.0).abs() > 1.0 || (cur_h - last.1).abs() > 1.0 {
-                    *last = (cur_w, cur_h);
-                    let (new_rows, new_cols) =
-                        terminal_state::compute_grid_size(cur_w, cur_h, CELL_W, CELL_H);
-                    // Resize all connected terminals and notify the daemon.
-                    let mut ios = timer_ios.borrow_mut();
-                    let borrowed = timer_state.borrow();
-                    for &session_id in borrowed.raw_socket_names.keys() {
-                        if let Some(sio) = ios.get_mut(&session_id) {
-                            let (old_rows, old_cols) = sio.terminal.size();
-                            if old_rows != new_rows || old_cols != new_cols {
-                                sio.terminal.resize(new_rows, new_cols);
-                                let _ = timer_beachhead.commands.send(
-                                    exaterm_types::proto::ClientMessage::ResizeTerminal {
-                                        session_id,
-                                        rows: new_rows,
-                                        cols: new_cols,
-                                    },
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Connect to any new session raw streams using the current window size.
-            {
-                let frame = timer_content_view.frame();
-                let (init_rows, init_cols) = terminal_state::compute_grid_size(
-                    frame.size.width,
-                    frame.size.height,
-                    CELL_W,
-                    CELL_H,
-                );
-                let borrowed = timer_state.borrow();
-                let mut ios = timer_ios.borrow_mut();
-                ios.connect_new_sessions(&borrowed.raw_socket_names, init_rows, init_cols);
-
-                // Remove sessions that are no longer present.
-                let active_ids: Vec<_> = borrowed.raw_socket_names.keys().copied().collect();
-                ios.retain_sessions(&active_ids);
-            }
-
-            // Drain PTY output and feed to terminal emulators.
+        // Connect to any new session raw streams.
+        {
+            let borrowed = timer_state.borrow();
             let mut ios = timer_ios.borrow_mut();
-            ios.drain_all_output();
+            ios.connect_new_sessions(&borrowed.raw_socket_names);
 
             let borrowed = timer_state.borrow();
             let focused = borrowed.workspace.focused_session();
 
-            match focused {
-                Some(session_id) => {
-                    // Focus mode: show the focused session's terminal, hide battlefield.
-                    timer_terminal_label.setHidden(false);
-                    timer_battlefield_view.setHidden(true);
-
-                    let snapshot = ios.session_snapshot(&session_id);
-                    let fallback = format!("Session {} — connecting...", session_id.0);
-                    terminal_view::update_label_with_snapshot(
-                        &timer_terminal_label,
-                        snapshot.as_ref(),
-                        &render_state,
-                        &fallback,
+        let borrowed = timer_state.borrow();
+        let focused = borrowed.workspace.focused_session();
+        {
+            let mut displayed = timer_displayed_focus.borrow_mut();
+            if *displayed != focused {
+                timer_bridge.clear();
+                if let Some(session_id) = focused {
+                    let size = timer_bridge.terminal_size();
+                    let _ = timer_beachhead.commands.send(
+                        exaterm_types::proto::ClientMessage::ResizeTerminal {
+                            session_id,
+                            rows: size.rows,
+                            cols: size.cols,
+                        },
                     );
                 }
-                None => {
-                    // Battlefield mode: show the card grid, hide terminal.
-                    timer_terminal_label.setHidden(true);
-                    timer_battlefield_view.setHidden(false);
+                *displayed = focused;
+            }
+        }
 
-                    let cards = borrowed.card_render_data(&ios);
-                    let selected = borrowed.workspace.selected_session();
-                    battlefield_view::set_battlefield_data(
-                        cards,
-                        selected,
-                        Rc::clone(&render_state),
-                    );
-                    timer_battlefield_view.setNeedsDisplay(true);
+        // Drain all PTY output every tick to prevent background buffer growth.
+        let all_output = timer_ios.borrow_mut().drain_all_output();
+
+        match focused {
+            Some(session_id) => {
+                // Focus mode: feed the focused session's output to SwiftTerm.
+                timer_terminal_view.setHidden(false);
+                timer_battlefield_view.setHidden(true);
+
+                if let Some(bytes) = all_output.get(&session_id) {
+                    timer_bridge.feed(bytes);
                 }
             }
-        },
-    );
+            None => {
+                // Battlefield mode: show the card grid, hide terminal.
+                timer_terminal_view.setHidden(true);
+                timer_battlefield_view.setHidden(false);
+
+                let cards = borrowed.card_render_data();
+                let selected = borrowed.workspace.selected_session();
+                battlefield_view::set_battlefield_data(
+                    cards, selected, Rc::clone(&render_state),
+                );
+                timer_battlefield_view.setNeedsDisplay(true);
+            }
+        }
+    });
 
     // SAFETY: Block captures only main-thread state and timer fires on the main run loop.
     let _timer = unsafe {
@@ -293,9 +295,12 @@ fn run_app() {
         )
     };
 
-    // Set up keyboard event monitoring to forward input to the PTY.
-    let key_ios = Rc::clone(&session_ios);
+    // Set up keyboard event monitoring.
+    // In focus mode, SwiftTerm handles input as first responder — we only intercept
+    // Escape (exit focus) and Cmd+N (add shell). In battlefield mode, we handle navigation.
     let key_state = Rc::clone(&state);
+    let key_window = main_window.clone();
+    let key_terminal_view = terminal_view.clone();
     let key_block = block2::StackBlock::new(
         move |event: std::ptr::NonNull<objc2_app_kit::NSEvent>| -> *mut objc2_app_kit::NSEvent {
             // SAFETY: The event pointer is valid for the duration of this callback.
@@ -309,8 +314,6 @@ fn run_app() {
                 option: flags.contains(objc2_app_kit::NSEventModifierFlags::Option),
                 command: flags.contains(objc2_app_kit::NSEventModifierFlags::Command),
             };
-
-            let characters = event_ref.characters().map(|s| s.to_string());
 
             let in_focus = key_state.borrow().workspace.focused_session().is_some();
 
@@ -332,10 +335,9 @@ fn run_app() {
                     36 => {
                         let selected = key_state.borrow().workspace.selected_session();
                         if let Some(session_id) = selected {
-                            key_state
-                                .borrow_mut()
-                                .workspace
-                                .enter_focus_mode(session_id);
+                            key_state.borrow_mut().workspace.enter_focus_mode(session_id);
+                            // Make SwiftTerm first responder so it receives keyboard input.
+                            key_window.makeFirstResponder(Some(&*key_terminal_view));
                         }
                         return std::ptr::null_mut();
                     }
@@ -359,47 +361,13 @@ fn run_app() {
             // Focus mode: Escape returns to battlefield.
             if in_focus && key_code == 53 {
                 key_state.borrow_mut().workspace.return_to_battlefield();
+                key_window.makeFirstResponder(None);
                 return std::ptr::null_mut();
             }
 
-            // Focus mode: forward keys to the focused session's PTY.
-            let input = key_map::KeyInput {
-                key_code,
-                modifiers,
-                characters,
-            };
-
-            let focused_id = key_state.borrow().workspace.focused_session();
-            let app_cursor = focused_id
-                .and_then(|id| key_ios.borrow().session_app_cursor(&id))
-                .unwrap_or(false);
-            let action = key_map::key_event_to_action(&input, app_cursor);
-            match action {
-                key_map::KeyAction::Bytes(bytes) => {
-                    if let Some(id) = focused_id {
-                        key_ios.borrow_mut().write_input(&id, &bytes);
-                    } else {
-                        key_ios.borrow_mut().write_input_first(&bytes);
-                    }
-                    // Return null to consume the event (prevent beep).
-                    std::ptr::null_mut()
-                }
-                key_map::KeyAction::Paste => {
-                    // Read from clipboard and send to PTY.
-                    if let Some(text) = clipboard_text() {
-                        if let Some(id) = focused_id {
-                            key_ios.borrow_mut().write_input(&id, text.as_bytes());
-                        } else {
-                            key_ios.borrow_mut().write_input_first(text.as_bytes());
-                        }
-                    }
-                    std::ptr::null_mut()
-                }
-                key_map::KeyAction::Copy | key_map::KeyAction::None => {
-                    // Let the system handle it.
-                    event.as_ptr()
-                }
-            }
+            // Focus mode: let SwiftTerm handle all other keys as first responder.
+            // Pass the event through to the responder chain.
+            event.as_ptr()
         },
     );
 
@@ -421,42 +389,4 @@ fn run_app() {
     std::mem::forget(session_ios);
 
     app.run();
-}
-
-/// Read the current clipboard text content, if any.
-fn clipboard_text() -> Option<String> {
-    use objc2_app_kit::NSPasteboard;
-    use objc2_foundation::ns_string;
-
-    let pb = NSPasteboard::generalPasteboard();
-    let string_type = ns_string!("public.utf8-plain-text");
-    pb.stringForType(string_type).map(|s| s.to_string())
-}
-
-/// Create a multi-line, read-only text label for displaying session info.
-fn create_session_label(
-    mtm: objc2::MainThreadMarker,
-) -> objc2::rc::Retained<objc2_app_kit::NSTextField> {
-    use objc2_app_kit::NSTextField;
-    use objc2_foundation::ns_string;
-
-    let label = NSTextField::labelWithString(ns_string!("Connecting to daemon..."), mtm);
-    label.setEditable(false);
-    label.setBezeled(false);
-    label.setDrawsBackground(false);
-    label.setSelectable(false);
-
-    // Use the scrollback line font from the theme for the fallback text.
-    let font = style::font_from_spec(&exaterm_ui::theme::scrollback_line_font());
-    label.setFont(Some(&font));
-
-    let white = style::color_to_nscolor(&exaterm_ui::theme::Color {
-        r: 248,
-        g: 250,
-        b: 252,
-        a: 1.0,
-    });
-    label.setTextColor(Some(&white));
-
-    label
 }

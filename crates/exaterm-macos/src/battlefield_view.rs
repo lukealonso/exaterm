@@ -18,7 +18,7 @@ use crate::app_state::CardRenderData;
 use crate::style;
 use crate::terminal_view::TerminalRenderState;
 use exaterm_types::model::SessionId;
-use exaterm_ui::layout::battlefield_columns;
+use exaterm_ui::layout::{CardRect, MARGIN, card_layout};
 
 // ---------------------------------------------------------------------------
 // Thread-local data bridge (main thread only)
@@ -66,61 +66,6 @@ define_class!(
         }
     }
 );
-
-// ---------------------------------------------------------------------------
-// Layout — pure math, fully testable without AppKit rendering
-// ---------------------------------------------------------------------------
-
-/// Card layout constants matching the shared theme.
-const GAP: f64 = 12.0;
-const MARGIN: f64 = 12.0;
-const CARD_MIN_HEIGHT: f64 = 220.0;
-
-/// A positioned card rectangle (origin + size) in the view coordinate space.
-#[derive(Debug, Clone, PartialEq)]
-pub struct CardRect {
-    pub x: f64,
-    pub y: f64,
-    pub w: f64,
-    pub h: f64,
-}
-
-/// Compute card positions for `card_count` cards within a view of `(view_w, view_h)`.
-///
-/// Uses `battlefield_columns()` from exaterm-ui for column count, then flows
-/// cards left-to-right, top-to-bottom in a grid with `GAP` spacing and `MARGIN` insets.
-pub fn card_layout(card_count: usize, view_w: f64, view_h: f64) -> Vec<CardRect> {
-    if card_count == 0 {
-        return Vec::new();
-    }
-
-    let cols = battlefield_columns(card_count, view_w as i32, false) as usize;
-    let cols = cols.max(1);
-    let rows = (card_count + cols - 1) / cols;
-
-    let card_w = (view_w - MARGIN * 2.0 - GAP * (cols as f64 - 1.0)) / cols as f64;
-    let card_h = if rows > 0 {
-        let available_h = view_h - MARGIN * 2.0 - GAP * (rows as f64 - 1.0);
-        (available_h / rows as f64).max(CARD_MIN_HEIGHT)
-    } else {
-        CARD_MIN_HEIGHT
-    };
-
-    let mut rects = Vec::with_capacity(card_count);
-    for i in 0..card_count {
-        let col = i % cols;
-        let row = i / cols;
-        let x = MARGIN + col as f64 * (card_w + GAP);
-        let y = MARGIN + row as f64 * (card_h + GAP);
-        rects.push(CardRect {
-            x,
-            y,
-            w: card_w,
-            h: card_h,
-        });
-    }
-    rects
-}
 
 // ---------------------------------------------------------------------------
 // Drawing — reads thread-locals and paints via Core Graphics
@@ -324,86 +269,4 @@ fn build_simple_attr_string(
     }
 
     Retained::into_super(result)
-}
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn card_layout_zero_cards() {
-        assert!(card_layout(0, 1400.0, 900.0).is_empty());
-    }
-
-    #[test]
-    fn card_layout_single_card() {
-        let rects = card_layout(1, 1400.0, 900.0);
-        assert_eq!(rects.len(), 1);
-        // Single card should start at margin.
-        assert!((rects[0].x - MARGIN).abs() < 0.01);
-        assert!((rects[0].y - MARGIN).abs() < 0.01);
-        // Full width minus margins.
-        let expected_w = 1400.0 - MARGIN * 2.0;
-        assert!((rects[0].w - expected_w).abs() < 0.01);
-    }
-
-    #[test]
-    fn card_layout_two_cards_wide_window() {
-        // At 1480 width, battlefield_columns(2, 1480, false) == 2
-        let rects = card_layout(2, 1480.0, 900.0);
-        assert_eq!(rects.len(), 2);
-        // Both on the same row.
-        assert!((rects[0].y - rects[1].y).abs() < 0.01);
-        // Second card starts after first + gap.
-        assert!(rects[1].x > rects[0].x + rects[0].w);
-    }
-
-    #[test]
-    fn card_layout_two_cards_narrow_window() {
-        // At 1000 width, battlefield_columns(2, 1000, false) == 1
-        let rects = card_layout(2, 1000.0, 900.0);
-        assert_eq!(rects.len(), 2);
-        // Stacked vertically: second card below first.
-        assert!(rects[1].y > rects[0].y);
-    }
-
-    #[test]
-    fn card_layout_four_cards() {
-        // battlefield_columns(4, 1400, false) == 2 → 2×2 grid
-        let rects = card_layout(4, 1400.0, 900.0);
-        assert_eq!(rects.len(), 4);
-        // Row 0: cards 0, 1.
-        assert!((rects[0].y - rects[1].y).abs() < 0.01);
-        // Row 1: cards 2, 3.
-        assert!((rects[2].y - rects[3].y).abs() < 0.01);
-        // Second row is below first row.
-        assert!(rects[2].y > rects[0].y);
-        // All cards have equal width.
-        assert!((rects[0].w - rects[1].w).abs() < 0.01);
-        assert!((rects[0].w - rects[2].w).abs() < 0.01);
-    }
-
-    #[test]
-    fn card_layout_respects_min_height() {
-        // Very short window — cards should not be smaller than CARD_MIN_HEIGHT.
-        let rects = card_layout(4, 1400.0, 100.0);
-        for r in &rects {
-            assert!(r.h >= CARD_MIN_HEIGHT);
-        }
-    }
-
-    #[test]
-    fn card_layout_cards_within_bounds() {
-        let (w, h) = (1400.0, 900.0);
-        let rects = card_layout(6, w, h);
-        for r in &rects {
-            assert!(r.x >= 0.0);
-            assert!(r.y >= 0.0);
-            assert!(r.x + r.w <= w + 0.01);
-        }
-    }
 }

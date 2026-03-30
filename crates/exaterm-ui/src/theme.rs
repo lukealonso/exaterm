@@ -493,6 +493,43 @@ pub fn scrollback_line_font() -> FontSpec {
     }
 }
 
+pub fn terminal_font() -> FontSpec {
+    FontSpec {
+        size: 13.0,
+        weight: 400,
+        letter_spacing: 0.0,
+        line_height: None,
+        monospace: true,
+    }
+}
+
+pub fn terminal_foreground_color() -> Color {
+    Color {
+        r: 204,
+        g: 204,
+        b: 204,
+        a: 1.0,
+    }
+}
+
+pub fn terminal_background_color() -> Color {
+    Color {
+        r: 0,
+        g: 0,
+        b: 0,
+        a: 1.0,
+    }
+}
+
+pub fn terminal_cursor_color() -> Color {
+    Color {
+        r: 134,
+        g: 239,
+        b: 172,
+        a: 1.0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -597,5 +634,19 @@ mod tests {
     #[test]
     fn scrollback_line_font_is_monospace() {
         assert!(scrollback_line_font().monospace);
+    }
+
+    #[test]
+    fn terminal_font_is_monospace() {
+        let font = terminal_font();
+        assert!(font.monospace);
+        assert!((font.size - 13.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn terminal_palette_is_opaque() {
+        assert_eq!(terminal_foreground_color().a, 1.0);
+        assert_eq!(terminal_background_color().a, 1.0);
+        assert_eq!(terminal_cursor_color().a, 1.0);
     }
 }
