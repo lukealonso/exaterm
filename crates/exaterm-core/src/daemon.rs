@@ -1765,12 +1765,46 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
+    /// Returns false when Unix socket creation is blocked (e.g. inside the
+    /// Claude Code sandbox).  Tests that start a real daemon process or rely
+    /// on FSEvents delivery use this as an early-exit guard so `cargo test`
+    /// passes in restricted environments without skipping anything on CI.
+    fn can_bind_unix_sockets() -> bool {
+        use std::os::unix::net::UnixListener;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        // Combine PID (cross-process isolation) with a per-process atomic
+        // counter (cross-thread isolation) so parallel test threads never race
+        // on the same probe path.
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let probe = std::env::temp_dir().join(format!(
+            ".exaterm-sock-probe-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed),
+        ));
+        let ok = UnixListener::bind(&probe).is_ok();
+        let _ = fs::remove_file(&probe);
+        ok
+    }
+
     fn unique_runtime_dir(label: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock should be after epoch")
             .as_nanos();
-        std::env::temp_dir().join(format!("exaterm-test-{label}-{nanos}"))
+        let suffix = format!("exaterm-test-{label}-{nanos}");
+        // Unix socket paths have a strict length limit (104 bytes on macOS).
+        // The socket lives at <dir>/exaterm/beachhead-control.sock (+31 chars).
+        // On macOS CI, TMPDIR expands to a long /var/folders/… path that pushes
+        // us over; in that case fall back to /tmp which is always short.
+        const SOCKET_SUFFIX_LEN: usize = "/exaterm/beachhead-control.sock".len();
+        const LIMIT: usize = 104;
+        let base = std::env::temp_dir();
+        let candidate = base.join(&suffix);
+        if candidate.as_os_str().len() + SOCKET_SUFFIX_LEN > LIMIT {
+            PathBuf::from("/tmp").join(suffix)
+        } else {
+            candidate
+        }
     }
 
     fn read_server_message(reader: &mut BufReader<UnixStream>) -> ServerMessage {
@@ -1806,6 +1840,9 @@ mod tests {
 
     #[test]
     fn local_daemon_attach_create_and_terminate_workspace() {
+        if !can_bind_unix_sockets() {
+            return;
+        }
         let _guard = env_lock().lock().expect("env lock");
         let runtime_dir = unique_runtime_dir("daemon-flow");
         std::env::set_var("EXATERM_RUNTIME_DIR", &runtime_dir);
@@ -1855,6 +1892,9 @@ mod tests {
 
     #[test]
     fn daemon_rejects_second_attached_client() {
+        if !can_bind_unix_sockets() {
+            return;
+        }
         let _guard = env_lock().lock().expect("env lock");
         let runtime_dir = unique_runtime_dir("daemon-reject");
         std::env::set_var("EXATERM_RUNTIME_DIR", &runtime_dir);
@@ -1895,6 +1935,9 @@ mod tests {
 
     #[test]
     fn repo_watch_events_update_observation_recent_files() {
+        if !can_bind_unix_sockets() {
+            return;
+        }
         let root = unique_runtime_dir("repo-watch");
         let repo_root = root.join("repo");
         let nested = repo_root.join("src");

@@ -2,9 +2,11 @@ name: CI
 
 on:
   pull_request:
+    branches:
+      - master
   push:
     branches:
-      - main
+      - master
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -15,23 +17,37 @@ permissions:
 
 jobs:
   workspace:
-    name: Workspace
-    runs-on: ubuntu-latest
-    container:
-      image: fedora:43
+    name: Workspace (${{ matrix.os }})
+    runs-on: ${{ matrix.runs_on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            runs_on: ubuntu-latest
+            container_image: fedora:43
+          - os: macos
+            runs_on: macos-latest
+    container: ${{ matrix.container_image || null }}
     env:
       CARGO_TERM_COLOR: always
     steps:
+      - name: Install git (Linux)
+        if: matrix.os == 'linux'
+        run: dnf install -y --setopt=install_weak_deps=False git
+
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Install native dependencies
+        if: matrix.os == 'linux'
         run: |
           dnf install -y --setopt=install_weak_deps=False \
             curl \
             gcc \
             gcc-c++ \
-            git \
             gtk4-devel \
             libadwaita-devel \
             pkgconf-pkg-config \
