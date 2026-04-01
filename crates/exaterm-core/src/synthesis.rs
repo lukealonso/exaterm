@@ -2,17 +2,65 @@ pub use exaterm_types::synthesis::{
     AttentionLevel, NameSuggestion, NudgeSuggestion, TacticalState, TacticalSynthesis,
 };
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
+use std::collections::BTreeSet;
 use std::env;
 use std::error::Error;
 use std::fs;
+use std::io::Read;
 use std::path::Path;
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_SUMMARY_MODEL: &str = "gpt-5.4-mini";
 const DEFAULT_NAMING_MODEL: &str = "gpt-5.4-mini";
 const DEFAULT_NUDGE_MODEL: &str = "gpt-5.4";
+const DEFAULT_CODEX_CLI_MODEL: &str = "gpt-5.4-mini";
+const DEFAULT_CLAUDE_CLI_MODEL: &str = "haiku";
 const DEFAULT_REASONING_EFFORT: &str = "medium";
-const DEFAULT_NUDGE_REASONING_EFFORT: &str = "high";
+const CLI_TIMEOUT: Duration = Duration::from_secs(90);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SynthesisProvider {
+    OpenAi,
+    CodexCli,
+    ClaudeCli,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProviderPreferences {
+    pub skipped_providers: BTreeSet<SynthesisProvider>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct OpenAiBackend {
+    api_key: String,
+    base_url: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CliBackend {
+    program: String,
+    model: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct SynthesisBackendRegistry {
+    openai: Option<OpenAiBackend>,
+    codex: Option<CliBackend>,
+    claude: Option<CliBackend>,
+    summary_model: String,
+    naming_model: String,
+    nudge_model: String,
+}
+
+#[derive(Debug)]
+pub struct ProviderCallResult<T> {
+    pub provider: SynthesisProvider,
+    pub value: Result<T, String>,
+    pub demoted_provider: Option<SynthesisProvider>,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct TacticalEvidence {
@@ -44,78 +92,237 @@ pub struct NudgeEvidence {
     pub recent_terminal_history: Vec<String>,
 }
 
-#[derive(Clone, Debug)]
-pub struct OpenAiSynthesisConfig {
-    pub api_key: String,
-    pub model: String,
-    pub base_url: String,
-}
-
-impl OpenAiSynthesisConfig {
+impl SynthesisBackendRegistry {
     pub fn from_env() -> Option<Self> {
         load_dotenv_file();
 
-        let api_key = env::var("OPENAI_API_KEY").ok()?.trim().to_string();
-        if api_key.is_empty() {
-            return None;
+        let openai = env::var("OPENAI_API_KEY")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .map(|api_key| OpenAiBackend {
+                api_key,
+                base_url: openai_chat_completions_url(),
+            });
+        let codex = find_executable("codex").map(|program| CliBackend {
+            program,
+            model: normalize_cli_model(
+                &env::var("EXATERM_CODEX_CLI_MODEL").unwrap_or_default(),
+                DEFAULT_CODEX_CLI_MODEL,
+            ),
+        });
+        let claude = find_executable("claude")
+            .or_else(|| find_executable("claude-code"))
+            .map(|program| CliBackend {
+                program,
+                model: normalize_cli_model(
+                    &env::var("EXATERM_CLAUDE_CLI_MODEL").unwrap_or_default(),
+                    DEFAULT_CLAUDE_CLI_MODEL,
+                ),
+            });
+
+        let registry = Self {
+            openai,
+            codex,
+            claude,
+            summary_model: normalize_summary_model(
+                &env::var("EXATERM_SUMMARY_MODEL").unwrap_or_default(),
+            ),
+            naming_model: normalize_naming_model(
+                &env::var("EXATERM_NAMING_MODEL").unwrap_or_default(),
+            ),
+            nudge_model: normalize_nudge_model(
+                &env::var("EXATERM_NUDGE_MODEL").unwrap_or_default(),
+            ),
+        };
+        registry.is_available().then_some(registry)
+    }
+
+    pub fn summarize_blocking(
+        &self,
+        preferences: &ProviderPreferences,
+        evidence: &TacticalEvidence,
+    ) -> ProviderCallResult<TacticalSynthesis> {
+        let user_prompt = format!(
+            "Produce one grounded Exaterm tactical classification for this terminal session. Fill every field from the evidence below and do not invent unseen work, intent, or progress.\n\nEvidence:\n{}",
+            serde_json::to_string_pretty(evidence)
+                .map_err(|error| error.to_string())
+                .unwrap_or_default()
+        );
+        self.run_with_fallback(preferences, |provider| match provider {
+            SynthesisProvider::OpenAi => summarize_openai_blocking(
+                self.openai.as_ref().expect("openai backend must exist"),
+                &self.summary_model,
+                evidence,
+            ),
+            SynthesisProvider::CodexCli => summarize_cli_blocking(
+                self.codex.as_ref().expect("codex backend must exist"),
+                tactical_system_prompt(),
+                &user_prompt,
+            ),
+            SynthesisProvider::ClaudeCli => summarize_claude_blocking(
+                self.claude.as_ref().expect("claude backend must exist"),
+                tactical_system_prompt(),
+                &user_prompt,
+            ),
+        })
+    }
+
+    pub fn suggest_name_blocking(
+        &self,
+        preferences: &ProviderPreferences,
+        evidence: &NamingEvidence,
+    ) -> ProviderCallResult<NameSuggestion> {
+        let user_prompt = format!(
+            "Choose a stable operator-facing terminal name from this history. Return empty string if the history is still too thin:\n{}",
+            serde_json::to_string_pretty(evidence)
+                .map_err(|error| error.to_string())
+                .unwrap_or_default()
+        );
+        self.run_with_fallback(preferences, |provider| match provider {
+            SynthesisProvider::OpenAi => suggest_name_openai_blocking(
+                self.openai.as_ref().expect("openai backend must exist"),
+                &self.naming_model,
+                evidence,
+            ),
+            SynthesisProvider::CodexCli => suggest_name_cli_blocking(
+                self.codex.as_ref().expect("codex backend must exist"),
+                naming_system_prompt(),
+                &user_prompt,
+            ),
+            SynthesisProvider::ClaudeCli => suggest_name_claude_blocking(
+                self.claude.as_ref().expect("claude backend must exist"),
+                naming_system_prompt(),
+                &user_prompt,
+            ),
+        })
+    }
+
+    pub fn suggest_nudge_blocking(
+        &self,
+        preferences: &ProviderPreferences,
+        evidence: &NudgeEvidence,
+    ) -> ProviderCallResult<NudgeSuggestion> {
+        let user_prompt = format!(
+            "Write one short contextual nudge for this stopped terminal session. Return empty string if no safe, useful nudge is warranted:\n{}",
+            serde_json::to_string_pretty(evidence)
+                .map_err(|error| error.to_string())
+                .unwrap_or_default()
+        );
+        self.run_with_fallback(preferences, |provider| match provider {
+            SynthesisProvider::OpenAi => suggest_nudge_openai_blocking(
+                self.openai.as_ref().expect("openai backend must exist"),
+                &self.nudge_model,
+                evidence,
+            ),
+            SynthesisProvider::CodexCli => suggest_nudge_cli_blocking(
+                self.codex.as_ref().expect("codex backend must exist"),
+                nudge_system_prompt(),
+                &user_prompt,
+            ),
+            SynthesisProvider::ClaudeCli => suggest_nudge_claude_blocking(
+                self.claude.as_ref().expect("claude backend must exist"),
+                nudge_system_prompt(),
+                &user_prompt,
+            ),
+        })
+    }
+
+    fn is_available(&self) -> bool {
+        self.openai.is_some() || self.codex.is_some() || self.claude.is_some()
+    }
+
+    fn preferred_provider_order(
+        &self,
+        preferences: &ProviderPreferences,
+    ) -> Vec<SynthesisProvider> {
+        let mut providers = Vec::new();
+        if self.openai.is_some()
+            && !preferences
+                .skipped_providers
+                .contains(&SynthesisProvider::OpenAi)
+        {
+            providers.push(SynthesisProvider::OpenAi);
+        }
+        if self.codex.is_some()
+            && !preferences
+                .skipped_providers
+                .contains(&SynthesisProvider::CodexCli)
+        {
+            providers.push(SynthesisProvider::CodexCli);
+        }
+        if self.claude.is_some()
+            && !preferences
+                .skipped_providers
+                .contains(&SynthesisProvider::ClaudeCli)
+        {
+            providers.push(SynthesisProvider::ClaudeCli);
+        }
+        providers
+    }
+
+    fn run_with_fallback<T, F>(
+        &self,
+        preferences: &ProviderPreferences,
+        mut call: F,
+    ) -> ProviderCallResult<T>
+    where
+        F: FnMut(SynthesisProvider) -> Result<T, String>,
+    {
+        let providers = self.preferred_provider_order(preferences);
+        let Some(_) = providers.first().copied() else {
+            return ProviderCallResult {
+                provider: SynthesisProvider::OpenAi,
+                value: Err(
+                    "no synthesis provider available after applying provider preferences".into(),
+                ),
+                demoted_provider: None,
+            };
+        };
+
+        let mut first_failed_provider = None::<SynthesisProvider>;
+        let mut last_error = None::<String>;
+        for provider in providers {
+            match call(provider) {
+                Ok(value) => {
+                    return ProviderCallResult {
+                        provider,
+                        value: Ok(value),
+                        demoted_provider: first_failed_provider,
+                    };
+                }
+                Err(error) => {
+                    if first_failed_provider.is_none() {
+                        first_failed_provider = Some(provider);
+                        last_error = Some(error);
+                    } else {
+                        let previous_error = last_error.take().unwrap_or_default();
+                        last_error = Some(format!(
+                            "{} failed: {previous_error}; {} failed: {error}",
+                            provider_label(
+                                first_failed_provider.expect("first failure should exist")
+                            ),
+                            provider_label(provider),
+                        ));
+                    }
+                }
+            }
         }
 
-        let requested_model = env::var("EXATERM_SUMMARY_MODEL").unwrap_or_default();
-        Some(Self {
-            api_key,
-            model: normalize_summary_model(&requested_model),
-            base_url: openai_chat_completions_url(),
-        })
+        let failed_provider = first_failed_provider.expect("provider order was non-empty");
+        ProviderCallResult {
+            provider: failed_provider,
+            value: Err(last_error.expect("failed provider should have an error")),
+            demoted_provider: Some(failed_provider),
+        }
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct OpenAiNamingConfig {
-    pub api_key: String,
-    pub model: String,
-    pub base_url: String,
-}
-
-impl OpenAiNamingConfig {
-    pub fn from_env() -> Option<Self> {
-        load_dotenv_file();
-
-        let api_key = env::var("OPENAI_API_KEY").ok()?.trim().to_string();
-        if api_key.is_empty() {
-            return None;
-        }
-
-        let requested_model = env::var("EXATERM_NAMING_MODEL").unwrap_or_default();
-        Some(Self {
-            api_key,
-            model: normalize_naming_model(&requested_model),
-            base_url: openai_chat_completions_url(),
-        })
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct OpenAiNudgeConfig {
-    pub api_key: String,
-    pub model: String,
-    pub base_url: String,
-}
-
-impl OpenAiNudgeConfig {
-    pub fn from_env() -> Option<Self> {
-        load_dotenv_file();
-
-        let api_key = env::var("OPENAI_API_KEY").ok()?.trim().to_string();
-        if api_key.is_empty() {
-            return None;
-        }
-
-        let requested_model = env::var("EXATERM_NUDGE_MODEL").unwrap_or_default();
-        Some(Self {
-            api_key,
-            model: normalize_nudge_model(&requested_model),
-            base_url: openai_chat_completions_url(),
-        })
+fn provider_label(provider: SynthesisProvider) -> &'static str {
+    match provider {
+        SynthesisProvider::OpenAi => "openai",
+        SynthesisProvider::CodexCli => "codex",
+        SynthesisProvider::ClaudeCli => "claude",
     }
 }
 
@@ -155,6 +362,54 @@ fn openai_chat_completions_url() -> String {
     }
 }
 
+fn find_executable(name: &str) -> Option<String> {
+    let mut candidates = env::var_os("PATH")
+        .into_iter()
+        .flat_map(|path| env::split_paths(&path).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    candidates.extend(standard_executable_dirs());
+
+    candidates.into_iter().find_map(|dir| {
+        let candidate = dir.join(name);
+        is_executable_file(&candidate).then(|| candidate.to_string_lossy().into_owned())
+    })
+}
+
+fn standard_executable_dirs() -> Vec<std::path::PathBuf> {
+    let mut dirs = vec![
+        "/opt/homebrew/bin".into(),
+        "/usr/local/bin".into(),
+        "/opt/local/bin".into(),
+        "/usr/bin".into(),
+        "/bin".into(),
+        "/usr/sbin".into(),
+        "/sbin".into(),
+    ];
+    if let Some(home) = env::var_os("HOME") {
+        dirs.push(std::path::PathBuf::from(&home).join(".local/bin"));
+        dirs.push(std::path::PathBuf::from(&home).join("bin"));
+    }
+    dirs
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
 pub fn normalize_summary_model(model: &str) -> String {
     let model = model.trim();
     if model.is_empty() {
@@ -177,6 +432,15 @@ pub fn normalize_nudge_model(model: &str) -> String {
     let model = model.trim();
     if model.is_empty() {
         DEFAULT_NUDGE_MODEL.into()
+    } else {
+        model.into()
+    }
+}
+
+fn normalize_cli_model(model: &str, default: &str) -> String {
+    let model = model.trim();
+    if model.is_empty() {
+        default.into()
     } else {
         model.into()
     }
@@ -331,13 +595,14 @@ fn bucket_duration_seconds(seconds: u64) -> Option<&'static str> {
     })
 }
 
-pub fn summarize_blocking(
-    config: &OpenAiSynthesisConfig,
+fn summarize_openai_blocking(
+    config: &OpenAiBackend,
+    model: &str,
     evidence: &TacticalEvidence,
 ) -> Result<TacticalSynthesis, String> {
     let request_body = json!({
-        "model": config.model,
-        "reasoning_effort": DEFAULT_NUDGE_REASONING_EFFORT,
+        "model": model,
+        "reasoning_effort": DEFAULT_REASONING_EFFORT,
         "messages": [
             {
                 "role": "system",
@@ -384,17 +649,17 @@ pub fn summarize_blocking(
 
     let text = extract_response_text(&payload)
         .ok_or_else(|| format!("response did not include parseable text: {payload}"))?;
-    serde_json::from_str::<TacticalSynthesis>(&text)
+    parse_json_output::<TacticalSynthesis>(&text, "model synthesis")
         .map(TacticalSynthesis::sanitize)
-        .map_err(|error| format!("failed to parse model synthesis: {error}; payload={text}"))
 }
 
-pub fn suggest_name_blocking(
-    config: &OpenAiNamingConfig,
+fn suggest_name_openai_blocking(
+    config: &OpenAiBackend,
+    model: &str,
     evidence: &NamingEvidence,
 ) -> Result<NameSuggestion, String> {
     let request_body = json!({
-        "model": config.model,
+        "model": model,
         "reasoning_effort": DEFAULT_REASONING_EFFORT,
         "messages": [
             {
@@ -442,17 +707,17 @@ pub fn suggest_name_blocking(
 
     let text = extract_response_text(&payload)
         .ok_or_else(|| format!("response did not include parseable text: {payload}"))?;
-    serde_json::from_str::<NameSuggestion>(&text)
+    parse_json_output::<NameSuggestion>(&text, "model naming response")
         .map(NameSuggestion::sanitize)
-        .map_err(|error| format!("failed to parse model naming response: {error}; payload={text}"))
 }
 
-pub fn suggest_nudge_blocking(
-    config: &OpenAiNudgeConfig,
+fn suggest_nudge_openai_blocking(
+    config: &OpenAiBackend,
+    model: &str,
     evidence: &NudgeEvidence,
 ) -> Result<NudgeSuggestion, String> {
     let request_body = json!({
-        "model": config.model,
+        "model": model,
         "reasoning_effort": DEFAULT_REASONING_EFFORT,
         "messages": [
             {
@@ -500,9 +765,8 @@ pub fn suggest_nudge_blocking(
 
     let text = extract_response_text(&payload)
         .ok_or_else(|| format!("response did not include parseable text: {payload}"))?;
-    serde_json::from_str::<NudgeSuggestion>(&text)
+    parse_json_output::<NudgeSuggestion>(&text, "model nudge response")
         .map(NudgeSuggestion::sanitize)
-        .map_err(|error| format!("failed to parse model nudge response: {error}; payload={text}"))
 }
 
 fn format_error_chain(error: impl Error) -> String {
@@ -513,6 +777,259 @@ fn format_error_chain(error: impl Error) -> String {
         source = next.source();
     }
     parts.join(": ")
+}
+
+fn parse_json_output<T>(text: &str, label: &str) -> Result<T, String>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let trimmed = text.trim();
+    serde_json::from_str::<T>(trimmed)
+        .or_else(|_| serde_json::from_str::<T>(&strip_markdown_fences(trimmed)))
+        .map_err(|error| format!("failed to parse {label}: {error}; payload={trimmed}"))
+}
+
+fn strip_markdown_fences(text: &str) -> String {
+    let trimmed = text.trim();
+    if let Some(stripped) = trimmed.strip_prefix("```") {
+        let stripped = stripped
+            .lines()
+            .skip_while(|line| !line.trim().is_empty() && !line.trim_start().starts_with('{'))
+            .collect::<Vec<_>>()
+            .join("\n");
+        return stripped.trim_end_matches("```").trim().to_string();
+    }
+    trimmed.to_string()
+}
+
+fn summarize_cli_blocking(
+    backend: &CliBackend,
+    system_prompt: &str,
+    user_prompt: &str,
+) -> Result<TacticalSynthesis, String> {
+    let text = run_codex_cli(backend, system_prompt, user_prompt, &synthesis_schema())?;
+    parse_json_output::<TacticalSynthesis>(&text, "codex synthesis")
+        .map(TacticalSynthesis::sanitize)
+}
+
+fn summarize_claude_blocking(
+    backend: &CliBackend,
+    system_prompt: &str,
+    user_prompt: &str,
+) -> Result<TacticalSynthesis, String> {
+    let text = run_claude_cli(backend, system_prompt, user_prompt, &synthesis_schema())?;
+    parse_json_output::<TacticalSynthesis>(&text, "claude synthesis")
+        .map(TacticalSynthesis::sanitize)
+}
+
+fn suggest_name_cli_blocking(
+    backend: &CliBackend,
+    system_prompt: &str,
+    user_prompt: &str,
+) -> Result<NameSuggestion, String> {
+    let text = run_codex_cli(backend, system_prompt, user_prompt, &naming_schema())?;
+    parse_json_output::<NameSuggestion>(&text, "codex naming").map(NameSuggestion::sanitize)
+}
+
+fn suggest_name_claude_blocking(
+    backend: &CliBackend,
+    system_prompt: &str,
+    user_prompt: &str,
+) -> Result<NameSuggestion, String> {
+    let text = run_claude_cli(backend, system_prompt, user_prompt, &naming_schema())?;
+    parse_json_output::<NameSuggestion>(&text, "claude naming").map(NameSuggestion::sanitize)
+}
+
+fn suggest_nudge_cli_blocking(
+    backend: &CliBackend,
+    system_prompt: &str,
+    user_prompt: &str,
+) -> Result<NudgeSuggestion, String> {
+    let text = run_codex_cli(backend, system_prompt, user_prompt, &nudge_schema())?;
+    parse_json_output::<NudgeSuggestion>(&text, "codex nudge").map(NudgeSuggestion::sanitize)
+}
+
+fn suggest_nudge_claude_blocking(
+    backend: &CliBackend,
+    system_prompt: &str,
+    user_prompt: &str,
+) -> Result<NudgeSuggestion, String> {
+    let text = run_claude_cli(backend, system_prompt, user_prompt, &nudge_schema())?;
+    parse_json_output::<NudgeSuggestion>(&text, "claude nudge").map(NudgeSuggestion::sanitize)
+}
+
+fn run_codex_cli(
+    backend: &CliBackend,
+    system_prompt: &str,
+    user_prompt: &str,
+    schema: &Value,
+) -> Result<String, String> {
+    let schema_path = unique_temp_path("codex-schema", "json");
+    let output_path = unique_temp_path("codex-output", "json");
+    fs::write(
+        &schema_path,
+        serde_json::to_vec(schema).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| format!("failed to write codex schema file: {error}"))?;
+
+    let prompt = format!("{system_prompt}\n\n{user_prompt}");
+    let cwd = env::current_dir().map_err(|error| format!("failed to read current dir: {error}"))?;
+    let mut command = Command::new(&backend.program);
+    command
+        .arg("exec")
+        .arg("--skip-git-repo-check")
+        .arg("--sandbox")
+        .arg("read-only")
+        .arg("-m")
+        .arg(&backend.model)
+        .arg("--color")
+        .arg("never")
+        .arg("--output-schema")
+        .arg(&schema_path)
+        .arg("-o")
+        .arg(&output_path)
+        .arg("-C")
+        .arg(cwd)
+        .arg("-");
+    let result = run_command_with_input(command, &prompt, CLI_TIMEOUT, "codex");
+    let _ = fs::remove_file(&schema_path);
+    if result.is_err() {
+        let _ = fs::remove_file(&output_path);
+    }
+    result?;
+    let output = fs::read_to_string(&output_path)
+        .map_err(|error| format!("failed to read codex output file: {error}"));
+    let _ = fs::remove_file(&output_path);
+    output
+}
+
+fn run_claude_cli(
+    backend: &CliBackend,
+    system_prompt: &str,
+    user_prompt: &str,
+    schema: &Value,
+) -> Result<String, String> {
+    let schema_text = serde_json::to_string(schema).map_err(|error| error.to_string())?;
+    let mut command = Command::new(&backend.program);
+    command
+        .arg("-p")
+        .arg("--bare")
+        .arg("--no-session-persistence")
+        .arg("--model")
+        .arg(&backend.model)
+        .arg("--permission-mode")
+        .arg("plan")
+        .arg("--tools")
+        .arg("")
+        .arg("--system-prompt")
+        .arg(system_prompt)
+        .arg("--json-schema")
+        .arg(schema_text)
+        .arg(user_prompt);
+    run_command_with_input(command, "", CLI_TIMEOUT, "claude")
+}
+
+fn run_command_with_input(
+    mut command: Command,
+    input: &str,
+    timeout: Duration,
+    label: &str,
+) -> Result<String, String> {
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("failed to spawn {label}: {error}"))?;
+    let mut stdout_reader = child.stdout.take().map(spawn_pipe_reader);
+    let mut stderr_reader = child.stderr.take().map(spawn_pipe_reader);
+
+    {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| format!("{label} stdin was unavailable"))?;
+        if !input.is_empty() {
+            std::io::Write::write_all(&mut stdin, input.as_bytes())
+                .map_err(|error| format!("failed to write {label} stdin: {error}"))?;
+        }
+    }
+
+    let status = match wait_for_child(&mut child, timeout, label) {
+        Ok(status) => status,
+        Err(error) => {
+            let _ = join_pipe_reader(&mut stdout_reader, label, "stdout");
+            let _ = join_pipe_reader(&mut stderr_reader, label, "stderr");
+            return Err(error);
+        }
+    };
+    let stdout = join_pipe_reader(&mut stdout_reader, label, "stdout")?;
+    let stderr = join_pipe_reader(&mut stderr_reader, label, "stderr")?;
+    if status.success() {
+        Ok(stdout.trim().to_string())
+    } else if stderr.trim().is_empty() {
+        Err(format!("{label} exited with status {status}"))
+    } else {
+        Err(format!(
+            "{label} exited with status {status}: {}",
+            stderr.trim()
+        ))
+    }
+}
+
+fn spawn_pipe_reader<T>(mut pipe: T) -> thread::JoinHandle<Result<String, String>>
+where
+    T: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut text = String::new();
+        pipe.read_to_string(&mut text)
+            .map_err(|error| format!("failed to read subprocess output: {error}"))?;
+        Ok(text)
+    })
+}
+
+fn join_pipe_reader(
+    handle: &mut Option<thread::JoinHandle<Result<String, String>>>,
+    label: &str,
+    stream_label: &str,
+) -> Result<String, String> {
+    let Some(handle) = handle.take() else {
+        return Ok(String::new());
+    };
+    handle
+        .join()
+        .map_err(|_| format!("failed to join {label} {stream_label} reader"))?
+}
+
+fn wait_for_child(child: &mut Child, timeout: Duration, label: &str) -> Result<ExitStatus, String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("failed to wait for {label}: {error}"))?
+        {
+            return Ok(status);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("{label} timed out after {}s", timeout.as_secs()));
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn unique_temp_path(prefix: &str, extension: &str) -> std::path::PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    env::temp_dir().join(format!(
+        "exaterm-{prefix}-{}-{nanos}.{extension}",
+        std::process::id()
+    ))
 }
 
 fn tactical_system_prompt() -> &'static str {
@@ -734,14 +1251,24 @@ pub fn extract_response_text(payload: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_response_text, name_signature, normalize_naming_model, normalize_summary_model,
-        nudge_schema, nudge_signature, openai_chat_completions_url,
-        should_skip_repeated_paused_summary, summary_signature, summary_substantive_signature,
-        synthesis_schema, tactical_system_prompt, AttentionLevel, NameSuggestion, NamingEvidence,
-        NudgeEvidence, TacticalEvidence, TacticalState, TacticalSynthesis,
+        AttentionLevel, CliBackend, DEFAULT_CLAUDE_CLI_MODEL, DEFAULT_CODEX_CLI_MODEL,
+        DEFAULT_NAMING_MODEL, DEFAULT_NUDGE_MODEL, DEFAULT_SUMMARY_MODEL, NameSuggestion,
+        NamingEvidence, NudgeEvidence, OpenAiBackend, ProviderPreferences,
+        SynthesisBackendRegistry, SynthesisProvider, TacticalEvidence, TacticalState,
+        TacticalSynthesis, extract_response_text, name_signature, normalize_naming_model,
+        normalize_summary_model, nudge_schema, nudge_signature, openai_chat_completions_url,
+        run_command_with_input, should_skip_repeated_paused_summary, summary_signature,
+        summary_substantive_signature, synthesis_schema, tactical_system_prompt,
     };
     use serde_json::json;
+    use std::collections::BTreeSet;
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+    use std::process::Command;
     use std::sync::Mutex;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
@@ -749,6 +1276,23 @@ mod tests {
     struct FixtureExpectations {
         tactical_states: Vec<TacticalState>,
         attention_levels: Vec<AttentionLevel>,
+    }
+
+    fn unique_temp_dir(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("exaterm-synthesis-{label}-{nanos}"))
+    }
+
+    #[cfg(unix)]
+    fn write_fake_executable(dir: &PathBuf, name: &str) {
+        let path = dir.join(name);
+        fs::write(&path, "#!/bin/sh\nexit 0\n").expect("write fake executable");
+        let mut perms = fs::metadata(&path).expect("metadata").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&path, perms).expect("chmod fake executable");
     }
 
     #[test]
@@ -763,6 +1307,15 @@ mod tests {
         assert_eq!(normalize_naming_model("gpt-5.4-mini"), "gpt-5.4-mini");
         assert_eq!(normalize_naming_model(""), "gpt-5.4-mini");
         assert_eq!(normalize_naming_model("gpt-5.4"), "gpt-5.4");
+    }
+
+    #[test]
+    fn cli_model_defaults_and_preserves_exact_name() {
+        assert_eq!(
+            super::normalize_cli_model("", "gpt-5.4-mini"),
+            "gpt-5.4-mini"
+        );
+        assert_eq!(super::normalize_cli_model("haiku", "other"), "haiku");
     }
 
     #[test]
@@ -840,6 +1393,274 @@ mod tests {
 
         let text = extract_response_text(&payload).expect("text should be extracted");
         assert!(text.contains("\"headline\":\"cargo test parser\""));
+    }
+
+    #[test]
+    fn parse_json_output_accepts_fenced_json() {
+        let parsed = super::parse_json_output::<NameSuggestion>(
+            "```json\n{\"name\":\"Parser pass\"}\n```",
+            "fenced",
+        )
+        .expect("fenced json should parse");
+        assert_eq!(parsed.name, "Parser pass");
+    }
+
+    #[test]
+    fn backend_registry_prefers_openai_over_cli_fallbacks() {
+        let _guard = ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let fake_bin = unique_temp_dir("prefer-openai");
+        fs::create_dir_all(&fake_bin).expect("create fake bin");
+        write_fake_executable(&fake_bin, "codex");
+        write_fake_executable(&fake_bin, "claude");
+
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", &fake_bin);
+        std::env::set_var("OPENAI_API_KEY", "test-key");
+
+        let registry = SynthesisBackendRegistry::from_env().expect("registry should exist");
+        assert_eq!(
+            registry.preferred_provider_order(&ProviderPreferences::default()),
+            vec![
+                SynthesisProvider::OpenAi,
+                SynthesisProvider::CodexCli,
+                SynthesisProvider::ClaudeCli
+            ]
+        );
+
+        std::env::set_var("PATH", old_path);
+        std::env::remove_var("OPENAI_API_KEY");
+        let _ = fs::remove_dir_all(fake_bin);
+    }
+
+    #[test]
+    fn backend_registry_uses_codex_before_claude_without_openai() {
+        let _guard = ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let fake_bin = unique_temp_dir("prefer-codex");
+        fs::create_dir_all(&fake_bin).expect("create fake bin");
+        write_fake_executable(&fake_bin, "codex");
+        write_fake_executable(&fake_bin, "claude");
+
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", &fake_bin);
+        std::env::remove_var("OPENAI_API_KEY");
+
+        let registry = SynthesisBackendRegistry::from_env().expect("registry should exist");
+        assert_eq!(
+            registry.preferred_provider_order(&ProviderPreferences::default()),
+            vec![SynthesisProvider::CodexCli, SynthesisProvider::ClaudeCli]
+        );
+        let skipped = BTreeSet::from([SynthesisProvider::CodexCli]);
+        assert_eq!(
+            registry.preferred_provider_order(&ProviderPreferences {
+                skipped_providers: skipped
+            }),
+            vec![SynthesisProvider::ClaudeCli]
+        );
+
+        std::env::set_var("PATH", old_path);
+        let _ = fs::remove_dir_all(fake_bin);
+    }
+
+    #[test]
+    fn backend_registry_skips_openai_when_previously_demoted() {
+        let registry = SynthesisBackendRegistry {
+            openai: Some(OpenAiBackend {
+                api_key: "test-key".into(),
+                base_url: "https://example.invalid/v1/chat/completions".into(),
+            }),
+            codex: Some(CliBackend {
+                program: "codex".into(),
+                model: DEFAULT_CODEX_CLI_MODEL.into(),
+            }),
+            claude: Some(CliBackend {
+                program: "claude".into(),
+                model: DEFAULT_CLAUDE_CLI_MODEL.into(),
+            }),
+            summary_model: DEFAULT_SUMMARY_MODEL.into(),
+            naming_model: DEFAULT_NAMING_MODEL.into(),
+            nudge_model: DEFAULT_NUDGE_MODEL.into(),
+        };
+
+        let skipped = BTreeSet::from([SynthesisProvider::OpenAi]);
+        assert_eq!(
+            registry.preferred_provider_order(&ProviderPreferences {
+                skipped_providers: skipped,
+            }),
+            vec![SynthesisProvider::CodexCli, SynthesisProvider::ClaudeCli]
+        );
+    }
+
+    #[test]
+    fn find_executable_checks_standard_dirs_after_path() {
+        let _guard = ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let fake_home = unique_temp_dir("standard-dirs");
+        let fake_local_bin = fake_home.join(".local/bin");
+        fs::create_dir_all(&fake_local_bin).expect("create fake local bin");
+        write_fake_executable(&fake_local_bin, "codex");
+
+        let old_home = std::env::var("HOME").ok();
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("HOME", &fake_home);
+        std::env::set_var("PATH", "/usr/bin:/bin");
+
+        let discovered = super::find_executable("codex");
+        assert!(discovered.is_some(), "codex should be discoverable");
+
+        match old_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+        std::env::set_var("PATH", old_path);
+        let _ = fs::remove_dir_all(fake_home);
+    }
+
+    #[test]
+    fn backend_registry_is_none_when_no_provider_exists() {
+        let _guard = ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", "/usr/bin:/bin");
+        std::env::remove_var("OPENAI_API_KEY");
+        if super::find_executable("codex").is_none() && super::find_executable("claude").is_none() {
+            assert!(SynthesisBackendRegistry::from_env().is_none());
+        }
+
+        std::env::set_var("PATH", old_path);
+    }
+
+    #[test]
+    fn run_with_fallback_demotes_failed_subprocess_and_uses_next_provider() {
+        let registry = SynthesisBackendRegistry {
+            openai: None,
+            codex: Some(CliBackend {
+                program: "codex".into(),
+                model: DEFAULT_CODEX_CLI_MODEL.into(),
+            }),
+            claude: Some(CliBackend {
+                program: "claude".into(),
+                model: DEFAULT_CLAUDE_CLI_MODEL.into(),
+            }),
+            summary_model: DEFAULT_SUMMARY_MODEL.into(),
+            naming_model: DEFAULT_NAMING_MODEL.into(),
+            nudge_model: DEFAULT_NUDGE_MODEL.into(),
+        };
+        let mut calls = Vec::new();
+        let result = registry.run_with_fallback(&ProviderPreferences::default(), |provider| {
+            calls.push(provider);
+            match provider {
+                SynthesisProvider::CodexCli => Err("codex failed".into()),
+                SynthesisProvider::ClaudeCli => Ok("ok".to_string()),
+                SynthesisProvider::OpenAi => Err("unexpected openai".into()),
+            }
+        });
+
+        assert_eq!(
+            calls,
+            vec![SynthesisProvider::CodexCli, SynthesisProvider::ClaudeCli]
+        );
+        assert_eq!(result.provider, SynthesisProvider::ClaudeCli);
+        assert_eq!(result.demoted_provider, Some(SynthesisProvider::CodexCli));
+        assert_eq!(result.value.expect("fallback should succeed"), "ok");
+    }
+
+    #[test]
+    fn run_with_fallback_demotes_failed_openai_and_uses_next_provider() {
+        let registry = SynthesisBackendRegistry {
+            openai: Some(OpenAiBackend {
+                api_key: "test-key".into(),
+                base_url: "https://example.invalid/v1/chat/completions".into(),
+            }),
+            codex: Some(CliBackend {
+                program: "codex".into(),
+                model: DEFAULT_CODEX_CLI_MODEL.into(),
+            }),
+            claude: Some(CliBackend {
+                program: "claude".into(),
+                model: DEFAULT_CLAUDE_CLI_MODEL.into(),
+            }),
+            summary_model: DEFAULT_SUMMARY_MODEL.into(),
+            naming_model: DEFAULT_NAMING_MODEL.into(),
+            nudge_model: DEFAULT_NUDGE_MODEL.into(),
+        };
+        let mut calls = Vec::new();
+        let result = registry.run_with_fallback(&ProviderPreferences::default(), |provider| {
+            calls.push(provider);
+            match provider {
+                SynthesisProvider::OpenAi => Err("openai failed".into()),
+                SynthesisProvider::CodexCli => Ok("ok".to_string()),
+                SynthesisProvider::ClaudeCli => Err("unexpected claude".into()),
+            }
+        });
+
+        assert_eq!(
+            calls,
+            vec![SynthesisProvider::OpenAi, SynthesisProvider::CodexCli]
+        );
+        assert_eq!(result.provider, SynthesisProvider::CodexCli);
+        assert_eq!(result.demoted_provider, Some(SynthesisProvider::OpenAi));
+        assert_eq!(result.value.expect("fallback should succeed"), "ok");
+    }
+
+    #[test]
+    fn run_command_with_input_drains_stdout_and_stderr_concurrently() {
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg(
+            r#"
+i=0
+while [ "$i" -lt 2048 ]; do
+  printf 'stdout-%04d xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n' "$i"
+  printf 'stderr-%04d xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n' "$i" 1>&2
+  i=$((i + 1))
+done
+read input
+printf 'stdin:%s\n' "$input"
+"#,
+        );
+
+        let output = run_command_with_input(command, "hello\n", Duration::from_secs(5), "sh")
+            .expect("command should complete without deadlocking");
+        assert!(output.contains("stdin:hello"));
+    }
+
+    #[test]
+    fn run_with_fallback_skips_any_preferred_subprocess_when_preference_is_set() {
+        let registry = SynthesisBackendRegistry {
+            openai: None,
+            codex: Some(CliBackend {
+                program: "codex".into(),
+                model: DEFAULT_CODEX_CLI_MODEL.into(),
+            }),
+            claude: Some(CliBackend {
+                program: "claude".into(),
+                model: DEFAULT_CLAUDE_CLI_MODEL.into(),
+            }),
+            summary_model: DEFAULT_SUMMARY_MODEL.into(),
+            naming_model: DEFAULT_NAMING_MODEL.into(),
+            nudge_model: DEFAULT_NUDGE_MODEL.into(),
+        };
+        let mut calls = Vec::new();
+        let skipped = BTreeSet::from([SynthesisProvider::CodexCli]);
+        let result = registry.run_with_fallback(
+            &ProviderPreferences {
+                skipped_providers: skipped,
+            },
+            |provider| {
+                calls.push(provider);
+                Ok("ok".to_string())
+            },
+        );
+
+        assert_eq!(calls, vec![SynthesisProvider::ClaudeCli]);
+        assert_eq!(result.provider, SynthesisProvider::ClaudeCli);
+        assert_eq!(result.demoted_provider, None);
+        assert_eq!(result.value.expect("claude should run"), "ok");
     }
 
     #[test]
@@ -1041,9 +1862,11 @@ mod tests {
         assert!(fixtures.len() >= 12);
         assert!(fixtures.iter().any(|(name, _, _)| name.contains("codex")));
         assert!(fixtures.iter().any(|(name, _, _)| name.contains("claude")));
-        assert!(fixtures
-            .iter()
-            .all(|(_, evidence, _)| evidence.recent_terminal_activity.len() >= 6));
+        assert!(
+            fixtures
+                .iter()
+                .all(|(_, evidence, _)| evidence.recent_terminal_activity.len() >= 6)
+        );
         assert!(fixtures.iter().any(|(_, _, expectations)| {
             expectations
                 .attention_levels
@@ -1120,7 +1943,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
 
-        let Some(config) = super::OpenAiSynthesisConfig::from_env() else {
+        let Some(registry) = SynthesisBackendRegistry::from_env() else {
             return;
         };
 
@@ -1129,7 +1952,10 @@ mod tests {
             .find(|(fixture_name, _, _)| *fixture_name == name)
             .unwrap_or_else(|| panic!("missing live summary fixture: {name}"));
 
-        let summary = match super::summarize_blocking(&config, &evidence) {
+        let summary = match registry
+            .summarize_blocking(&ProviderPreferences::default(), &evidence)
+            .value
+        {
             Ok(summary) => summary,
             Err(error) if error.contains("error sending request for url") => {
                 eprintln!(
@@ -1609,22 +2435,26 @@ mod tests {
     #[test]
     fn tactical_prompt_requires_real_state_and_high_bar_for_complete() {
         let prompt = tactical_system_prompt();
-        assert!(prompt
-            .contains("You must always choose a real tactical_state and a real attention_level."));
+        assert!(
+            prompt.contains(
+                "You must always choose a real tactical_state and a real attention_level."
+            )
+        );
         assert!(prompt.contains("use complete rarely; the bar is high"));
         assert!(prompt.contains("do not use complete for 'looks good'"));
-        assert!(prompt
-            .contains("when unsure between idle and stopped after recent work, prefer stopped"));
+        assert!(
+            prompt
+                .contains("when unsure between idle and stopped after recent work, prefer stopped")
+        );
     }
 
     #[test]
     fn synthesis_schema_requires_non_null_tactical_state() {
         let schema = synthesis_schema();
         assert_eq!(schema["properties"]["tactical_state"]["type"], "string");
-        assert!(!schema["properties"]["tactical_state"]["enum"]
+        let enum_values = schema["properties"]["tactical_state"]["enum"]
             .as_array()
-            .expect("tactical_state enum should be an array")
-            .iter()
-            .any(|value| value.is_null()));
+            .expect("tactical_state enum should be an array");
+        assert!(!enum_values.iter().any(serde_json::Value::is_null));
     }
 }

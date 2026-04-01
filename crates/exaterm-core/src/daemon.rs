@@ -1,20 +1,20 @@
-use crate::file_watch::{spawn_repo_watch, RepoWatchHandle};
-use crate::model::{user_shell_launch, SessionId, SessionLaunch, WorkspaceStore};
+use crate::file_watch::{RepoWatchHandle, spawn_repo_watch};
+use crate::model::{SessionId, SessionLaunch, WorkspaceStore, user_shell_launch};
 use crate::observation::{
-    apply_file_activity, apply_observation_refresh, apply_stream_update, build_naming_evidence,
-    build_nudge_evidence, build_tactical_evidence, clear_file_activity,
+    SessionObservation, apply_file_activity, apply_observation_refresh, apply_stream_update,
+    build_naming_evidence, build_nudge_evidence, build_tactical_evidence, clear_file_activity,
     compute_observation_refresh, find_git_worktree_root, is_bare_waiting_shell,
-    record_terminal_input_activity, SessionObservation,
+    record_terminal_input_activity,
 };
 use crate::proto::{
     ClientMessage, ObservationSnapshot, ServerMessage, SessionSnapshot, WorkspaceSnapshot,
 };
-use crate::runtime::{spawn_headless_runtime, RuntimeEvent, SessionRuntime};
+use crate::runtime::{RuntimeEvent, SessionRuntime, spawn_headless_runtime};
 use crate::synthesis::{
-    name_signature, nudge_signature, should_skip_repeated_paused_summary, suggest_name_blocking,
-    suggest_nudge_blocking, summarize_blocking, summary_signature, summary_substantive_signature,
-    NameSuggestion, NamingEvidence, NudgeEvidence, NudgeSuggestion, OpenAiNamingConfig,
-    OpenAiNudgeConfig, OpenAiSynthesisConfig, TacticalState, TacticalSynthesis,
+    NameSuggestion, NamingEvidence, NudgeEvidence, NudgeSuggestion, ProviderCallResult,
+    ProviderPreferences, SynthesisBackendRegistry, TacticalState, TacticalSynthesis,
+    name_signature, nudge_signature, should_skip_repeated_paused_summary, summary_signature,
+    summary_substantive_signature,
 };
 use portable_pty::PtySize;
 use serde::Serialize;
@@ -39,6 +39,7 @@ const REFRESH_INTERVAL: Duration = Duration::from_millis(900);
 const CONTROL_EVENTS_PER_TICK: usize = 128;
 const TERMINAL_RETURN_DELAY: Duration = Duration::from_millis(35);
 const MIN_IDLE_SECS_FOR_NUDGE: u64 = 20;
+const PROVIDER_DEMOTION_COOLDOWN: Duration = Duration::from_secs(300);
 
 struct SummaryWorker {
     requests: mpsc::Sender<SummaryJob>,
@@ -50,13 +51,14 @@ struct SummaryJob {
     signature: String,
     substantive_signature: String,
     evidence: crate::synthesis::TacticalEvidence,
+    preferences: ProviderPreferences,
 }
 
 struct SummaryResult {
     session_id: SessionId,
     signature: String,
     substantive_signature: String,
-    summary: Result<TacticalSynthesis, String>,
+    summary: ProviderCallResult<TacticalSynthesis>,
 }
 
 struct NamingWorker {
@@ -68,12 +70,13 @@ struct NamingJob {
     session_id: SessionId,
     signature: String,
     evidence: NamingEvidence,
+    preferences: ProviderPreferences,
 }
 
 struct NamingResult {
     session_id: SessionId,
     signature: String,
-    suggestion: Result<NameSuggestion, String>,
+    suggestion: ProviderCallResult<NameSuggestion>,
 }
 
 struct NudgeWorker {
@@ -85,6 +88,7 @@ struct NudgeJob {
     session_id: SessionId,
     signature: String,
     evidence: NudgeEvidence,
+    preferences: ProviderPreferences,
 }
 
 struct ObservationWorker {
@@ -131,7 +135,7 @@ impl ControlNotifier {
 struct NudgeResult {
     session_id: SessionId,
     signature: String,
-    suggestion: Result<NudgeSuggestion, String>,
+    suggestion: ProviderCallResult<NudgeSuggestion>,
 }
 
 struct SummaryCacheEntry {
@@ -142,6 +146,7 @@ struct SummaryCacheEntry {
     last_summary: Option<TacticalSynthesis>,
     last_attempt: Option<Instant>,
     in_flight: bool,
+    skipped_providers: BTreeMap<crate::synthesis::SynthesisProvider, Instant>,
 }
 
 struct ObservationCacheEntry {
@@ -154,6 +159,7 @@ struct NamingCacheEntry {
     requested_signature: Option<String>,
     last_attempt: Option<Instant>,
     in_flight: bool,
+    skipped_providers: BTreeMap<crate::synthesis::SynthesisProvider, Instant>,
 }
 
 struct NudgeCacheEntry {
@@ -164,6 +170,7 @@ struct NudgeCacheEntry {
     last_attempt: Option<Instant>,
     last_sent: Option<Instant>,
     in_flight: bool,
+    skipped_providers: BTreeMap<crate::synthesis::SynthesisProvider, Instant>,
 }
 
 impl SummaryCacheEntry {
@@ -176,6 +183,7 @@ impl SummaryCacheEntry {
             last_summary: None,
             last_attempt: None,
             in_flight: false,
+            skipped_providers: BTreeMap::new(),
         }
     }
 }
@@ -196,6 +204,7 @@ impl NamingCacheEntry {
             requested_signature: None,
             last_attempt: None,
             in_flight: false,
+            skipped_providers: BTreeMap::new(),
         }
     }
 }
@@ -210,6 +219,7 @@ impl NudgeCacheEntry {
             last_attempt: None,
             last_sent: None,
             in_flight: false,
+            skipped_providers: BTreeMap::new(),
         }
     }
 }
@@ -1011,6 +1021,7 @@ fn maybe_queue_summary(
         signature,
         substantive_signature,
         evidence: evidence.clone(),
+        preferences: active_provider_preferences(&entry.skipped_providers),
     });
 }
 
@@ -1042,6 +1053,7 @@ fn maybe_queue_name(state: &mut DaemonState, session_id: SessionId, evidence: &N
         session_id,
         signature,
         evidence: evidence.clone(),
+        preferences: active_provider_preferences(&entry.skipped_providers),
     });
 }
 
@@ -1098,6 +1110,7 @@ fn maybe_queue_nudge(
         session_id: session.id,
         signature,
         evidence,
+        preferences: active_provider_preferences(&entry.skipped_providers),
     });
 }
 
@@ -1143,7 +1156,10 @@ fn drain_worker_results(state: &mut DaemonState) -> bool {
                 .or_insert_with(SummaryCacheEntry::new);
             entry.in_flight = false;
             entry.requested_signature = None;
-            if let Ok(summary) = result.summary {
+            if let Some(provider) = result.summary.demoted_provider {
+                record_provider_demotion(&mut entry.skipped_providers, provider);
+            }
+            if let Ok(summary) = result.summary.value {
                 entry.completed_signature = Some(result.signature);
                 entry.completed_substantive_signature = Some(result.substantive_signature);
                 entry.last_summary = Some(summary);
@@ -1160,7 +1176,10 @@ fn drain_worker_results(state: &mut DaemonState) -> bool {
                 .or_insert_with(NamingCacheEntry::new);
             entry.in_flight = false;
             entry.requested_signature = None;
-            if let Ok(suggestion) = result.suggestion {
+            if let Some(provider) = result.suggestion.demoted_provider {
+                record_provider_demotion(&mut entry.skipped_providers, provider);
+            }
+            if let Ok(suggestion) = result.suggestion.value {
                 entry.completed_signature = Some(result.signature);
                 if !suggestion.name.is_empty() {
                     state
@@ -1191,7 +1210,10 @@ fn drain_worker_results(state: &mut DaemonState) -> bool {
                 .or_insert_with(NudgeCacheEntry::new);
             entry.in_flight = false;
             entry.requested_signature = None;
-            if let Ok(suggestion) = result.suggestion {
+            if let Some(provider) = result.suggestion.demoted_provider {
+                record_provider_demotion(&mut entry.skipped_providers, provider);
+            }
+            if let Ok(suggestion) = result.suggestion.value {
                 entry.completed_signature = Some(result.signature);
                 entry.last_nudge = (!suggestion.text.is_empty()).then_some(suggestion.text.clone());
                 suggestion_text = (!suggestion.text.is_empty()).then_some(suggestion.text);
@@ -1210,6 +1232,25 @@ fn drain_worker_results(state: &mut DaemonState) -> bool {
     }
 
     changed
+}
+
+fn active_provider_preferences(
+    skipped_providers: &BTreeMap<crate::synthesis::SynthesisProvider, Instant>,
+) -> ProviderPreferences {
+    let skipped_providers = skipped_providers
+        .iter()
+        .filter_map(|(provider, demoted_at)| {
+            (demoted_at.elapsed() < PROVIDER_DEMOTION_COOLDOWN).then_some(*provider)
+        })
+        .collect();
+    ProviderPreferences { skipped_providers }
+}
+
+fn record_provider_demotion(
+    skipped_providers: &mut BTreeMap<crate::synthesis::SynthesisProvider, Instant>,
+    provider: crate::synthesis::SynthesisProvider,
+) {
+    skipped_providers.insert(provider, Instant::now());
 }
 
 fn handle_runtime_event(
@@ -1324,12 +1365,12 @@ fn summary_refresh_interval(session_age: Duration) -> Duration {
 }
 
 fn spawn_summary_worker() -> Option<SummaryWorker> {
-    let config = OpenAiSynthesisConfig::from_env()?;
+    let registry = SynthesisBackendRegistry::from_env()?;
     let (request_tx, request_rx) = mpsc::channel::<SummaryJob>();
     let (result_tx, result_rx) = mpsc::channel::<SummaryResult>();
     thread::spawn(move || {
         while let Ok(job) = request_rx.recv() {
-            let summary = summarize_blocking(&config, &job.evidence);
+            let summary = registry.summarize_blocking(&job.preferences, &job.evidence);
             let _ = result_tx.send(SummaryResult {
                 session_id: job.session_id,
                 signature: job.signature,
@@ -1345,12 +1386,12 @@ fn spawn_summary_worker() -> Option<SummaryWorker> {
 }
 
 fn spawn_naming_worker() -> Option<NamingWorker> {
-    let config = OpenAiNamingConfig::from_env()?;
+    let registry = SynthesisBackendRegistry::from_env()?;
     let (request_tx, request_rx) = mpsc::channel::<NamingJob>();
     let (result_tx, result_rx) = mpsc::channel::<NamingResult>();
     thread::spawn(move || {
         while let Ok(job) = request_rx.recv() {
-            let suggestion = suggest_name_blocking(&config, &job.evidence);
+            let suggestion = registry.suggest_name_blocking(&job.preferences, &job.evidence);
             let _ = result_tx.send(NamingResult {
                 session_id: job.session_id,
                 signature: job.signature,
@@ -1365,12 +1406,12 @@ fn spawn_naming_worker() -> Option<NamingWorker> {
 }
 
 fn spawn_nudge_worker() -> Option<NudgeWorker> {
-    let config = OpenAiNudgeConfig::from_env()?;
+    let registry = SynthesisBackendRegistry::from_env()?;
     let (request_tx, request_rx) = mpsc::channel::<NudgeJob>();
     let (result_tx, result_rx) = mpsc::channel::<NudgeResult>();
     thread::spawn(move || {
         while let Ok(job) = request_rx.recv() {
-            let suggestion = suggest_nudge_blocking(&config, &job.evidence);
+            let suggestion = registry.suggest_nudge_blocking(&job.preferences, &job.evidence);
             let _ = result_tx.send(NudgeResult {
                 session_id: job.session_id,
                 signature: job.signature,
@@ -1538,7 +1579,7 @@ fn spawn_local_daemon_process(current_exe: &std::path::Path) -> Result<(), Strin
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
-            inherit_beachhead_openai_env(&mut command);
+            inherit_beachhead_env(&mut command);
             return command
                 .spawn()
                 .map(|_| ())
@@ -1552,7 +1593,7 @@ fn spawn_local_daemon_process(current_exe: &std::path::Path) -> Result<(), Strin
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    inherit_beachhead_openai_env(&mut command);
+    inherit_beachhead_env(&mut command);
     command
         .spawn()
         .map(|_| ())
@@ -1569,7 +1610,7 @@ fn exatermd_sibling_path(current_exe: &std::path::Path) -> Option<PathBuf> {
     Some(current_exe.with_file_name(sibling))
 }
 
-fn inherit_beachhead_openai_env(command: &mut Command) {
+fn inherit_beachhead_env(command: &mut Command) {
     for key in [
         "OPENAI_API_KEY",
         "EXATERM_OPENAI_BASE_URL",
@@ -1577,6 +1618,8 @@ fn inherit_beachhead_openai_env(command: &mut Command) {
         "EXATERM_SUMMARY_MODEL",
         "EXATERM_NAMING_MODEL",
         "EXATERM_NUDGE_MODEL",
+        "EXATERM_CODEX_CLI_MODEL",
+        "EXATERM_CLAUDE_CLI_MODEL",
     ] {
         if let Some(value) = env::var_os(key) {
             command.env(key, value);
@@ -2007,5 +2050,133 @@ mod tests {
 
         state.shutdown_workspace();
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn drain_worker_results_persists_provider_demotions_per_session() {
+        let mut state = DaemonState::new();
+
+        let (summary_request_tx, _summary_request_rx) = mpsc::channel();
+        let (summary_result_tx, summary_result_rx) = mpsc::channel();
+        state.summary_worker = Some(SummaryWorker {
+            requests: summary_request_tx,
+            responses: summary_result_rx,
+        });
+        summary_result_tx
+            .send(SummaryResult {
+                session_id: SessionId(1),
+                signature: "summary".into(),
+                substantive_signature: "summary-substantive".into(),
+                summary: ProviderCallResult {
+                    provider: crate::synthesis::SynthesisProvider::ClaudeCli,
+                    value: Err("openai failed".into()),
+                    demoted_provider: Some(crate::synthesis::SynthesisProvider::OpenAi),
+                },
+            })
+            .expect("send summary result");
+
+        let (naming_request_tx, _naming_request_rx) = mpsc::channel();
+        let (naming_result_tx, naming_result_rx) = mpsc::channel();
+        state.naming_worker = Some(NamingWorker {
+            requests: naming_request_tx,
+            responses: naming_result_rx,
+        });
+        naming_result_tx
+            .send(NamingResult {
+                session_id: SessionId(2),
+                signature: "naming".into(),
+                suggestion: ProviderCallResult {
+                    provider: crate::synthesis::SynthesisProvider::ClaudeCli,
+                    value: Err("claude failed".into()),
+                    demoted_provider: Some(crate::synthesis::SynthesisProvider::ClaudeCli),
+                },
+            })
+            .expect("send naming result");
+
+        let (nudge_request_tx, _nudge_request_rx) = mpsc::channel();
+        let (nudge_result_tx, nudge_result_rx) = mpsc::channel();
+        state.nudge_worker = Some(NudgeWorker {
+            requests: nudge_request_tx,
+            responses: nudge_result_rx,
+        });
+        nudge_result_tx
+            .send(NudgeResult {
+                session_id: SessionId(3),
+                signature: "nudge".into(),
+                suggestion: ProviderCallResult {
+                    provider: crate::synthesis::SynthesisProvider::ClaudeCli,
+                    value: Err("codex failed".into()),
+                    demoted_provider: Some(crate::synthesis::SynthesisProvider::CodexCli),
+                },
+            })
+            .expect("send nudge result");
+
+        let changed = drain_worker_results(&mut state);
+        assert!(!changed);
+        assert!(
+            state
+                .summary_cache
+                .get(&SessionId(1))
+                .unwrap()
+                .skipped_providers
+                .contains_key(&crate::synthesis::SynthesisProvider::OpenAi)
+        );
+        assert!(
+            state
+                .naming_cache
+                .get(&SessionId(2))
+                .unwrap()
+                .skipped_providers
+                .contains_key(&crate::synthesis::SynthesisProvider::ClaudeCli)
+        );
+        assert!(
+            state
+                .nudge_cache
+                .get(&SessionId(3))
+                .unwrap()
+                .skipped_providers
+                .contains_key(&crate::synthesis::SynthesisProvider::CodexCli)
+        );
+    }
+
+    #[test]
+    fn maybe_queue_summary_retries_expired_provider_demotions() {
+        let mut state = DaemonState::new();
+
+        let (request_tx, request_rx) = mpsc::channel();
+        let (response_tx, response_rx) = mpsc::channel();
+        state.summary_worker = Some(SummaryWorker {
+            requests: request_tx,
+            responses: response_rx,
+        });
+
+        let session_id = SessionId(7);
+        let mut entry = SummaryCacheEntry::new();
+        entry.skipped_providers.insert(
+            crate::synthesis::SynthesisProvider::OpenAi,
+            Instant::now() - PROVIDER_DEMOTION_COOLDOWN - Duration::from_secs(1),
+        );
+        state.summary_cache.insert(session_id, entry);
+
+        let evidence = crate::synthesis::TacticalEvidence {
+            session_name: "Shell".into(),
+            task_label: "Retry".into(),
+            dominant_process: None,
+            process_tree_excerpt: None,
+            recent_files: vec![],
+            terminal_status_line: None,
+            terminal_status_line_age: None,
+            recent_terminal_activity: vec![],
+            recent_events: vec![],
+        };
+
+        maybe_queue_summary(&mut state, session_id, &evidence);
+
+        let job = request_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("summary job should be queued after cooldown");
+        assert!(job.preferences.skipped_providers.is_empty());
+
+        drop(response_tx);
     }
 }
