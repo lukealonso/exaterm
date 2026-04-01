@@ -1,4 +1,4 @@
-use exaterm_core::daemon::{LocalBeachheadClient, connect_session_stream_socket};
+use exaterm_core::daemon::{connect_session_stream_socket, LocalBeachheadClient};
 use exaterm_types::model::SessionId;
 use exaterm_types::proto::{ClientMessage, ServerMessage};
 use std::collections::BTreeMap;
@@ -129,6 +129,7 @@ pub struct RemoteBeachheadBridge {
 struct SessionForward {
     process: Child,
     local_socket_path: PathBuf,
+    remote_socket_name: String,
 }
 
 pub struct RemoteRawSessionConnector {
@@ -262,40 +263,55 @@ impl RemoteRawSessionConnector {
             .local_socket_dir
             .join(format!("session-{}.sock", session_id.0));
         let remote_socket_path = format!("{}/{}", self.remote_socket_dir, socket_name);
-        {
+        let needs_refresh = {
+            let forwards = self
+                .session_forwards
+                .lock()
+                .map_err(|_| "remote session forward lock poisoned".to_string())?;
+            forwards
+                .get(&session_id)
+                .is_none_or(|forward| forward.remote_socket_name != socket_name)
+        };
+
+        if needs_refresh {
             let mut forwards = self
                 .session_forwards
                 .lock()
                 .map_err(|_| "remote session forward lock poisoned".to_string())?;
-            if !forwards.contains_key(&session_id) {
-                let mut forward = Command::new("ssh");
-                forward
-                    .arg("-o")
-                    .arg("ExitOnForwardFailure=yes")
-                    .arg("-o")
-                    .arg("StreamLocalBindUnlink=yes")
-                    .arg("-N")
-                    .arg("-L")
-                    .arg(format!(
-                        "{}:{}",
-                        local_socket_path.display(),
-                        remote_socket_path
-                    ))
-                    .arg(&self.target)
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null());
-                let process = forward.spawn().map_err(|error| {
-                    format!("failed to start SSH raw-session forwarder: {error}")
-                })?;
-                forwards.insert(
-                    session_id,
-                    SessionForward {
-                        process,
-                        local_socket_path: local_socket_path.clone(),
-                    },
-                );
+            if let Some(mut existing) = forwards.remove(&session_id) {
+                let _ = existing.process.kill();
+                let _ = existing.process.wait();
+                let _ = fs::remove_file(existing.local_socket_path);
             }
+
+            let mut forward = Command::new("ssh");
+            forward
+                .arg("-o")
+                .arg("ExitOnForwardFailure=yes")
+                .arg("-o")
+                .arg("StreamLocalBindUnlink=yes")
+                .arg("-N")
+                .arg("-L")
+                .arg(format!(
+                    "{}:{}",
+                    local_socket_path.display(),
+                    remote_socket_path
+                ))
+                .arg(&self.target)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            let process = forward
+                .spawn()
+                .map_err(|error| format!("failed to start SSH raw-session forwarder: {error}"))?;
+            forwards.insert(
+                session_id,
+                SessionForward {
+                    process,
+                    local_socket_path: local_socket_path.clone(),
+                    remote_socket_name: socket_name.to_string(),
+                },
+            );
         }
 
         wait_for_forwarded_control_socket(
@@ -518,7 +534,7 @@ fn wait_for_forwarded_control_socket(
 
 #[cfg(test)]
 mod tests {
-    use super::{RunMode, parse_run_mode, shell_quote, ssh_shell_command};
+    use super::{parse_run_mode, shell_quote, ssh_shell_command, RunMode};
 
     #[test]
     fn parses_local_run_mode_without_args() {

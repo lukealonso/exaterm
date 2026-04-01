@@ -7,6 +7,24 @@ use std::sync::mpsc;
 use exaterm_types::model::SessionId;
 use exaterm_ui::beachhead::RawSessionConnector;
 
+pub(crate) trait SessionConnector {
+    fn connect_raw_session(
+        &self,
+        session_id: SessionId,
+        socket_name: &str,
+    ) -> Result<UnixStream, String>;
+}
+
+impl SessionConnector for RawSessionConnector {
+    fn connect_raw_session(
+        &self,
+        session_id: SessionId,
+        socket_name: &str,
+    ) -> Result<UnixStream, String> {
+        RawSessionConnector::connect_raw_session(self, session_id, socket_name)
+    }
+}
+
 /// Bidirectional I/O bridge for a single session's raw PTY stream.
 pub struct SessionIO {
     output_rx: mpsc::Receiver<Vec<u8>>,
@@ -16,8 +34,8 @@ pub struct SessionIO {
 
 impl SessionIO {
     /// Connect to a session's raw stream socket and spawn a background reader thread.
-    pub fn connect(
-        connector: &RawSessionConnector,
+    pub(crate) fn connect<C: SessionConnector>(
+        connector: &C,
         session_id: SessionId,
         socket_name: &str,
     ) -> Result<Self, String> {
@@ -73,19 +91,26 @@ impl SessionIOMap {
     }
 
     /// Attempt to connect any sessions whose raw socket name is known but not yet connected.
-    pub fn connect_new_sessions(
+    pub(crate) fn connect_new_sessions<C: SessionConnector>(
         &mut self,
-        connector: &RawSessionConnector,
+        connector: &C,
         raw_socket_names: &BTreeMap<SessionId, String>,
     ) {
         for (id, socket_name) in raw_socket_names {
-            if self.connected_sockets.contains_key(id) {
+            let needs_refresh = self
+                .connected_sockets
+                .get(id)
+                .map(|existing| existing != socket_name)
+                .unwrap_or(true)
+                || !self.sessions.contains_key(id);
+            if !needs_refresh {
                 continue;
             }
-            self.connected_sockets.insert(*id, socket_name.clone());
+
             match SessionIO::connect(connector, *id, socket_name) {
                 Ok(session_io) => {
                     self.sessions.insert(*id, session_io);
+                    self.connected_sockets.insert(*id, socket_name.clone());
                 }
                 Err(e) => {
                     eprintln!("exaterm: failed to connect session {}: {e}", id.0);
@@ -163,6 +188,62 @@ mod tests {
         map.retain_sessions(&[SessionId(1)]);
         assert!(map.connected_sockets.contains_key(&SessionId(1)));
         assert!(!map.connected_sockets.contains_key(&SessionId(2)));
+    }
+
+    struct MockConnector {
+        calls: std::cell::RefCell<Vec<(SessionId, String)>>,
+        peers: std::cell::RefCell<Vec<UnixStream>>,
+    }
+
+    impl MockConnector {
+        fn new() -> Self {
+            Self {
+                calls: std::cell::RefCell::new(Vec::new()),
+                peers: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl SessionConnector for MockConnector {
+        fn connect_raw_session(
+            &self,
+            session_id: SessionId,
+            socket_name: &str,
+        ) -> Result<UnixStream, String> {
+            let (left, right) = UnixStream::pair().map_err(|error| error.to_string())?;
+            self.calls
+                .borrow_mut()
+                .push((session_id, socket_name.to_string()));
+            self.peers.borrow_mut().push(right);
+            Ok(left)
+        }
+    }
+
+    #[test]
+    fn reconnects_when_socket_name_changes() {
+        let mut map = SessionIOMap::new();
+        let connector = MockConnector::new();
+
+        let mut names = BTreeMap::new();
+        names.insert(SessionId(1), "sock1".to_string());
+        map.connect_new_sessions(&connector, &names);
+
+        names.insert(SessionId(1), "sock2".to_string());
+        map.connect_new_sessions(&connector, &names);
+
+        let calls = connector.calls.borrow();
+        assert_eq!(
+            calls
+                .iter()
+                .map(|(_, name)| name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["sock1", "sock2"]
+        );
+        assert_eq!(
+            map.connected_sockets.get(&SessionId(1)).map(String::as_str),
+            Some("sock2")
+        );
+        assert_eq!(map.sessions.len(), 1);
     }
 
     #[test]

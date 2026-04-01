@@ -80,6 +80,12 @@ The exact package names depend on distro.
 
 Exaterm also uses the OpenAI API for summaries, naming, and nudges.
 
+On macOS, initialize the SwiftTerm submodule before building:
+
+```bash
+git submodule update --init --recursive
+```
+
 Required:
 - `OPENAI_API_KEY`
 
@@ -111,8 +117,14 @@ From the repo root:
 make
 ```
 
-That builds both:
-- `exaterm`
+That builds the default native frontend for your platform and `exatermd`.
+
+On Linux, that means:
+- `exaterm-gtk`
+- `exatermd`
+
+On macOS, that means:
+- `exaterm-macos`
 - `exatermd`
 
 ## Running
@@ -123,8 +135,8 @@ Local:
 make run
 ```
 
-That launches the GTK app and connects to a local beachhead, spawning one if needed.
-It also builds both `exaterm` and `exatermd` first.
+That launches the native frontend for your platform and connects to a local
+beachhead, spawning one if needed.
 
 You can also run the daemon directly:
 
@@ -137,7 +149,7 @@ make daemon
 There is an experimental SSH path:
 
 ```bash
-cargo run -p exaterm -- --ssh user@host
+cargo run -p exaterm-gtk -- --ssh user@host
 ```
 
 The intended direction is:
@@ -145,6 +157,8 @@ The intended direction is:
 - launch it remotely
 - forward its Unix sockets back over SSH
 - keep the UI talking to the same beachhead protocol it uses locally
+
+If you are on macOS, use `exaterm-macos` instead of `exaterm-gtk`.
 
 Treat this as in-progress rather than finished product UX.
 

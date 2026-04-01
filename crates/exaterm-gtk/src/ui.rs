@@ -1,6 +1,4 @@
-use crate::actions::{
-    insert_terminal_number, send_runtime_input_line, set_auto_nudge_hover, toggle_auto_nudge,
-};
+use crate::actions::{insert_terminal_number, set_auto_nudge_hover, toggle_auto_nudge};
 use crate::beachhead::BeachheadConnection;
 use crate::style::{
     apply_battle_card_surface_style, apply_battle_status_style, configure_app_icons, load_css,
@@ -1755,14 +1753,11 @@ fn apply_workspace_snapshot(context: &Rc<AppContext>, snapshot: WorkspaceSnapsho
     }
 
     for session in snapshot.sessions {
-        {
-            let mut names = context.raw_stream_socket_names.borrow_mut();
-            if let Some(socket_name) = session.raw_stream_socket_name.clone() {
-                names.insert(session.record.id, socket_name);
-            } else {
-                names.remove(&session.record.id);
-            }
-        }
+        update_raw_stream_socket_name(
+            context,
+            session.record.id,
+            session.raw_stream_socket_name.clone(),
+        );
         if !context
             .session_cards
             .borrow()
@@ -1827,6 +1822,37 @@ fn apply_workspace_snapshot(context: &Rc<AppContext>, snapshot: WorkspaceSnapsho
         }
     }
     update_flowbox_columns(context);
+}
+
+fn update_raw_stream_socket_name(
+    context: &Rc<AppContext>,
+    session_id: SessionId,
+    socket_name: Option<String>,
+) {
+    let changed = {
+        let mut names = context.raw_stream_socket_names.borrow_mut();
+        match socket_name {
+            Some(socket_name) => {
+                let changed = names
+                    .get(&session_id)
+                    .is_some_and(|existing| existing != &socket_name);
+                names.insert(session_id, socket_name);
+                changed
+            }
+            None => names.remove(&session_id).is_some(),
+        }
+    };
+
+    if changed {
+        reset_daemon_display_runtime(context, session_id);
+    }
+}
+
+fn reset_daemon_display_runtime(context: &Rc<AppContext>, session_id: SessionId) {
+    context.display_runtimes.borrow_mut().remove(&session_id);
+    if let Ok(mut writers) = context.raw_input_writers.lock() {
+        writers.remove(&session_id);
+    }
 }
 
 fn observation_from_snapshot(snapshot: &ObservationSnapshot) -> SessionObservation {

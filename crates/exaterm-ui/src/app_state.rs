@@ -119,8 +119,9 @@ impl AppState {
         for session in &snapshot.sessions {
             if let Some(ref name) = session.raw_stream_socket_name {
                 self.raw_socket_names
-                    .entry(session.record.id)
-                    .or_insert_with(|| name.clone());
+                    .insert(session.record.id, name.clone());
+            } else {
+                self.raw_socket_names.remove(&session.record.id);
             }
         }
 
@@ -415,6 +416,40 @@ mod tests {
         assert_eq!(state.observations.len(), 1);
         assert!(state.observations.contains_key(&SessionId(1)));
         assert!(!state.observations.contains_key(&SessionId(2)));
+    }
+
+    #[test]
+    fn apply_snapshot_updates_raw_socket_name_when_it_changes() {
+        let mut state = AppState::new();
+        let mut snap = make_session_snapshot(1, "Shell 1", SessionStatus::Running);
+        snap.raw_stream_socket_name = Some("session-1.sock".into());
+        state.apply_snapshot(&make_snapshot(vec![snap]));
+
+        let mut updated = make_session_snapshot(1, "Shell 1", SessionStatus::Running);
+        updated.raw_stream_socket_name = Some("session-1-new.sock".into());
+        state.apply_snapshot(&make_snapshot(vec![updated]));
+
+        assert_eq!(
+            state
+                .raw_socket_names
+                .get(&SessionId(1))
+                .map(String::as_str),
+            Some("session-1-new.sock")
+        );
+    }
+
+    #[test]
+    fn apply_snapshot_clears_raw_socket_name_when_it_disappears() {
+        let mut state = AppState::new();
+        let mut snap = make_session_snapshot(1, "Shell 1", SessionStatus::Running);
+        snap.raw_stream_socket_name = Some("session-1.sock".into());
+        state.apply_snapshot(&make_snapshot(vec![snap]));
+
+        let mut updated = make_session_snapshot(1, "Shell 1", SessionStatus::Running);
+        updated.raw_stream_socket_name = None;
+        state.apply_snapshot(&make_snapshot(vec![updated]));
+
+        assert!(!state.raw_socket_names.contains_key(&SessionId(1)));
     }
 
     #[test]

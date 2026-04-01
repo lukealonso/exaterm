@@ -11,7 +11,7 @@ endif
 all: build
 
 build:
-	cargo build
+	cargo build -p exaterm-types -p exaterm-core -p exaterm-ui -p $(APP_PACKAGE) -p exatermd
 
 build-app:
 	cargo build -p $(APP_PACKAGE)
@@ -37,10 +37,10 @@ daemon:
 	cargo run -p exatermd
 
 check:
-	cargo check
+	cargo check -p exaterm-types -p exaterm-core -p exaterm-ui -p $(APP_PACKAGE) -p exatermd
 
 test:
-	cargo test --workspace
+	cargo test -p exaterm-types -p exaterm-core -p exaterm-ui -p $(APP_PACKAGE) -p exatermd
 
 test-workspace: test
 
@@ -58,7 +58,7 @@ clean:
 
 help:
 	@printf '%s\n' \
-		'make              Build the default workspace for this platform' \
+		'make              Build the default app and daemon for this platform' \
 		'make build-app    Build the native frontend package for this platform' \
 		'make run          Build and run the native frontend package for this platform' \
 		'make build-gtk    Build the GTK frontend explicitly' \
@@ -66,8 +66,8 @@ help:
 		'make build-macos  Build the macOS frontend explicitly' \
 		'make run-macos    Build and run the macOS frontend explicitly' \
 		'make daemon       Run the daemon directly' \
-		'make check        Run cargo check for the default workspace' \
-		'make test         Run the full workspace test suite' \
+		'make check        Check the default app and daemon for this platform' \
+		'make test         Run the default app, core, UI, and daemon tests' \
 		'make core-test    Run core library tests' \
 		'make daemon-check Check the daemon package' \
 		'make clean        Remove build artifacts'
