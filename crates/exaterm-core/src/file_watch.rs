@@ -116,6 +116,9 @@ mod tests {
 
     #[test]
     fn watcher_reports_modified_file_relative_to_repo_root() {
+        if !can_bind_unix_sockets() {
+            return;
+        }
         let root = tempdir_path("exaterm-notify-basic");
         fs::create_dir_all(root.join(".git")).expect("git dir");
         fs::create_dir_all(root.join("src")).expect("src dir");
@@ -139,6 +142,9 @@ mod tests {
 
     #[test]
     fn watcher_tracks_files_in_new_nested_directories() {
+        if !can_bind_unix_sockets() {
+            return;
+        }
         let root = tempdir_path("exaterm-notify-nested");
         fs::create_dir_all(root.join(".git")).expect("git dir");
 
@@ -214,6 +220,25 @@ mod tests {
             }
         }
         None
+    }
+
+    /// Returns false when Unix socket creation is blocked (e.g. inside the
+    /// Claude Code sandbox), which also implies FSEvents delivery is unreliable.
+    fn can_bind_unix_sockets() -> bool {
+        use std::os::unix::net::UnixListener;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        // Combine PID (cross-process isolation) with a per-process atomic
+        // counter (cross-thread isolation) so parallel test threads never race
+        // on the same probe path.
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let probe = std::env::temp_dir().join(format!(
+            ".exaterm-sock-probe-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed),
+        ));
+        let ok = UnixListener::bind(&probe).is_ok();
+        let _ = fs::remove_file(&probe);
+        ok
     }
 
     fn tempdir_path(prefix: &str) -> PathBuf {
