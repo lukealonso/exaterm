@@ -422,9 +422,8 @@ function createContextMenu(): HTMLElement {
 
   menu.addEventListener("click", (e) => {
     const item = (e.target as HTMLElement).closest("[data-action]") as HTMLElement | null;
-    if (!item || contextMenuSessionId === null) return;
-    const action = item.dataset.action;
-    handleContextMenuAction(action!, contextMenuSessionId);
+    if (!item || contextMenuSessionId === null || !item.dataset.action) return;
+    handleContextMenuAction(item.dataset.action, contextMenuSessionId);
     hideContextMenu();
   });
 
@@ -475,9 +474,13 @@ function handleContextMenuAction(action: string, sessionId: number) {
       }
       break;
     case "paste":
-      navigator.clipboard.readText().then((text) => {
-        sendTextToSession(sessionId, text);
-      });
+      navigator.clipboard.readText()
+        .then((text) => {
+          sendTextToSession(sessionId, text);
+        })
+        .catch(() => {
+          console.warn("Clipboard access denied or unavailable");
+        });
       break;
     case "add-terminals":
       if (onSendCommand) {
@@ -538,9 +541,22 @@ export function init(appEl: HTMLElement, sendFn: (cmd: ClientMessage) => void) {
   });
   resizeObserver.observe(gridEl);
 
+  // Selection on pointerdown so it fires even when xterm.js swallows the
+  // subsequent click (e.g. to start a text selection inside the terminal).
+  gridEl.addEventListener("pointerdown", (e) => {
+    const cardEl = (e.target as HTMLElement).closest(".battle-card") as HTMLElement | null;
+    if (!cardEl || !cardEl.dataset.sessionId) return;
+    if (e.button !== 0) return; // left-click only
+    const sid = Number(cardEl.dataset.sessionId);
+    if (focusedSessionId === null && selectedSessionId !== sid) {
+      selectedSessionId = sid;
+      render();
+    }
+  });
+
   // Click behavior matches GTK:
   // - In focus mode: click focused card → return to battlefield.
-  // - In battlefield with embedded terminal: click → select card + focus terminal input.
+  // - In battlefield with embedded terminal: click → focus terminal input.
   // - In battlefield without embedded terminal: click → enter focus mode.
   gridEl.addEventListener("click", (e) => {
     const cardEl = (e.target as HTMLElement).closest(".battle-card") as HTMLElement | null;
@@ -560,14 +576,17 @@ export function init(appEl: HTMLElement, sendFn: (cmd: ClientMessage) => void) {
       return;
     }
 
-    selectedSessionId = sid;
     // Check if the terminal is actually embedded (visible) in the card,
     // not just alive in the background.
     const termSlot = cards.get(sid)?.terminalSlot;
     const terminalEmbedded = termSlot && !termSlot.classList.contains("scrollback-terminal-hidden");
     if (terminalEmbedded) {
-      // Card has a visible embedded terminal: just select and focus it.
-      render();
+      // Card has a visible embedded terminal: focus it.
+      // Selection was already set by pointerdown; re-render only if needed.
+      if (selectedSessionId !== sid) {
+        selectedSessionId = sid;
+        render();
+      }
       const managed = getTerminal(sid);
       if (managed) managed.term.focus();
     } else {

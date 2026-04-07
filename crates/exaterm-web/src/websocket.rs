@@ -1,10 +1,10 @@
 use crate::routes::AppState;
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Path, State, WebSocketUpgrade};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::IntoResponse;
 use exaterm_core::daemon::connect_session_stream_socket;
-use exaterm_types::proto::{ClientMessage, ServerMessage};
+use exaterm_types::proto::{ClientMessage, ServerMessage, WorkspaceSnapshot};
 use futures::{SinkExt, StreamExt};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -18,14 +18,34 @@ fn origin_allowed(headers: &HeaderMap) -> bool {
         // the socket already has local access.
         return true;
     };
-    // Allow localhost/127.0.0.1 on any port.
-    let origin_lower = origin.to_lowercase();
-    origin_lower.starts_with("http://localhost")
-        || origin_lower.starts_with("https://localhost")
-        || origin_lower.starts_with("http://127.0.0.1")
-        || origin_lower.starts_with("https://127.0.0.1")
-        || origin_lower.starts_with("http://[::1]")
-        || origin_lower.starts_with("https://[::1]")
+    // Parse as a URI and match the host component exactly to prevent
+    // prefix-based bypasses (e.g. localhost.evil.com).
+    let Ok(uri) = origin.parse::<Uri>() else {
+        return false;
+    };
+    matches!(uri.scheme_str(), Some("http" | "https"))
+        && matches!(
+            uri.host(),
+            Some("localhost" | "127.0.0.1" | "[::1]" | "::1")
+        )
+}
+
+/// Strip internal filesystem paths from the snapshot before sending to the
+/// browser.  The frontend only uses `raw_stream_socket_name` as a truthy
+/// check, so we replace the real path with a harmless placeholder.
+fn sanitize_snapshot(snapshot: &WorkspaceSnapshot) -> WorkspaceSnapshot {
+    let sessions = snapshot
+        .sessions
+        .iter()
+        .map(|s| {
+            let mut s = s.clone();
+            if s.raw_stream_socket_name.is_some() {
+                s.raw_stream_socket_name = Some("available".into());
+            }
+            s
+        })
+        .collect();
+    WorkspaceSnapshot { sessions }
 }
 
 // --- Control WebSocket: JSON snapshot/command relay ---
@@ -46,8 +66,10 @@ async fn handle_control(
     mut socket: WebSocket,
     relay: Arc<crate::relay::DaemonRelay>,
 ) {
-    // Send current snapshot immediately.
-    let snapshot = relay.snapshot();
+    // Send the current snapshot from the same receiver we'll subscribe to,
+    // so no update can be lost between the initial send and the change loop.
+    let mut snapshots = relay.snapshots.clone();
+    let snapshot = sanitize_snapshot(&snapshots.borrow_and_update().clone());
     let msg = ServerMessage::WorkspaceSnapshot { snapshot };
     if let Ok(json) = serde_json::to_string(&msg) {
         if socket.send(Message::Text(json.into())).await.is_err() {
@@ -55,15 +77,13 @@ async fn handle_control(
         }
     }
 
-    let mut snapshots = relay.snapshots.clone();
-
     loop {
         tokio::select! {
             result = snapshots.changed() => {
                 if result.is_err() {
                     break;
                 }
-                let snapshot = snapshots.borrow_and_update().clone();
+                let snapshot = sanitize_snapshot(&snapshots.borrow_and_update().clone());
                 let msg = ServerMessage::WorkspaceSnapshot { snapshot };
                 if let Ok(json) = serde_json::to_string(&msg) {
                     if socket.send(Message::Text(json.into())).await.is_err() {
@@ -75,7 +95,7 @@ async fn handle_control(
                 match result {
                     Some(Ok(Message::Text(text))) => {
                         match serde_json::from_str::<ClientMessage>(&text) {
-                            Ok(cmd) => { let _ = relay.commands.send(cmd).await; }
+                            Ok(cmd) => { let _ = relay.commands.send(cmd); }
                             Err(e) => eprintln!("invalid client message: {e}"),
                         }
                     }
@@ -103,7 +123,7 @@ pub async fn ws_stream(
 }
 
 async fn handle_stream(
-    socket: WebSocket,
+    mut socket: WebSocket,
     relay: Arc<crate::relay::DaemonRelay>,
     session_id: u32,
 ) {
@@ -137,6 +157,12 @@ async fn handle_stream(
         }
     }
     let Some(unix_stream) = unix_stream else {
+        let _ = socket
+            .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                code: 1011,
+                reason: "failed to connect to session stream".into(),
+            })))
+            .await;
         return;
     };
     unix_stream.set_nonblocking(true).ok();
@@ -185,5 +211,68 @@ async fn handle_stream(
     tokio::select! {
         _ = to_browser => {}
         _ = to_daemon => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn headers_with_origin(origin: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("origin", origin.parse().unwrap());
+        headers
+    }
+
+    #[test]
+    fn no_origin_header_is_allowed() {
+        assert!(origin_allowed(&HeaderMap::new()));
+    }
+
+    #[test]
+    fn localhost_http_is_allowed() {
+        assert!(origin_allowed(&headers_with_origin("http://localhost")));
+        assert!(origin_allowed(&headers_with_origin("http://localhost:9800")));
+    }
+
+    #[test]
+    fn localhost_https_is_allowed() {
+        assert!(origin_allowed(&headers_with_origin("https://localhost")));
+        assert!(origin_allowed(&headers_with_origin("https://localhost:9800")));
+    }
+
+    #[test]
+    fn loopback_ipv4_is_allowed() {
+        assert!(origin_allowed(&headers_with_origin("http://127.0.0.1")));
+        assert!(origin_allowed(&headers_with_origin("http://127.0.0.1:9800")));
+        assert!(origin_allowed(&headers_with_origin("https://127.0.0.1:9800")));
+    }
+
+    #[test]
+    fn loopback_ipv6_is_allowed() {
+        assert!(origin_allowed(&headers_with_origin("http://[::1]")));
+        assert!(origin_allowed(&headers_with_origin("http://[::1]:9800")));
+        assert!(origin_allowed(&headers_with_origin("https://[::1]:9800")));
+    }
+
+    #[test]
+    fn localhost_subdomain_is_rejected() {
+        assert!(!origin_allowed(&headers_with_origin("http://localhost.evil.com")));
+    }
+
+    #[test]
+    fn loopback_subdomain_is_rejected() {
+        assert!(!origin_allowed(&headers_with_origin("http://127.0.0.1.evil.com")));
+    }
+
+    #[test]
+    fn external_origin_is_rejected() {
+        assert!(!origin_allowed(&headers_with_origin("http://evil.com")));
+        assert!(!origin_allowed(&headers_with_origin("https://example.org")));
+    }
+
+    #[test]
+    fn empty_origin_is_rejected() {
+        assert!(!origin_allowed(&headers_with_origin("")));
     }
 }

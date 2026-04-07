@@ -1,18 +1,5 @@
-import { test, expect, Page } from "@playwright/test";
-
-async function waitForCards(page: Page, count: number, timeout = 10_000) {
-  await expect(page.locator(".battle-card").first()).toBeVisible({ timeout });
-  if (count > 1) {
-    await expect(page.locator(".battle-card")).toHaveCount(count, { timeout });
-  }
-}
-
-async function ensureSessionCount(page: Page, target: number) {
-  while ((await page.locator(".battle-card").count()) < target) {
-    await page.click("#add-shell-btn");
-    await page.waitForTimeout(1500);
-  }
-}
+import { test, expect } from "@playwright/test";
+import { waitForCards, ensureSessionCount } from "./helpers";
 
 test.describe("Context menu", () => {
   test("right-click on card shows context menu with all items", async ({
@@ -370,7 +357,7 @@ test.describe("Close button", () => {
     // The card should now show a complete or failed status.
     const firstCard = page.locator(".battle-card").first();
     const classes = await firstCard.getAttribute("class");
-    expect(classes).toMatch(/card-(complete|failed|idle|active)/);
+    expect(classes).toMatch(/card-(complete|failed)/);
   });
 });
 

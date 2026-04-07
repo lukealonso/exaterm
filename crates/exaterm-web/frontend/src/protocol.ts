@@ -103,6 +103,8 @@ export type ServerMessage =
 export type ClientMessage =
   | { type: "attach_client" }
   | { type: "create_or_resume_default_workspace" }
+  | { type: "add_terminals"; source_session: SessionId }
+  | { type: "add_terminals_to"; source_session: SessionId; target_total: number }
   | { type: "add_one_terminal"; source_session: SessionId }
   | { type: "resize_terminal"; session_id: SessionId; rows: number; cols: number }
   | { type: "toggle_auto_nudge"; session_id: SessionId; enabled: boolean }

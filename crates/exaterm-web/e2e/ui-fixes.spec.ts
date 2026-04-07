@@ -1,19 +1,5 @@
-import { test, expect, Page } from "@playwright/test";
-
-async function waitForCards(page: Page, count: number, timeout = 10_000) {
-  await expect(page.locator(".battle-card").first()).toBeVisible({ timeout });
-  if (count > 1) {
-    await expect(page.locator(".battle-card")).toHaveCount(count, { timeout });
-  }
-}
-
-async function enterFocusMode(page: Page, nth = 0) {
-  await page.locator(".battle-card").nth(nth).click();
-  await page.keyboard.press("Control+Enter");
-  await expect(page.locator(".battlefield-grid")).toHaveClass(/focus-mode/, {
-    timeout: 5_000,
-  });
-}
+import { test, expect } from "@playwright/test";
+import { waitForCards, enterFocusMode } from "./helpers";
 
 test.describe("Close button and nudge pill layout", () => {
   test("close button and nudge pill are in the same row without overlap", async ({
@@ -160,24 +146,24 @@ test.describe("Enter key focus behavior", () => {
     await page.waitForTimeout(3000);
 
     const screens = page.locator(".xterm-screen");
-    if ((await screens.count()) >= 2) {
-      // Click terminal A to give it focus.
-      await screens.first().click();
-      await page.waitForTimeout(200);
+    await expect(screens).toHaveCount(2, { timeout: 5000 });
 
-      // Select card B by pressing Ctrl+] (moves selection without stealing focus).
-      await page.keyboard.press("Control+]");
-      await page.waitForTimeout(200);
+    // Click terminal A to give it focus.
+    await screens.first().click();
+    await page.waitForTimeout(200);
 
-      // Now terminal A has focus but card B is selected.
-      // Pressing Enter should go to terminal A, NOT focus card B.
-      await page.keyboard.press("Enter");
-      await page.waitForTimeout(200);
+    // Select card B by pressing Ctrl+] (moves selection without stealing focus).
+    await page.keyboard.press("Control+]");
+    await page.waitForTimeout(200);
 
-      await expect(page.locator(".battlefield-grid")).not.toHaveClass(
-        /focus-mode/
-      );
-    }
+    // Now terminal A has focus but card B is selected.
+    // Pressing Enter should go to terminal A, NOT focus card B.
+    await page.keyboard.press("Enter");
+    await page.waitForTimeout(200);
+
+    await expect(page.locator(".battlefield-grid")).not.toHaveClass(
+      /focus-mode/
+    );
   });
 });
 

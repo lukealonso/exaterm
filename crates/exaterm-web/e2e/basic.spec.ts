@@ -1,32 +1,5 @@
-import { test, expect, Page } from "@playwright/test";
-
-// Helper: wait for at least N battle cards to be visible.
-async function waitForCards(page: Page, count: number, timeout = 10_000) {
-  await expect(page.locator(".battle-card").first()).toBeVisible({ timeout });
-  if (count > 1) {
-    await expect(page.locator(".battle-card")).toHaveCount(count, {
-      timeout,
-    });
-  }
-}
-
-// Helper: enter focus mode on the first card via Ctrl+Enter.
-async function enterFocusMode(page: Page, nth = 0) {
-  await page.locator(".battle-card").nth(nth).click();
-  await page.keyboard.press("Control+Enter");
-  await expect(page.locator(".battlefield-grid")).toHaveClass(/focus-mode/, {
-    timeout: 5_000,
-  });
-}
-
-// Helper: add shells until we have at least `target` sessions.
-async function ensureSessionCount(page: Page, target: number) {
-  while ((await page.locator(".battle-card").count()) < target) {
-    await page.click("#add-shell-btn");
-    // Wait a moment for the snapshot to arrive with the new sessions.
-    await page.waitForTimeout(1500);
-  }
-}
+import { test, expect } from "@playwright/test";
+import { waitForCards, enterFocusMode, ensureSessionCount } from "./helpers";
 
 test.describe("Page load", () => {
   test("shows toolbar, session count, and a battle card", async ({ page }) => {
@@ -288,7 +261,7 @@ test.describe("Card status styling", () => {
     await waitForCards(page, 1);
 
     const chipText = await page.locator(".card-status").first().textContent();
-    expect(chipText!.trim().length).toBeGreaterThan(0);
+    expect(chipText?.trim().length ?? 0).toBeGreaterThan(0);
   });
 });
 
@@ -522,23 +495,15 @@ test.describe("Terminal resize", () => {
 });
 
 test.describe("Reconnection", () => {
-  test("overlay appears when WebSocket closes", async ({ page }) => {
+  test("overlay is hidden when connected and has correct CSS", async ({ page }) => {
     await page.goto("/");
     await waitForCards(page, 1);
     await expect(page.locator("#reconnect-overlay")).toHaveClass(/hidden/);
 
-    // Close the WebSocket from the browser side.
-    await page.evaluate(() => {
-      // Find and close all WebSockets.
-      (window as any).__testCloseWs = true;
-    });
-
-    // We can't easily kill the server, but we can test the overlay logic
-    // by injecting a close event. Let's test the overlay CSS is correct.
+    // When the hidden class is present, display should be none.
     const overlayDisplay = await page
       .locator("#reconnect-overlay")
       .evaluate((el) => getComputedStyle(el).display);
-    // When hidden, should be display: none.
     expect(overlayDisplay).toBe("none");
   });
 });

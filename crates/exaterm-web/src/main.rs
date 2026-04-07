@@ -47,14 +47,27 @@ fn parse_args() -> Opts {
         match args[i].as_str() {
             "--port" => {
                 i += 1;
-                if let Some(value) = args.get(i) {
-                    port = value.parse().expect("invalid --port value");
+                match args.get(i) {
+                    Some(value) => {
+                        port = value.parse().unwrap_or_else(|_| {
+                            eprintln!("invalid --port value: {value}");
+                            std::process::exit(1);
+                        })
+                    }
+                    None => {
+                        eprintln!("--port requires a value");
+                        std::process::exit(1);
+                    }
                 }
             }
             "--bind" => {
                 i += 1;
-                if let Some(value) = args.get(i) {
-                    host = value.clone();
+                match args.get(i) {
+                    Some(value) => host = value.clone(),
+                    None => {
+                        eprintln!("--bind requires a value");
+                        std::process::exit(1);
+                    }
                 }
             }
             "--no-embed" => {

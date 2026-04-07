@@ -1,19 +1,5 @@
-import { test, expect, Page } from "@playwright/test";
-
-async function waitForCards(page: Page, count: number, timeout = 10_000) {
-  await expect(page.locator(".battle-card").first()).toBeVisible({ timeout });
-  if (count > 1) {
-    await expect(page.locator(".battle-card")).toHaveCount(count, { timeout });
-  }
-}
-
-async function enterFocusMode(page: Page, nth = 0) {
-  await page.locator(".battle-card").nth(nth).click();
-  await page.keyboard.press("Control+Enter");
-  await expect(page.locator(".battlefield-grid")).toHaveClass(/focus-mode/, {
-    timeout: 5_000,
-  });
-}
+import { test, expect } from "@playwright/test";
+import { waitForCards, enterFocusMode } from "./helpers";
 
 test.describe("Add one terminal", () => {
   test("Add Shell button adds exactly one session", async ({ page }) => {
@@ -76,10 +62,9 @@ test.describe("Terminal scrollback preservation", () => {
       const rows = document.querySelector(".focused-card .xterm-rows");
       return rows?.textContent?.includes("SCROLLBACK_MARKER_123") ?? false;
     });
-    // The marker may have scrolled out of the visible viewport but
-    // should be in the buffer. If not visible, at least the terminal
-    // should exist and be functional.
+    // The terminal must still exist, and ideally the marker is present.
     await expect(page.locator(".focused-card .xterm-screen")).toBeVisible();
+    expect(hasMarker).toBe(true);
   });
 });
 
@@ -196,12 +181,10 @@ test.describe("Scrollback preview", () => {
     await page.click("#add-shell-btn");
     await page.waitForTimeout(2000);
 
-    // The first card should show a scrollback preview.
-    // If the xterm buffer is used, it should contain recent content
-    // (not just the shell startup banner).
+    // The first card should show a scrollback preview containing our marker.
     const firstCard = page.locator(".battle-card").first();
-    const hasScrollback = await firstCard.locator(".card-scrollback-text").count();
-    const hasWaiting = await firstCard.locator(".card-scrollback-empty").count();
-    expect(hasScrollback + hasWaiting).toBeGreaterThanOrEqual(1);
+    await expect(firstCard.locator(".card-scrollback-text")).toContainText(
+      "PREVIEW_MARKER_XYZ"
+    );
   });
 });

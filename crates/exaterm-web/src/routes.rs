@@ -112,7 +112,7 @@ mod tests {
     fn mime_for_known_extensions() {
         assert_eq!(mime_for_path("app.js"), "application/javascript");
         assert_eq!(mime_for_path("app.css"), "text/css");
-        assert_eq!(mime_for_path("index.html"), "text/html");
+        assert_eq!(mime_for_path("index.html"), "text/html; charset=utf-8");
         assert_eq!(mime_for_path("icon.svg"), "image/svg+xml");
         assert_eq!(mime_for_path("logo.png"), "image/png");
         assert_eq!(mime_for_path("font.woff2"), "font/woff2");

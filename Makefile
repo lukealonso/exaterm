@@ -6,7 +6,7 @@ else
 APP_PACKAGE := exaterm-gtk
 endif
 
-.PHONY: all build build-app build-gtk build-macos run run-app run-gtk run-macos daemon check test test-workspace core-test core-check daemon-check package package-macos package-macos-debug web web-run web-test clean help
+.PHONY: all build build-app build-gtk build-macos run run-app run-gtk run-macos daemon check test test-workspace core-test core-check daemon-check package package-macos package-macos-debug web web-deps web-run web-test clean help
 
 all: build
 
@@ -67,8 +67,11 @@ package:
 	@exit 1
 endif
 
-web:
+web: web-deps
 	cargo build -p exaterm-web -p exatermd
+
+web-deps:
+	cd crates/exaterm-web/frontend && npm install
 
 web-run: web
 	cargo run -p exaterm-web

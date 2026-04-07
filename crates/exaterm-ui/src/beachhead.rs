@@ -104,7 +104,7 @@ impl BeachheadConnection {
         &self.client.commands
     }
 
-    pub fn events(&self) -> &mpsc::Receiver<ServerMessage> {
+    pub fn events(&self) -> &crossbeam_channel::Receiver<ServerMessage> {
         &self.client.events
     }
 

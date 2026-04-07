@@ -24,7 +24,7 @@ The goal is simple: make it possible to supervise multiple coding agents without
 
 ## Architecture
 
-Exaterm is split into six crates:
+Exaterm is split into several crates:
 
 - `crates/exaterm-types`
   - shared contract types only
@@ -195,7 +195,7 @@ The daemon is auto-spawned on the remote host if not already running.
 
 ### CLI options
 
-```
+```text
 --port <N>       Port to listen on (default: 9800)
 --bind <addr>    Address to bind to (default: 127.0.0.1)
 --no-embed       Serve frontend assets from disk instead of the embedded copy (for development)

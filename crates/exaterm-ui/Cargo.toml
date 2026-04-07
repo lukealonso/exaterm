@@ -6,5 +6,6 @@ edition = "2021"
 [dependencies]
 exaterm-types = { path = "../exaterm-types" }
 exaterm-core = { path = "../exaterm-core" }
+crossbeam-channel = "0.5"
 
 [dev-dependencies]

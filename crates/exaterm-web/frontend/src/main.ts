@@ -6,6 +6,7 @@ import { init as initUi, update as updateUi, getFirstSessionId, restartWorkspace
 // --- State ---
 
 let controlWs: WebSocket | null = null;
+let pendingRestart = false;
 const appEl = document.getElementById("app")!;
 const overlayEl = document.getElementById("reconnect-overlay")!;
 
@@ -25,6 +26,10 @@ function connectControl() {
       const msg: ServerMessage = JSON.parse(event.data);
       if (msg.type === "workspace_snapshot") {
         updateUi(msg.snapshot);
+        if (pendingRestart && msg.snapshot.sessions.length === 0) {
+          pendingRestart = false;
+          sendCommand({ type: "create_or_resume_default_workspace" });
+        }
       }
     } catch (e) {
       console.error("failed to parse server message:", e);
@@ -63,13 +68,9 @@ shortcutsOverlay.addEventListener("click", (e) => {
 
 document.getElementById("restart-btn")!.addEventListener("click", () => {
   if (!confirm("Terminate all sessions and start fresh?")) return;
+  pendingRestart = true;
   sendCommand({ type: "terminate_workspace" });
   restartWorkspace();
-  // After termination, the daemon will send an empty snapshot.
-  // Then we request a new default workspace.
-  setTimeout(() => {
-    sendCommand({ type: "create_or_resume_default_workspace" });
-  }, 500);
 });
 
 const addShellBtn = document.getElementById("add-shell-btn")!;

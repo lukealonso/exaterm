@@ -1,20 +1,8 @@
-import { test, expect, Page } from "@playwright/test";
+import { test, expect } from "@playwright/test";
+import { waitForCards, ensureSessionCount } from "./helpers";
+import type { Page } from "@playwright/test";
 
-async function waitForCards(page: Page, count: number, timeout = 10_000) {
-  await expect(page.locator(".battle-card").first()).toBeVisible({ timeout });
-  if (count > 1) {
-    await expect(page.locator(".battle-card")).toHaveCount(count, { timeout });
-  }
-}
-
-async function ensureSessionCount(page: Page, target: number) {
-  while ((await page.locator(".battle-card").count()) < target) {
-    await page.click("#add-shell-btn");
-    await page.waitForTimeout(1500);
-  }
-}
-
-async function enterFocusMode(page: Page) {
+async function enterFocusModeWithWait(page: Page) {
   await page.locator(".battle-card").first().click();
   await page.keyboard.press("Control+Enter");
   await expect(page.locator(".focused-card .xterm-screen")).toBeVisible({
@@ -29,7 +17,7 @@ test.describe("Terminal reattach after embed/scrollback transition", () => {
   }) => {
     await page.goto("/");
     await waitForCards(page, 1);
-    await enterFocusMode(page);
+    await enterFocusModeWithWait(page);
 
     // Type a marker.
     await page.locator(".focused-card .xterm-screen").click();
@@ -61,7 +49,7 @@ test.describe("Terminal reattach after embed/scrollback transition", () => {
   test.fixme("terminal is scrollable to bottom after reattach", async ({ page }) => {
     await page.goto("/");
     await waitForCards(page, 1);
-    await enterFocusMode(page);
+    await enterFocusModeWithWait(page);
 
     // Generate lots of output.
     await page.locator(".focused-card .xterm-screen").click();

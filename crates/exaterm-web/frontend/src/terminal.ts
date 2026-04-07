@@ -138,15 +138,17 @@ export function attachTerminal(
       scrollTimer = setTimeout(() => terminal.scrollToBottom(), 200);
     };
     sock.onclose = () => {
-      // Reconnect if the terminal is still in the map (not disposed).
-      if (!reconnecting && terminals.has(sessionId)) {
+      // Reconnect if the same terminal instance is still managed (not
+      // disposed or replaced by a new attach).
+      const currentEntry = terminals.get(sessionId);
+      if (!reconnecting && currentEntry && currentEntry.term === term) {
         reconnecting = true;
         setTimeout(() => {
-          if (terminals.has(sessionId)) {
-            ws = connectStream(sessionId, terminal);
-            // Update the managed entry's ws reference.
-            const entry = terminals.get(sessionId);
-            if (entry) entry.ws = ws;
+          const entry = terminals.get(sessionId);
+          // Only reconnect if the same terminal instance is still managed.
+          if (entry && entry.term === term) {
+            ws = connectStream(sessionId, term);
+            entry.ws = ws;
           }
           reconnecting = false;
         }, 1000);

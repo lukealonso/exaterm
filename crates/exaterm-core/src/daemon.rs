@@ -431,7 +431,7 @@ enum ClientControl {
 
 pub struct LocalBeachheadClient {
     pub commands: mpsc::Sender<ClientMessage>,
-    pub events: mpsc::Receiver<ServerMessage>,
+    pub events: crossbeam_channel::Receiver<ServerMessage>,
     event_wake_reader: std::sync::Mutex<UnixStream>,
 }
 
@@ -456,7 +456,7 @@ impl LocalBeachheadClient {
             .map_err(|error| format!("failed to set event wake writer nonblocking: {error}"))?;
 
         let (command_tx, command_rx) = mpsc::channel::<ClientMessage>();
-        let (event_tx, event_rx) = mpsc::channel::<ServerMessage>();
+        let (event_tx, event_rx) = crossbeam_channel::unbounded::<ServerMessage>();
 
         thread::spawn(move || {
             let mut writer = control_writer;
@@ -800,26 +800,10 @@ fn handle_client_message(
             Ok(false)
         }
         ClientMessage::AddTerminals { source_session } => {
-            let additions = additions_for_session_count(state.workspace.sessions().len());
-            if additions == 0 {
-                return Ok(false);
+            let count = additions_for_session_count(state.workspace.sessions().len());
+            if count > 0 {
+                add_n_terminals(state, source_session, count, control_tx)?;
             }
-            let cwd = state
-                .workspace
-                .session(source_session)
-                .and_then(|session| session.launch.cwd.clone());
-            for _ in 0..additions {
-                let number = state.workspace.sessions().len() + 1;
-                let mut launch =
-                    user_shell_launch(format!("Shell {number}"), "Generic command session");
-                if let Some(cwd) = cwd.clone() {
-                    launch = launch.with_cwd(cwd);
-                }
-                let session_id = state.add_shell_session_without_watch(launch.clone())?;
-                state.attach_repo_watch(session_id, &launch, control_tx)?;
-                ensure_runtime_forwarder(state, session_id, control_tx.clone());
-            }
-            state.snapshot_dirty = true;
             Ok(false)
         }
         ClientMessage::AddTerminalsTo {
@@ -827,43 +811,13 @@ fn handle_client_message(
             target_total,
         } => {
             let current_total = state.workspace.sessions().len();
-            if target_total <= current_total || !supported_terminal_target(target_total) {
-                return Ok(false);
+            if target_total > current_total && supported_terminal_target(target_total) {
+                add_n_terminals(state, source_session, target_total - current_total, control_tx)?;
             }
-            let additions = target_total - current_total;
-            let cwd = state
-                .workspace
-                .session(source_session)
-                .and_then(|session| session.launch.cwd.clone());
-            for _ in 0..additions {
-                let number = state.workspace.sessions().len() + 1;
-                let mut launch =
-                    user_shell_launch(format!("Shell {number}"), "Generic command session");
-                if let Some(cwd) = cwd.clone() {
-                    launch = launch.with_cwd(cwd);
-                }
-                let session_id = state.add_shell_session_without_watch(launch.clone())?;
-                state.attach_repo_watch(session_id, &launch, control_tx)?;
-                ensure_runtime_forwarder(state, session_id, control_tx.clone());
-            }
-            state.snapshot_dirty = true;
             Ok(false)
         }
         ClientMessage::AddOneTerminal { source_session } => {
-            let cwd = state
-                .workspace
-                .session(source_session)
-                .and_then(|session| session.launch.cwd.clone());
-            let number = state.workspace.sessions().len() + 1;
-            let mut launch =
-                user_shell_launch(format!("Shell {number}"), "Generic command session");
-            if let Some(cwd) = cwd {
-                launch = launch.with_cwd(cwd);
-            }
-            let session_id = state.add_shell_session_without_watch(launch.clone())?;
-            state.attach_repo_watch(session_id, &launch, control_tx)?;
-            ensure_runtime_forwarder(state, session_id, control_tx.clone());
-            state.snapshot_dirty = true;
+            add_n_terminals(state, source_session, 1, control_tx)?;
             Ok(false)
         }
         ClientMessage::ResizeTerminal {
@@ -1664,6 +1618,30 @@ fn clear_stale_control_socket(control_socket_path: &PathBuf) -> Result<(), Strin
 pub fn connect_session_stream_socket(socket_name: &str) -> Result<UnixStream, String> {
     UnixStream::connect(session_raw_socket_path(socket_name)?)
         .map_err(|error| format!("failed to connect session raw socket: {error}"))
+}
+
+fn add_n_terminals(
+    state: &mut DaemonState,
+    source_session: SessionId,
+    count: usize,
+    control_tx: &ControlNotifier,
+) -> Result<(), String> {
+    let cwd = state
+        .workspace
+        .session(source_session)
+        .and_then(|session| session.launch.cwd.clone());
+    for _ in 0..count {
+        let number = state.workspace.sessions().len() + 1;
+        let mut launch = user_shell_launch(format!("Shell {number}"), "Generic command session");
+        if let Some(cwd) = cwd.clone() {
+            launch = launch.with_cwd(cwd);
+        }
+        let session_id = state.add_shell_session_without_watch(launch.clone())?;
+        state.attach_repo_watch(session_id, &launch, control_tx)?;
+        ensure_runtime_forwarder(state, session_id, control_tx.clone());
+    }
+    state.snapshot_dirty = true;
+    Ok(())
 }
 
 fn additions_for_session_count(count: usize) -> usize {
