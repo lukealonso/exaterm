@@ -14,6 +14,9 @@ pub enum ClientMessage {
         source_session: SessionId,
         target_total: usize,
     },
+    AddOneTerminal {
+        source_session: SessionId,
+    },
     ResizeTerminal {
         session_id: SessionId,
         rows: u16,

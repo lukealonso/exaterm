@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Exaterm</title>
+  <link rel="stylesheet" href="/assets/app.css">
+  <link rel="stylesheet" href="/assets/main.css">
+</head>
+<body>
+  <div id="toolbar" class="toolbar">
+    <span class="toolbar-title">Exaterm</span>
+    <span id="session-count" class="toolbar-count"></span>
+    <button id="add-shell-btn" class="toolbar-btn">+ Add Shell</button>
+    <button id="restart-btn" class="toolbar-btn toolbar-btn-destructive" title="Terminate all sessions and start fresh">Restart</button>
+    <button id="shortcuts-btn" class="toolbar-btn toolbar-btn-subtle" title="Keyboard shortcuts">?</button>
+  </div>
+  <div id="app"></div>
+  <div id="shortcuts-overlay" class="shortcuts-overlay hidden">
+    <div class="shortcuts-panel">
+      <div class="shortcuts-title">Keyboard Shortcuts</div>
+      <div class="shortcuts-grid">
+        <kbd>Click</kbd><span>Select card and focus terminal (or enter focus mode if no terminal)</span>
+        <kbd>Escape</kbd><span>Return to battlefield</span>
+        <kbd>Enter</kbd><span>Focus terminal input (or enter focus mode if no terminal)</span>
+        <kbd>Ctrl/⌘ + Enter</kbd><span>Enter focus mode (always)</span>
+        <kbd>Ctrl/⌘ + [</kbd><span>Select previous card</span>
+        <kbd>Ctrl/⌘ + ]</kbd><span>Select next card</span>
+        <kbd>Ctrl/⌘ + Shift + N</kbd><span>Add shells</span>
+        <kbd>Right-click</kbd><span>Context menu (Copy, Paste, Insert #, Sync)</span>
+        <kbd>Select text</kbd><span>Auto-copies to clipboard</span>
+      </div>
+      <button id="shortcuts-close-btn" class="toolbar-btn">Close</button>
+    </div>
+  </div>
+  <div id="reconnect-overlay" class="reconnect-overlay hidden">
+    <div class="reconnect-message">Reconnecting...</div>
+  </div>
+  <script src="/assets/main.js"></script>
+</body>
+</html>

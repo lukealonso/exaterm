@@ -849,6 +849,23 @@ fn handle_client_message(
             state.snapshot_dirty = true;
             Ok(false)
         }
+        ClientMessage::AddOneTerminal { source_session } => {
+            let cwd = state
+                .workspace
+                .session(source_session)
+                .and_then(|session| session.launch.cwd.clone());
+            let number = state.workspace.sessions().len() + 1;
+            let mut launch =
+                user_shell_launch(format!("Shell {number}"), "Generic command session");
+            if let Some(cwd) = cwd {
+                launch = launch.with_cwd(cwd);
+            }
+            let session_id = state.add_shell_session_without_watch(launch.clone())?;
+            state.attach_repo_watch(session_id, &launch, control_tx)?;
+            ensure_runtime_forwarder(state, session_id, control_tx.clone());
+            state.snapshot_dirty = true;
+            Ok(false)
+        }
         ClientMessage::ResizeTerminal {
             session_id,
             rows,

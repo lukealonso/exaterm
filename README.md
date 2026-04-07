@@ -24,7 +24,7 @@ The goal is simple: make it possible to supervise multiple coding agents without
 
 ## Architecture
 
-Exaterm is split into five crates:
+Exaterm is split into six crates:
 
 - `crates/exaterm-types`
   - shared contract types only
@@ -41,6 +41,9 @@ Exaterm is split into five crates:
 - `crates/exaterm-gtk`
   - the GTK/VTE desktop client (Linux)
   - renders the UI, owns local display PTYs, and talks to the daemon
+- `crates/exaterm-web`
+  - browser-based web UI (axum + TypeScript/xterm.js)
+  - connects to the daemon over Unix sockets, serves a single-page app with WebSocket relay
 
 The UI is intended to always be beachhead-backed in normal operation.
 
@@ -127,6 +130,12 @@ On macOS, that means:
 - `exaterm-macos`
 - `exatermd`
 
+To build only the web UI (no GTK or system UI libraries required):
+
+```bash
+make web
+```
+
 ## Running
 
 Local:
@@ -162,6 +171,42 @@ If you are on macOS, use `exaterm-macos` instead of `exaterm-gtk`.
 
 Treat this as in-progress rather than finished product UX.
 
+## Web UI
+
+The web UI is a browser-based alternative to the GTK app. It connects to the same beachhead daemon and presents the same battle cards, terminal output, and autonudge controls — just in a browser tab instead of a native window.
+
+### Running locally
+
+```bash
+make web-run
+```
+
+This starts the web server on `http://127.0.0.1:9800`. Open that in a browser. The daemon is auto-spawned if not already running.
+
+### Running over SSH
+
+Run the web server on the remote host and forward the HTTP port:
+
+```bash
+ssh -L 9800:127.0.0.1:9800 user@host 'cargo run -p exaterm-web'
+```
+
+The daemon is auto-spawned on the remote host if not already running.
+
+### CLI options
+
+```
+--port <N>       Port to listen on (default: 9800)
+--bind <addr>    Address to bind to (default: 127.0.0.1)
+--no-embed       Serve frontend assets from disk instead of the embedded copy (for development)
+```
+
+### Security
+
+The web server binds to localhost by default and has no authentication. Anyone who can reach the port gets full terminal access. This is safe when accessed through an SSH tunnel or on a single-user machine.
+
+If you bind to a non-localhost address (e.g. `--bind 0.0.0.0`), the server will print a warning. Do not expose the web UI to an untrusted network without additional access control.
+
 ## Development Commands
 
 Useful commands:
@@ -175,6 +220,9 @@ make test
 make test-workspace
 make core-test
 make daemon-check
+make web
+make web-run
+make web-test
 ```
 
 ## Why “Exaterm”?

@@ -2,3 +2,7 @@
 **/*.rs.bk
 .env
 .env.*
+crates/exaterm-web/frontend/dist/
+crates/exaterm-web/frontend/node_modules/
+crates/exaterm-web/test-results/
+crates/exaterm-web/playwright-report/
