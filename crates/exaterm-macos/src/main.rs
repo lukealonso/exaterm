@@ -460,9 +460,6 @@ fn run_app(mode: exaterm_ui::beachhead::RunMode) {
     // Show the window.
     main_window.makeKeyAndOrderFront(None);
     app.activate();
-    if exaterm_core::synthesis::OpenAiSynthesisConfig::from_env().is_none() {
-        present_openai_key_warning(mtm, &main_window);
-    }
 
     // Keep everything alive for the lifetime of the app.
     std::mem::forget(main_window);
@@ -623,22 +620,6 @@ fn present_startup_error(mtm: objc2::MainThreadMarker, error: &str) {
     alert.setAlertStyle(NSAlertStyle::Critical);
     let message = NSString::from_str("Exaterm could not start a live beachhead connection.");
     let info = NSString::from_str(error);
-    alert.setMessageText(&message);
-    alert.setInformativeText(&info);
-    alert.runModal();
-}
-
-#[cfg(target_os = "macos")]
-fn present_openai_key_warning(mtm: objc2::MainThreadMarker, _window: &objc2_app_kit::NSWindow) {
-    use objc2_app_kit::{NSAlert, NSAlertStyle};
-    use objc2_foundation::NSString;
-
-    let alert = NSAlert::new(mtm);
-    alert.setAlertStyle(NSAlertStyle::Warning);
-    let message = NSString::from_str("OpenAI API key missing");
-    let info = NSString::from_str(
-        "Exaterm started, but OPENAI_API_KEY is not set. Tactical summaries, naming, and auto-nudge are disabled until you provide a key.",
-    );
     alert.setMessageText(&message);
     alert.setInformativeText(&info);
     alert.runModal();
