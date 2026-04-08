@@ -275,4 +275,53 @@ mod tests {
     fn empty_origin_is_rejected() {
         assert!(!origin_allowed(&headers_with_origin("")));
     }
+
+    #[test]
+    fn sanitize_snapshot_replaces_socket_paths() {
+        use exaterm_types::model::{SessionId, SessionRecord, SessionLaunch, SessionKind, SessionStatus};
+        use exaterm_types::proto::{SessionSnapshot, ObservationSnapshot};
+
+        let snapshot = WorkspaceSnapshot {
+            sessions: vec![SessionSnapshot {
+                record: SessionRecord {
+                    id: SessionId(1),
+                    launch: SessionLaunch {
+                        name: "test".into(),
+                        subtitle: "".into(),
+                        program: "/bin/sh".into(),
+                        args: vec![],
+                        cwd: None,
+                        kind: SessionKind::WaitingShell,
+                    },
+                    display_name: None,
+                    status: SessionStatus::Running,
+                    pid: Some(1234),
+                    events: vec![],
+                },
+                observation: ObservationSnapshot::default(),
+                summary: None,
+                raw_stream_socket_name: Some("/tmp/exaterm-abc/session-1.sock".into()),
+                auto_nudge_enabled: false,
+                last_nudge: None,
+                last_sent_age_secs: None,
+            }],
+        };
+
+        let sanitized = sanitize_snapshot(&snapshot);
+        assert_eq!(sanitized.sessions.len(), 1);
+        // Real path must be replaced with placeholder.
+        assert_eq!(
+            sanitized.sessions[0].raw_stream_socket_name.as_deref(),
+            Some("available")
+        );
+    }
+
+    #[test]
+    fn sanitize_snapshot_preserves_none_socket() {
+        let snapshot = WorkspaceSnapshot {
+            sessions: vec![],
+        };
+        let sanitized = sanitize_snapshot(&snapshot);
+        assert!(sanitized.sessions.is_empty());
+    }
 }

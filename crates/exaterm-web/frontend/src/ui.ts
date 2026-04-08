@@ -75,7 +75,7 @@ function deriveBattleCardStatus(
 
   // No summary available — derive from daemon status + observation.
   switch (status) {
-    case "Blocked": return "blocked";
+    case "Blocked": return "active";
     case "Launching": return "active";
     case "Waiting":
       if (hasRuntimeEvidence) return "active";
