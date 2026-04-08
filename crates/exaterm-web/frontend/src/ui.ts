@@ -17,6 +17,7 @@ import {
   isSyncInputs,
   setSyncInputs,
   sendTextToSession,
+  markTerminalDead,
 } from "./terminal";
 
 // --- Status derivation (port of supervision.rs) ---
@@ -74,7 +75,7 @@ function deriveBattleCardStatus(
 
   // No summary available — derive from daemon status + observation.
   switch (status) {
-    case "Blocked": return "active";
+    case "Blocked": return "blocked";
     case "Launching": return "active";
     case "Waiting":
       if (hasRuntimeEvidence) return "active";
@@ -320,6 +321,9 @@ function updateCard(card: CardElements, session: SessionSnapshot, embedTerminal:
     session.record.status === "Complete" ||
     session.record.status === "Detached" ||
     (typeof session.record.status === "object" && "Failed" in session.record.status);
+  if (isDeadSession) {
+    markTerminalDead(session.record.id);
+  }
   const closeBtn = card.root.querySelector<HTMLElement>(".card-close-btn")!;
   closeBtn.title = isDeadSession ? "Dismiss card" : "Close shell (sends exit)";
   closeBtn.onclick = (e) => {
@@ -445,10 +449,9 @@ function showContextMenu(x: number, y: number, sessionId: number) {
   const hasSelection = managed?.term.hasSelection() ?? false;
   copyItem.classList.toggle("disabled", !hasSelection);
 
-  // Update add terminals enabled state.
+  // Update add terminals enabled state — always enabled since we send add_one_terminal.
   const addItem = contextMenuEl.querySelector('[data-action="add-terminals"]') as HTMLElement;
-  const count = currentSnapshot.sessions.length;
-  addItem.classList.toggle("disabled", ![1, 2, 4, 6, 8, 12].includes(count));
+  addItem.classList.remove("disabled");
 
   contextMenuEl.style.left = `${x}px`;
   contextMenuEl.style.top = `${y}px`;
@@ -500,7 +503,9 @@ function handleContextMenuAction(action: string, sessionId: number) {
 }
 
 function insertTerminalNumber(sourceSessionId: number, oneBased: boolean) {
-  const ids = currentSnapshot.sessions.map((s) => s.record.id);
+  const ids = currentSnapshot.sessions
+    .filter((s) => !dismissedSessionIds.has(s.record.id))
+    .map((s) => s.record.id);
   if (isSyncInputs()) {
     // Send each session's own index to its terminal.
     ids.forEach((id, i) => {
@@ -668,7 +673,9 @@ export function init(appEl: HTMLElement, sendFn: (cmd: ClientMessage) => void) {
     if (focusedSessionId === null && (e.key === "[" || e.key === "]") && (e.ctrlKey || e.metaKey)) {
       e.preventDefault();
       e.stopPropagation();
-      const sessions = currentSnapshot.sessions;
+      const sessions = currentSnapshot.sessions.filter(
+        (s) => !dismissedSessionIds.has(s.record.id)
+      );
       if (sessions.length === 0) return;
       const ids = sessions.map((s) => s.record.id);
       const currentIdx = selectedSessionId !== null ? ids.indexOf(selectedSessionId) : -1;
@@ -748,6 +755,11 @@ function render() {
   );
 
   if (sessions.length === 0) {
+    for (const [id, card] of cards) {
+      card.root.remove();
+      detachTerminal(id);
+      cards.delete(id);
+    }
     gridEl.innerHTML = `<div class="empty-state">
       <div class="empty-title">No Live Sessions Yet</div>
       <div class="empty-body">Use Add Shell to start a real terminal-native agent or open an operator shell.<br>Exaterm opens into an empty battlefield so the workspace begins with your own sessions.</div>

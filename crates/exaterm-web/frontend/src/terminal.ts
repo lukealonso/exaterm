@@ -8,6 +8,8 @@ export interface ManagedTerminal {
   fit: FitAddon;
   ws: WebSocket;
   resizeObserver: ResizeObserver | null;
+  /** When false, the stream WebSocket will not reconnect on close. */
+  live: boolean;
 }
 
 const terminals = new Map<number, ManagedTerminal>();
@@ -138,15 +140,14 @@ export function attachTerminal(
       scrollTimer = setTimeout(() => terminal.scrollToBottom(), 200);
     };
     sock.onclose = () => {
-      // Reconnect if the same terminal instance is still managed (not
-      // disposed or replaced by a new attach).
+      // Reconnect if the same terminal instance is still managed, live,
+      // and not replaced by a new attach.
       const currentEntry = terminals.get(sessionId);
-      if (!reconnecting && currentEntry && currentEntry.term === term) {
+      if (!reconnecting && currentEntry && currentEntry.term === term && currentEntry.live) {
         reconnecting = true;
         setTimeout(() => {
           const entry = terminals.get(sessionId);
-          // Only reconnect if the same terminal instance is still managed.
-          if (entry && entry.term === term) {
+          if (entry && entry.term === term && entry.live) {
             ws = connectStream(sessionId, term);
             entry.ws = ws;
           }
@@ -195,6 +196,7 @@ export function attachTerminal(
     fit,
     ws,
     resizeObserver,
+    live: true,
   };
   terminals.set(session.record.id, managed);
   return managed;
@@ -268,6 +270,13 @@ export function showTerminal(sessionId: number, container: HTMLElement) {
 }
 
 let hiddenHolder: HTMLElement | null = null;
+
+/** Stop reconnecting the stream WebSocket for a dead session.
+ *  The terminal stays in the map (scrollback preserved) until detached. */
+export function markTerminalDead(sessionId: number) {
+  const managed = terminals.get(sessionId);
+  if (managed) managed.live = false;
+}
 
 export function detachTerminal(sessionId: number) {
   const managed = terminals.get(sessionId);
