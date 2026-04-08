@@ -708,6 +708,7 @@ export function update(snapshot: WorkspaceSnapshot) {
 }
 
 export function restartWorkspace() {
+  currentSnapshot = { sessions: [] };
   dismissedSessionIds.clear();
   focusedSessionId = null;
   selectedSessionId = null;
@@ -717,6 +718,8 @@ export function restartWorkspace() {
   }
   cards.clear();
   if (gridEl) gridEl.innerHTML = "";
+  const countEl = document.getElementById("session-count");
+  if (countEl) countEl.textContent = "";
 }
 
 export function getFirstSessionId(): number | null {
@@ -729,8 +732,6 @@ export function getFirstSessionId(): number | null {
 function selectCard(sessionId: number) {
   selectedSessionId = sessionId;
   render();
-  const managed = getTerminal(sessionId);
-  if (managed) managed.term.focus();
 }
 
 function focusCard(sessionId: number) {
@@ -738,6 +739,9 @@ function focusCard(sessionId: number) {
   selectedSessionId = sessionId;
   render();
   requestAnimationFrame(() => {
+    // Only focus the terminal if it's actually embedded (not in preview mode).
+    const slot = cards.get(sessionId)?.terminalSlot;
+    if (!slot || slot.classList.contains("scrollback-terminal-hidden")) return;
     const managed = getTerminal(sessionId);
     if (managed) {
       managed.fit.fit();
