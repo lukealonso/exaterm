@@ -374,8 +374,9 @@ function updateCard(card: CardElements, session: SessionSnapshot, embedTerminal:
     let previewLines: string[];
     if (termBuffer && termBuffer.length > 0) {
       previewLines = [];
-      const startRow = Math.max(0, termBuffer.cursorY - 11);
-      for (let i = startRow; i <= termBuffer.cursorY && i < termBuffer.length; i++) {
+      const lastRow = Math.min(termBuffer.length - 1, termBuffer.baseY + termBuffer.cursorY);
+      const startRow = Math.max(0, lastRow - 11);
+      for (let i = startRow; i <= lastRow; i++) {
         const line = termBuffer.getLine(i)?.translateToString(true) ?? "";
         if (line.trim()) previewLines.push(line);
       }
@@ -753,6 +754,15 @@ function render() {
   const sessions = currentSnapshot.sessions.filter(
     (s) => !dismissedSessionIds.has(s.record.id)
   );
+
+  // Clear stale selection/focus that references a dismissed or removed session.
+  const visibleIds = new Set(sessions.map((s) => s.record.id));
+  if (focusedSessionId !== null && !visibleIds.has(focusedSessionId)) {
+    focusedSessionId = null;
+  }
+  if (selectedSessionId !== null && !visibleIds.has(selectedSessionId)) {
+    selectedSessionId = null;
+  }
 
   if (sessions.length === 0) {
     for (const [id, card] of cards) {
