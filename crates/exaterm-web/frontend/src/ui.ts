@@ -720,7 +720,9 @@ export function restartWorkspace() {
 }
 
 export function getFirstSessionId(): number | null {
-  const sessions = currentSnapshot.sessions;
+  const sessions = currentSnapshot.sessions.filter(
+    (s) => !dismissedSessionIds.has(s.record.id)
+  );
   return sessions.length > 0 ? sessions[0].record.id : null;
 }
 
