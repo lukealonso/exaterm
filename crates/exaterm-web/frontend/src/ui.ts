@@ -115,6 +115,7 @@ export function battlefieldColumns(total: number, availableWidth: number, focuse
   if (total === 2) return Math.floor(availableWidth / 2) >= EMBEDDED_TERMINAL_MIN_WIDTH ? 2 : 1;
   if (total === 4) return 2;
   if (total === 6) return 3;
+  if (total === 9) return 3;
   if (total <= 4) return availableWidth >= 1800 ? total : 2;
   if (total === 5) return Math.max(3, Math.min(5, Math.floor(availableWidth / 420)));
   return Math.max(3, Math.min(Math.min(4, total), Math.floor(availableWidth / 380)));
@@ -571,8 +572,9 @@ export function init(appEl: HTMLElement, sendFn: (cmd: ClientMessage) => void) {
 
     if (focusedSessionId !== null) {
       if (sid === focusedSessionId) {
+        // Return to battlefield — preserve selection so keyboard shortcuts
+        // continue operating on this card (matches workspace_view.rs).
         focusedSessionId = null;
-        selectedSessionId = null;
         render();
         return;
       }
@@ -611,12 +613,11 @@ export function init(appEl: HTMLElement, sendFn: (cmd: ClientMessage) => void) {
 
   // Keyboard shortcuts (capture phase to beat xterm.js).
   document.addEventListener("keydown", (e) => {
-    // Escape: exit focus mode.
+    // Escape: exit focus mode — preserve selection (matches workspace_view.rs).
     if (e.key === "Escape" && focusedSessionId !== null) {
       e.preventDefault();
       e.stopPropagation();
       focusedSessionId = null;
-      selectedSessionId = null;
       render();
       return;
     }

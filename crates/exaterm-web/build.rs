@@ -21,8 +21,27 @@ fn main() {
     // When node_modules is missing we emit a warning and create placeholder
     // files so that `cargo check --workspace` still succeeds (the embedded
     // dist will contain stubs, but the binary won't be usable).
+    //
+    // Cargo's rerun-if-changed tracks file mtimes, not directory existence.
+    // We write a marker file that records whether the last build used real or
+    // placeholder assets so that adding/removing node_modules always triggers
+    // a rebuild.
     let node_modules = frontend_dir.join("node_modules");
-    if !node_modules.exists() {
+    let deps_available = node_modules.exists();
+    let marker_path = dist_dir.join(".deps-state");
+    let marker_value = if deps_available { "full" } else { "placeholder" };
+    let needs_rebuild = fs::read_to_string(&marker_path)
+        .map(|prev| prev != marker_value)
+        .unwrap_or(true);
+    if needs_rebuild {
+        // Force Cargo to rerun build.rs on next invocation by rewriting the
+        // marker.  This covers the transition in both directions (deps added
+        // or removed).
+        fs::write(&marker_path, marker_value).expect("failed to write deps-state marker");
+    }
+    println!("cargo:rerun-if-changed=frontend/dist/.deps-state");
+
+    if !deps_available {
         println!(
             "cargo:warning=frontend/node_modules not found — skipping frontend build. \
              Run `npm install` in crates/exaterm-web/frontend/ (or `make web`) to build \
