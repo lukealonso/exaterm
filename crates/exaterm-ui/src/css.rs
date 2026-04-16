@@ -66,33 +66,7 @@ pub fn generate_application_css() -> String {
 
     parts.push(format!(
         "\
-        flowboxchild {{\n\
-        {i}padding: 0;\n\
-        {i}background: transparent;\n\
-        {i}box-shadow: none;\n\
-        {i}outline: none;\n\
-        }}"
-    ));
-
-    parts.push(format!(
-        "\
-        flowboxchild:selected {{\n\
-        {i}background: transparent;\n\
-        {i}box-shadow: none;\n\
-        {i}outline: none;\n\
-        }}"
-    ));
-
-    parts.push(format!(
-        "\
-        flowboxchild:selected > * {{\n\
-        {i}box-shadow: none;\n\
-        }}"
-    ));
-
-    parts.push(format!(
-        "\
-        flowboxchild.selected-card > * {{\n\
+        .battle-card.selected-card {{\n\
         {i}border-color: rgba(113, 197, 255, 0.98);\n\
         {i}box-shadow: 0 0 0 1px rgba(113, 197, 255, 0.92), 0 22px 44px rgba(13, 92, 151, 0.24);\n\
         }}"
@@ -448,6 +422,7 @@ pub fn generate_application_css() -> String {
         {i}border: 1px solid rgba(173, 188, 204, 0.08);\n\
         {i}background: rgba(11, 18, 28, 0.18);\n\
         {i}padding: 7px 9px;\n\
+        {i}min-width: 0;\n\
         }}"
     ));
 
@@ -469,6 +444,7 @@ pub fn generate_application_css() -> String {
         "\
         .segmented-bar {{\n\
         {i}min-height: 8px;\n\
+        {i}min-width: 0;\n\
         }}"
     ));
 
@@ -476,6 +452,7 @@ pub fn generate_application_css() -> String {
         "\
         .bar-segment {{\n\
         {i}min-height: 8px;\n\
+        {i}min-width: 0;\n\
         {i}border-radius: 999px;\n\
         }}"
     ));
@@ -488,16 +465,29 @@ pub fn generate_application_css() -> String {
     ));
 
     parts.push(format!("\
+        .bar-attention-1,\n\
         .bar-calm {{\n\
         {i}background: linear-gradient(90deg, rgba(110, 231, 183, 0.88) 0%, rgba(52, 211, 153, 0.92) 100%);\n\
         }}"));
 
     parts.push(format!("\
+        .bar-attention-2 {{\n\
+        {i}background: linear-gradient(90deg, rgba(163, 230, 53, 0.88) 0%, rgba(74, 222, 128, 0.92) 100%);\n\
+        }}"));
+
+    parts.push(format!("\
+        .bar-attention-3,\n\
         .bar-watch {{\n\
         {i}background: linear-gradient(90deg, rgba(250, 204, 21, 0.88) 0%, rgba(251, 146, 60, 0.92) 100%);\n\
         }}"));
 
     parts.push(format!("\
+        .bar-attention-4 {{\n\
+        {i}background: linear-gradient(90deg, rgba(251, 146, 60, 0.9) 0%, rgba(239, 68, 68, 0.92) 100%);\n\
+        }}"));
+
+    parts.push(format!("\
+        .bar-attention-5,\n\
         .bar-alert {{\n\
         {i}background: linear-gradient(90deg, rgba(248, 113, 113, 0.9) 0%, rgba(239, 68, 68, 0.94) 100%);\n\
         }}"));
@@ -574,7 +564,7 @@ pub fn generate_application_css() -> String {
 
     parts.push(format!(
         "\
-        flowboxchild.focused-card > * {{\n\
+        .battle-card.focused-card {{\n\
         {i}border-color: rgba(110, 231, 183, 0.92);\n\
         {i}box-shadow: 0 0 0 1px rgba(110, 231, 183, 0.78), 0 20px 38px rgba(7, 88, 57, 0.22);\n\
         }}"
@@ -615,7 +605,7 @@ pub fn generate_application_css() -> String {
     // --- focus mode overrides ---
     parts.push(format!(
         "\
-        .focus-mode flowboxchild .battle-card {{\n\
+        .focus-mode .battle-card {{\n\
         {i}min-width: 176px;\n\
         {i}min-height: 182px;\n\
         {i}border-radius: 18px;\n\
@@ -625,36 +615,36 @@ pub fn generate_application_css() -> String {
 
     parts.push(format!(
         "\
-        .focus-mode flowboxchild .card-title {{\n\
+        .focus-mode .card-title {{\n\
         {i}font-size: 15px;\n\
         }}"
     ));
 
     parts.push(format!(
         "\
-        .focus-mode flowboxchild .card-status,\n\
-        .focus-mode flowboxchild .card-recency {{\n\
+        .focus-mode .card-status,\n\
+        .focus-mode .card-recency {{\n\
         {i}font-size: 10px;\n\
         }}"
     ));
 
     parts.push(format!(
         "\
-        .focus-mode flowboxchild .card-header-row {{\n\
+        .focus-mode .card-header-row {{\n\
         {i}min-height: 28px;\n\
         }}"
     ));
 
     parts.push(format!(
         "\
-        .focus-mode flowboxchild .card-bottom-stack {{\n\
+        .focus-mode .card-bottom-stack {{\n\
         {i}margin-top: 0;\n\
         }}"
     ));
 
     parts.push(format!(
         "\
-        .focus-mode flowboxchild .card-alert {{\n\
+        .focus-mode .card-alert {{\n\
         {i}color: rgba(206, 217, 229, 0.84);\n\
         {i}font-size: 12px;\n\
         {i}font-weight: 600;\n\
@@ -672,10 +662,55 @@ pub fn generate_application_css() -> String {
 
     parts.push(format!(
         "\
-        .focus-mode flowboxchild .card-headline,\n\
-        .focus-mode flowboxchild .card-detail,\n\
-        .focus-mode flowboxchild .card-scrollback-band,\n\
-        .focus-mode flowboxchild .bar-widget {{\n\
+        .focus-mode .card-headline,\n\
+        .focus-mode .card-detail,\n\
+        .focus-mode .card-scrollback-band,\n\
+        .focus-mode .bar-widget {{\n\
+        }}"
+    ));
+
+    parts.push(format!(
+        "\
+        .toolbar-add-button {{\n\
+        {i}background: rgba(30, 58, 95, 0.72);\n\
+        {i}color: rgba(199, 218, 240, 0.92);\n\
+        {i}border: 1px solid rgba(96, 165, 250, 0.18);\n\
+        {i}border-radius: 10px;\n\
+        {i}padding: 4px 14px;\n\
+        {i}font-size: 12px;\n\
+        {i}font-weight: 700;\n\
+        {i}min-height: 0;\n\
+        }}"
+    ));
+
+    parts.push(format!(
+        "\
+        .toolbar-add-button:hover {{\n\
+        {i}background: rgba(37, 72, 118, 0.82);\n\
+        {i}border-color: rgba(96, 165, 250, 0.32);\n\
+        }}"
+    ));
+
+    parts.push(format!(
+        "\
+        .toolbar-toggle-button {{\n\
+        {i}background: rgba(30, 38, 50, 0.72);\n\
+        {i}color: rgba(188, 201, 216, 0.78);\n\
+        {i}border: 1px solid rgba(163, 175, 194, 0.14);\n\
+        {i}border-radius: 10px;\n\
+        {i}padding: 4px 14px;\n\
+        {i}font-size: 12px;\n\
+        {i}font-weight: 700;\n\
+        {i}min-height: 0;\n\
+        }}"
+    ));
+
+    parts.push(format!(
+        "\
+        .toolbar-toggle-button:checked {{\n\
+        {i}background: rgba(30, 58, 95, 0.82);\n\
+        {i}color: rgba(199, 218, 240, 0.94);\n\
+        {i}border-color: rgba(96, 165, 250, 0.28);\n\
         }}"
     ));
 
@@ -715,24 +750,7 @@ mod tests {
             background: #000000;
         }
 
-        flowboxchild {
-            padding: 0;
-            background: transparent;
-            box-shadow: none;
-            outline: none;
-        }
-
-        flowboxchild:selected {
-            background: transparent;
-            box-shadow: none;
-            outline: none;
-        }
-
-        flowboxchild:selected > * {
-            box-shadow: none;
-        }
-
-        flowboxchild.selected-card > * {
+        .battle-card.selected-card {
             border-color: rgba(113, 197, 255, 0.98);
             box-shadow: 0 0 0 1px rgba(113, 197, 255, 0.92), 0 22px 44px rgba(13, 92, 151, 0.24);
         }
@@ -947,6 +965,7 @@ mod tests {
             border: 1px solid rgba(173, 188, 204, 0.08);
             background: rgba(11, 18, 28, 0.18);
             padding: 7px 9px;
+            min-width: 0;
         }
 
         .bar-caption {
@@ -958,10 +977,12 @@ mod tests {
 
         .segmented-bar {
             min-height: 8px;
+            min-width: 0;
         }
 
         .bar-segment {
             min-height: 8px;
+            min-width: 0;
             border-radius: 999px;
         }
 
@@ -969,14 +990,25 @@ mod tests {
             background: rgba(163, 175, 194, 0.14);
         }
 
+        .bar-attention-1,
         .bar-calm {
             background: linear-gradient(90deg, rgba(110, 231, 183, 0.88) 0%, rgba(52, 211, 153, 0.92) 100%);
         }
 
+        .bar-attention-2 {
+            background: linear-gradient(90deg, rgba(163, 230, 53, 0.88) 0%, rgba(74, 222, 128, 0.92) 100%);
+        }
+
+        .bar-attention-3,
         .bar-watch {
             background: linear-gradient(90deg, rgba(250, 204, 21, 0.88) 0%, rgba(251, 146, 60, 0.92) 100%);
         }
 
+        .bar-attention-4 {
+            background: linear-gradient(90deg, rgba(251, 146, 60, 0.9) 0%, rgba(239, 68, 68, 0.92) 100%);
+        }
+
+        .bar-attention-5,
         .bar-alert {
             background: linear-gradient(90deg, rgba(248, 113, 113, 0.9) 0%, rgba(239, 68, 68, 0.94) 100%);
         }
@@ -1020,7 +1052,7 @@ mod tests {
             color: #dbeafe;
         }
 
-        flowboxchild.focused-card > * {
+        .battle-card.focused-card {
             border-color: rgba(110, 231, 183, 0.92);
             box-shadow: 0 0 0 1px rgba(110, 231, 183, 0.78), 0 20px 38px rgba(7, 88, 57, 0.22);
         }
@@ -1124,31 +1156,31 @@ mod tests {
             border-color: rgba(192, 132, 252, 0.24);
         }
 
-        .focus-mode flowboxchild .battle-card {
+        .focus-mode .battle-card {
             min-width: 176px;
             min-height: 182px;
             border-radius: 18px;
             box-shadow: 0 14px 28px rgba(0, 0, 0, 0.22);
         }
 
-        .focus-mode flowboxchild .card-title {
+        .focus-mode .card-title {
             font-size: 15px;
         }
 
-        .focus-mode flowboxchild .card-status,
-        .focus-mode flowboxchild .card-recency {
+        .focus-mode .card-status,
+        .focus-mode .card-recency {
             font-size: 10px;
         }
 
-        .focus-mode flowboxchild .card-header-row {
+        .focus-mode .card-header-row {
             min-height: 28px;
         }
 
-        .focus-mode flowboxchild .card-bottom-stack {
+        .focus-mode .card-bottom-stack {
             margin-top: 0;
         }
 
-        .focus-mode flowboxchild .card-alert {
+        .focus-mode .card-alert {
             color: rgba(206, 217, 229, 0.84);
             font-size: 12px;
             font-weight: 600;
@@ -1163,10 +1195,43 @@ mod tests {
             margin-right: 0;
         }
 
-        .focus-mode flowboxchild .card-headline,
-        .focus-mode flowboxchild .card-detail,
-        .focus-mode flowboxchild .card-scrollback-band,
-        .focus-mode flowboxchild .bar-widget {
+        .focus-mode .card-headline,
+        .focus-mode .card-detail,
+        .focus-mode .card-scrollback-band,
+        .focus-mode .bar-widget {
+        }
+
+        .toolbar-add-button {
+            background: rgba(30, 58, 95, 0.72);
+            color: rgba(199, 218, 240, 0.92);
+            border: 1px solid rgba(96, 165, 250, 0.18);
+            border-radius: 10px;
+            padding: 4px 14px;
+            font-size: 12px;
+            font-weight: 700;
+            min-height: 0;
+        }
+
+        .toolbar-add-button:hover {
+            background: rgba(37, 72, 118, 0.82);
+            border-color: rgba(96, 165, 250, 0.32);
+        }
+
+        .toolbar-toggle-button {
+            background: rgba(30, 38, 50, 0.72);
+            color: rgba(188, 201, 216, 0.78);
+            border: 1px solid rgba(163, 175, 194, 0.14);
+            border-radius: 10px;
+            padding: 4px 14px;
+            font-size: 12px;
+            font-weight: 700;
+            min-height: 0;
+        }
+
+        .toolbar-toggle-button:checked {
+            background: rgba(30, 58, 95, 0.82);
+            color: rgba(199, 218, 240, 0.94);
+            border-color: rgba(96, 165, 250, 0.28);
         }
 
         terminal {
@@ -1225,6 +1290,23 @@ mod tests {
         ] {
             assert!(
                 css.contains(&format!(".{name} {{")),
+                "missing .{name} selector"
+            );
+        }
+    }
+
+    #[test]
+    fn contains_attention_bar_selectors() {
+        let css = generate_application_css();
+        for name in [
+            "bar-attention-1",
+            "bar-attention-2",
+            "bar-attention-3",
+            "bar-attention-4",
+            "bar-attention-5",
+        ] {
+            assert!(
+                css.contains(&format!(".{name}")),
                 "missing .{name} selector"
             );
         }

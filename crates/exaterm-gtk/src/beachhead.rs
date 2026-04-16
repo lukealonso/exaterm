@@ -1,1 +1,1 @@
-pub use exaterm_ui::beachhead::{BeachheadConnection, BeachheadTarget, RawSessionConnector};
+pub use exaterm_ui::beachhead::{BeachheadConnection, RawSessionConnector};

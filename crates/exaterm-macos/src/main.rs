@@ -128,7 +128,7 @@ fn run_app(mode: exaterm_ui::beachhead::RunMode) {
         )
     };
 
-    main_window.setTitle(ns_string!("Exaterm"));
+    main_window.setTitle(ns_string!("exaterm"));
     main_window.setMinSize(NSSize::new(
         window::WINDOW_MIN_WIDTH,
         window::WINDOW_MIN_HEIGHT,

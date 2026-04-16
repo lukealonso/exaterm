@@ -1,4 +1,4 @@
-use crate::actions::{insert_terminal_number, set_auto_nudge_hover, toggle_auto_nudge};
+use crate::actions::{set_auto_nudge_hover, toggle_auto_nudge};
 use crate::beachhead::BeachheadConnection;
 use crate::style::{
     apply_battle_card_surface_style, apply_battle_status_style, configure_app_icons, load_css,
@@ -26,9 +26,9 @@ use exaterm_core::synthesis::{
 use exaterm_types::model::{SessionId, SessionLaunch, SessionRecord};
 use exaterm_types::proto::{ClientMessage, ObservationSnapshot, ServerMessage, WorkspaceSnapshot};
 use exaterm_types::synthesis::{AttentionLevel, NameSuggestion, TacticalState, TacticalSynthesis};
-use exaterm_ui::beachhead::{BeachheadTarget, RunMode, parse_run_mode};
+use exaterm_ui::beachhead::{parse_run_mode, BeachheadTarget, ParsedArgs, RunMode};
 use exaterm_ui::layout::{
-    battlefield_can_embed_terminals, battlefield_columns,
+    battlefield_can_embed_terminals, compute_tiling, GridTiling,
     visible_scrollback_line_capacity as layout_visible_scrollback_line_capacity,
 };
 use exaterm_ui::presentation::{
@@ -58,7 +58,6 @@ use vte::prelude::*;
 use vte4 as vte;
 
 const APP_ID: &str = "io.exaterm.Exaterm";
-const TERMINAL_LAYOUT_TARGETS: &[usize] = &[2, 4, 6, 8, 9, 12, 16];
 const TERMINATOR_AMBIENCE_FOREGROUND: &str = "#ffffff";
 const TERMINATOR_AMBIENCE_BACKGROUND: &str = "#000000";
 const TERMINATOR_AMBIENCE_PALETTE: [&str; 16] = [
@@ -149,17 +148,8 @@ impl SummaryCacheEntry {
     }
 }
 
-fn summary_refresh_interval(session_age: Duration) -> Duration {
-    let seconds = session_age.as_secs();
-    if seconds < 60 {
-        Duration::from_secs(5)
-    } else if seconds < 180 {
-        Duration::from_secs(10)
-    } else if seconds < 300 {
-        Duration::from_secs(20)
-    } else {
-        Duration::from_secs(30)
-    }
+fn summary_refresh_interval(_session_age: Duration) -> Duration {
+    Duration::from_secs(5 * 60)
 }
 
 impl NamingCacheEntry {
@@ -221,8 +211,9 @@ pub(crate) struct AppContext {
     title: adw::WindowTitle,
     empty_state: gtk::Box,
     content_root: gtk::Box,
-    cards: gtk::FlowBox,
+    cards: gtk::Grid,
     battlefield_panel: gtk::ScrolledWindow,
+    cached_tiling: RefCell<Option<GridTiling>>,
     pub(crate) sync_inputs_enabled: Arc<AtomicBool>,
     pub(crate) sync_inputs_permitted: Arc<AtomicBool>,
     pub(crate) raw_input_writers: Arc<Mutex<BTreeMap<SessionId, Arc<Mutex<UnixStream>>>>>,
@@ -242,14 +233,19 @@ pub(crate) struct AppContext {
 
 pub fn run() -> glib::ExitCode {
     let argv = std::env::args().collect::<Vec<_>>();
-    let mode = match parse_run_mode(argv.iter().skip(1).cloned()) {
-        Ok(mode) => mode,
+    let parsed = match parse_run_mode(argv.iter().skip(1).cloned()) {
+        Ok(parsed) => parsed,
         Err(error) => {
             eprintln!("{error}");
-            eprintln!("usage: exaterm [--ssh user@host]");
+            eprintln!("usage: exaterm [--ssh user@host] [--new <id> | --resume <id>]");
             return glib::ExitCode::from(2);
         }
     };
+
+    if let Some(workspace) = &parsed.workspace {
+        std::env::set_var("EXATERM_WORKSPACE", workspace.id());
+    }
+
     let app = gtk::Application::builder()
         .application_id(APP_ID)
         .flags(gio::ApplicationFlags::NON_UNIQUE)
@@ -258,7 +254,7 @@ pub fn run() -> glib::ExitCode {
         adw::init().expect("libadwaita should initialize");
         adw::StyleManager::default().set_color_scheme(adw::ColorScheme::ForceDark);
     });
-    app.connect_activate(move |app| build_ui(app, mode.clone()));
+    app.connect_activate(move |app| build_ui(app, parsed.clone()));
     let program = argv
         .first()
         .cloned()
@@ -270,16 +266,15 @@ pub(crate) fn daemon_backed(context: &AppContext) -> bool {
     context.beachhead.is_some()
 }
 
-fn build_ui(app: &gtk::Application, mode: RunMode) {
+fn build_ui(app: &gtk::Application, parsed: ParsedArgs) {
     load_css();
     configure_app_icons(APP_ID);
+    let mode = parsed.mode.clone();
+    let workspace_id = parsed.workspace.as_ref().map(|w| w.id().to_string());
     let beachhead = if visual_gallery_enabled() {
         None
     } else {
-        let target = match &mode {
-            RunMode::Local => BeachheadTarget::Local,
-            RunMode::Ssh { target } => BeachheadTarget::Ssh(target.clone()),
-        };
+        let target = BeachheadTarget::from_parsed(&parsed);
         match BeachheadConnection::connect(&target) {
             Ok(connection) => Some(connection),
             Err(error) => {
@@ -289,16 +284,18 @@ fn build_ui(app: &gtk::Application, mode: RunMode) {
         }
     };
 
-    let cards = gtk::FlowBox::builder()
-        .selection_mode(gtk::SelectionMode::Single)
+    let cards = gtk::Grid::builder()
         .column_spacing(12)
         .row_spacing(12)
         .margin_top(12)
         .margin_bottom(12)
         .margin_start(12)
         .margin_end(12)
-        .homogeneous(true)
+        .column_homogeneous(true)
+        .row_homogeneous(true)
         .valign(gtk::Align::Fill)
+        .hexpand(true)
+        .vexpand(true)
         .build();
 
     let battlefield_panel = gtk::ScrolledWindow::builder()
@@ -468,11 +465,39 @@ fn build_ui(app: &gtk::Application, mode: RunMode) {
     focus_panel.add_css_class("focus-panel");
     focus_panel.append(&focus_frame);
 
-    let title = adw::WindowTitle::new("Exaterm", "");
+    let window_title = match &workspace_id {
+        Some(id) => format!("exaterm · {id}"),
+        None => "exaterm".into(),
+    };
+    let title = adw::WindowTitle::new(&window_title, "");
     let header = adw::HeaderBar::builder()
         .title_widget(&title)
         .show_end_title_buttons(true)
         .build();
+
+    let add_terminal_button = gtk::Button::builder()
+        .label("+ Add Terminal")
+        .build();
+    add_terminal_button.add_css_class("toolbar-add-button");
+
+    let toolbar = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(8)
+        .margin_start(12)
+        .margin_end(12)
+        .margin_top(6)
+        .margin_bottom(2)
+        .halign(gtk::Align::Start)
+        .build();
+    toolbar.add_css_class("battlefield-toolbar");
+    toolbar.append(&add_terminal_button);
+
+    let sync_inputs_button = gtk::ToggleButton::builder()
+        .label("Sync Inputs")
+        .active(false)
+        .build();
+    sync_inputs_button.add_css_class("toolbar-toggle-button");
+    toolbar.append(&sync_inputs_button);
 
     let content_root = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -480,6 +505,7 @@ fn build_ui(app: &gtk::Application, mode: RunMode) {
         .vexpand(true)
         .build();
     content_root.add_css_class("battlefield-root");
+    content_root.append(&toolbar);
     content_root.append(&empty_state);
     content_root.append(&battlefield_panel);
     content_root.append(&focus_panel);
@@ -492,7 +518,7 @@ fn build_ui(app: &gtk::Application, mode: RunMode) {
 
     let window = adw::ApplicationWindow::builder()
         .application(app)
-        .title("Exaterm")
+        .title("exaterm")
         .icon_name(APP_ID)
         .default_width(1480)
         .default_height(960)
@@ -508,6 +534,7 @@ fn build_ui(app: &gtk::Application, mode: RunMode) {
         content_root,
         cards,
         battlefield_panel,
+        cached_tiling: RefCell::new(None),
         sync_inputs_enabled: Arc::new(AtomicBool::new(false)),
         sync_inputs_permitted: Arc::new(AtomicBool::new(true)),
         raw_input_writers: Arc::new(Mutex::new(BTreeMap::new())),
@@ -548,30 +575,18 @@ fn build_ui(app: &gtk::Application, mode: RunMode) {
     });
 
     {
-        let cards = context.cards.clone();
         let context = context.clone();
-        cards.connect_selected_children_changed(move |flowbox| {
-            let selected = flowbox.selected_children();
-            let Some(selected_child) = selected.first() else {
-                return;
-            };
-            let maybe_session =
-                context
-                    .session_cards
-                    .borrow()
-                    .iter()
-                    .find_map(|(session_id, card)| {
-                        (card.row == *selected_child).then_some(*session_id)
-                    });
-            if let Some(session_id) = maybe_session {
-                let focused = context.state.borrow().focused_session().is_some();
-                if focused {
-                    show_intervention(&context, session_id);
-                } else {
-                    context.state.borrow_mut().select_session(session_id);
-                    refresh_card_styles(&context);
-                }
-            }
+        add_terminal_button.connect_clicked(move |_| {
+            add_terminal_from_toolbar(&context);
+        });
+    }
+
+    {
+        let context = context.clone();
+        sync_inputs_button.connect_toggled(move |button| {
+            context
+                .sync_inputs_enabled
+                .store(button.is_active(), Ordering::Relaxed);
         });
     }
 
@@ -614,7 +629,7 @@ fn build_ui(app: &gtk::Application, mode: RunMode) {
 
     {
         let context = context.clone();
-        glib::timeout_add_local(std::time::Duration::from_millis(900), move || {
+        glib::timeout_add_local(std::time::Duration::from_millis(300), move || {
             refresh_runtime_and_cards(&context);
             glib::ControlFlow::Continue
         });
@@ -737,13 +752,13 @@ fn present_startup_error(app: &gtk::Application, error: &str) {
     let close_button = gtk::Button::with_label("Close");
     let window = adw::ApplicationWindow::builder()
         .application(app)
-        .title("Exaterm")
+        .title("exaterm")
         .icon_name(APP_ID)
         .default_width(720)
         .default_height(220)
         .build();
 
-    let title = adw::WindowTitle::new("Exaterm", "Startup failed");
+    let title = adw::WindowTitle::new("exaterm", "Startup failed");
     let header = adw::HeaderBar::builder()
         .title_widget(&title)
         .show_end_title_buttons(true)
@@ -804,7 +819,6 @@ fn append_session_card_with_spawn(
         .expect("new session should exist");
 
     let card = build_battle_card_widgets(context, &session);
-    context.cards.insert(&card.row, -1);
     context
         .session_cards
         .borrow_mut()
@@ -814,10 +828,7 @@ fn append_session_card_with_spawn(
         .borrow_mut()
         .insert(session_id, SessionObservation::new());
 
-    update_flowbox_columns(context);
-    if context.state.borrow().selected_session() == Some(session_id) {
-        context.cards.select_child(&card.row);
-    }
+    sync_grid_layout(context);
     if should_spawn {
         spawn_session(context, session_id, &session.launch, &card.terminal);
     }
@@ -1150,24 +1161,15 @@ fn build_battle_card_widgets(
         .valign(gtk::Align::Fill)
         .build();
     frame.add_css_class("battle-card");
-    let row = gtk::FlowBoxChild::builder()
-        .child(&frame)
-        .hexpand(true)
-        .vexpand(true)
-        .halign(gtk::Align::Fill)
-        .valign(gtk::Align::Fill)
-        .build();
-    row.set_focusable(true);
+    frame.set_focusable(true);
 
     {
         let context = context.clone();
-        let row = row.clone();
         let session_id = session.id;
         let click = gtk::GestureClick::new();
         click.set_button(1);
         click.connect_released(move |_, _, _, _| {
             let focused_before = context.state.borrow().focused_session();
-            context.cards.select_child(&row);
             context.state.borrow_mut().select_session(session_id);
             if let Some(focused_session) = focused_before {
                 if focused_session == session_id {
@@ -1187,6 +1189,48 @@ fn build_battle_card_widgets(
         frame.add_controller(click);
     }
 
+    // Drag-to-reorder: DragSource on the card frame so it works even
+    // when the header is hidden in unadorned/sparse mode.
+    {
+        let drag_source = gtk::DragSource::new();
+        drag_source.set_actions(gdk::DragAction::MOVE);
+        let session_id = session.id;
+        drag_source.connect_prepare(move |_source, _x, _y| {
+            let value = session_id.0.to_value();
+            Some(gdk::ContentProvider::for_value(&value))
+        });
+        frame.add_controller(drag_source);
+    }
+
+    // DropTarget on the card frame to accept reorder drops.
+    {
+        let context = context.clone();
+        let target_session_id = session.id;
+        let drop_target = gtk::DropTarget::new(u32::static_type(), gdk::DragAction::MOVE);
+        drop_target.connect_drop(move |_target, value, _x, _y| {
+            let Ok(source_raw) = value.get::<u32>() else {
+                return false;
+            };
+            let source_id = SessionId(source_raw);
+            if source_id == target_session_id {
+                return false;
+            }
+            let target_index = context
+                .state
+                .borrow()
+                .ordered_session_ids()
+                .iter()
+                .position(|id| *id == target_session_id)
+                .unwrap_or(0);
+            context.state.borrow_mut().move_session(source_id, target_index);
+            *context.cached_tiling.borrow_mut() = None;
+            sync_grid_layout(&context);
+            refresh_card_styles(&context);
+            true
+        });
+        frame.add_controller(drop_target);
+    }
+
     let terminal = vte::Terminal::builder()
         .scroll_on_output(false)
         .scroll_on_keystroke(true)
@@ -1203,11 +1247,9 @@ fn build_battle_card_widgets(
     });
     {
         let context = context.clone();
-        let row = row.clone();
         let session_id = session.id;
         let terminal_focus = gtk::EventControllerFocus::new();
         terminal_focus.connect_enter(move |_| {
-            context.cards.select_child(&row);
             {
                 let mut state = context.state.borrow_mut();
                 state.select_session(session_id);
@@ -1244,7 +1286,6 @@ fn build_battle_card_widgets(
     }
 
     SessionCardWidgets {
-        row,
         frame,
         header,
         title,
@@ -1305,67 +1346,15 @@ fn install_terminal_context_menu(
     }
     actions.add_action(&paste_action);
 
-    let add_terminals_action = gtk::gio::SimpleAction::new("add_terminals", None);
+    let close_session_action = gtk::gio::SimpleAction::new("close_session", None);
     {
         let context = context.clone();
-        add_terminals_action.connect_activate(move |_, _| {
-            split_terminal_here(&context, source_session);
+        close_session_action.connect_activate(move |_, _| {
+            close_session(&context, source_session);
         });
     }
-    actions.add_action(&add_terminals_action);
+    actions.add_action(&close_session_action);
 
-    let add_terminals_to_action =
-        gtk::gio::SimpleAction::new("add_terminals_to", Some(&u32::static_variant_type()));
-    {
-        let context = context.clone();
-        add_terminals_to_action.connect_activate(move |_, target| {
-            let Some(target_total) = target.and_then(|value| value.get::<u32>()) else {
-                return;
-            };
-            add_terminals_to(&context, source_session, target_total as usize);
-        });
-    }
-    actions.add_action(&add_terminals_to_action);
-
-    let insert_terminal_number_one_action =
-        gtk::gio::SimpleAction::new("insert_terminal_number_one", None);
-    {
-        let context = context.clone();
-        insert_terminal_number_one_action.connect_activate(move |_, _| {
-            insert_terminal_number(&context, source_session, true);
-        });
-    }
-    actions.add_action(&insert_terminal_number_one_action);
-
-    let insert_terminal_number_zero_action =
-        gtk::gio::SimpleAction::new("insert_terminal_number_zero", None);
-    {
-        let context = context.clone();
-        insert_terminal_number_zero_action.connect_activate(move |_, _| {
-            insert_terminal_number(&context, source_session, false);
-        });
-    }
-    actions.add_action(&insert_terminal_number_zero_action);
-
-    let sync_inputs_action = gtk::gio::SimpleAction::new_stateful(
-        "sync_inputs",
-        None,
-        &context
-            .sync_inputs_enabled
-            .load(Ordering::Relaxed)
-            .to_variant(),
-    );
-    {
-        let context = context.clone();
-        sync_inputs_action.connect_change_state(move |action, value| {
-            let enabled = value.and_then(|state| state.get::<bool>()).unwrap_or(false);
-            context
-                .sync_inputs_enabled
-                .store(enabled, Ordering::Relaxed);
-            action.set_state(&enabled.to_variant());
-        });
-    }
-    actions.add_action(&sync_inputs_action);
     terminal.insert_action_group("terminal", Some(&actions));
 
     let menu = gtk::gio::Menu::new();
@@ -1382,56 +1371,16 @@ fn install_terminal_context_menu(
     let right_click = gtk::GestureClick::new();
     right_click.set_button(3);
     {
-        let context = context.clone();
         let terminal = terminal.clone();
         let copy_action = copy_action.clone();
-        let add_terminals_action = add_terminals_action.clone();
-        let sync_inputs_action = sync_inputs_action.clone();
         let menu = menu.clone();
         let popover = popover.clone();
         right_click.connect_pressed(move |gesture, _, x, y| {
-            let count = context.state.borrow().sessions().len();
-            let sync_permitted = context.state.borrow().focused_session().is_none();
             copy_action.set_enabled(terminal.has_selection());
-            add_terminals_action.set_enabled(matches!(count, 1 | 2 | 4 | 6 | 8 | 9 | 12));
-            sync_inputs_action.set_enabled(sync_permitted);
-            sync_inputs_action.set_state(
-                &context
-                    .sync_inputs_enabled
-                    .load(Ordering::Relaxed)
-                    .to_variant(),
-            );
             menu.remove_all();
             menu.append(Some("Copy"), Some("terminal.copy"));
             menu.append(Some("Paste"), Some("terminal.paste"));
-            let available_targets = reachable_terminal_targets(count);
-            if !available_targets.is_empty() {
-                let submenu = gtk::gio::Menu::new();
-                for target_total in available_targets {
-                    let item =
-                        gtk::gio::MenuItem::new(Some(&format!("Up to {target_total}")), None);
-                    item.set_action_and_target_value(
-                        Some("terminal.add_terminals_to"),
-                        Some(&(target_total as u32).to_variant()),
-                    );
-                    submenu.append_item(&item);
-                }
-                menu.append_submenu(Some("Add Terminals"), &submenu);
-            } else {
-                menu.append(Some("Add Terminals"), Some("terminal.add_terminals"));
-            }
-            menu.append(
-                Some("Insert Terminal Number (1-base)"),
-                Some("terminal.insert_terminal_number_one"),
-            );
-            menu.append(
-                Some("Insert Terminal Number (0-base)"),
-                Some("terminal.insert_terminal_number_zero"),
-            );
-            let sync_inputs_item =
-                gtk::gio::MenuItem::new(Some("Synchronize Inputs"), Some("terminal.sync_inputs"));
-            sync_inputs_item.set_attribute_value("role", Some(&"check".to_variant()));
-            menu.append_item(&sync_inputs_item);
+            menu.append(Some("Close Session"), Some("terminal.close_session"));
             let rect = gdk::Rectangle::new(x as i32, y as i32, 1, 1);
             popover.set_pointing_to(Some(&rect));
             popover.set_offset(0, 0);
@@ -1474,127 +1423,77 @@ fn install_nudge_pill_interactions(
     pill.add_controller(motion);
 }
 
-fn split_terminal_here(context: &Rc<AppContext>, source_session: SessionId) {
+fn close_session(context: &Rc<AppContext>, session_id: SessionId) {
+    let was_focused = context.state.borrow().focused_session() == Some(session_id);
+    if was_focused {
+        show_battlefield(context);
+    }
+
     if daemon_backed(context) {
         if let Some(beachhead) = context.beachhead.as_ref() {
             let _ = beachhead
                 .commands()
-                .send(ClientMessage::AddTerminals { source_session });
+                .send(ClientMessage::CloseSession { session_id });
         }
-        return;
-    }
-    let current_count = context.state.borrow().sessions().len();
-    let additions = match current_count {
-        1 => 1,
-        2 | 4 | 6 => 2,
-        8 => 1,
-        9 => 3,
-        12 => 4,
-        _ => 0,
-    };
-    if additions == 0 {
         return;
     }
 
-    let cwd = context
-        .state
-        .borrow()
-        .session(source_session)
-        .and_then(|session| session.launch.cwd.clone());
-    let mut last_session = None;
-    for _ in 0..additions {
-        let number = context.state.borrow().sessions().len() + 1;
-        let mut launch = default_shell_launch(context, number);
-        if matches!(context.mode, RunMode::Local) {
-            if let Some(cwd) = cwd.clone() {
-                launch = launch.with_cwd(cwd);
-            }
-        }
-        last_session = Some(append_session_card(context, launch));
+    // Local (gallery) mode: remove the session directly.
+    if let Some(card) = context.session_cards.borrow_mut().remove(&session_id) {
+        context.cards.remove(&card.frame);
+    }
+    context.observations.borrow_mut().remove(&session_id);
+    context.runtimes.borrow_mut().remove(&session_id);
+    context.display_runtimes.borrow_mut().remove(&session_id);
+    if let Ok(mut writers) = context.raw_input_writers.lock() {
+        writers.remove(&session_id);
+    }
+    context.summary_cache.borrow_mut().remove(&session_id);
+    context.naming_cache.borrow_mut().remove(&session_id);
+    context.nudge_cache.borrow_mut().remove(&session_id);
+    context.state.borrow_mut().remove_session(session_id);
+
+    // Select a neighbor if the closed session was selected.
+    let sessions = context.state.borrow().sessions().to_vec();
+    if !sessions.is_empty() && context.state.borrow().selected_session().is_none() {
+        context
+            .state
+            .borrow_mut()
+            .select_session(sessions[0].id);
     }
 
-    let Some(new_session) = last_session else {
-        return;
-    };
-    context.state.borrow_mut().select_session(new_session);
-    if let Some(card) = context.session_cards.borrow().get(&new_session) {
-        context.cards.select_child(&card.row);
-    }
-    refresh_runtime_and_cards(context);
-    refresh_workspace(context);
-    if context.state.borrow().focused_session().is_none()
-        && battlefield_embeds_terminal(context, new_session)
-    {
-        if let Some(card) = context.session_cards.borrow().get(&new_session) {
-            card.terminal.grab_focus();
-        }
-    }
+    sync_grid_layout(context);
     refresh_card_styles(context);
+    refresh_workspace(context);
 }
 
-fn add_terminals_to(context: &Rc<AppContext>, source_session: SessionId, target_total: usize) {
-    let current_count = context.state.borrow().sessions().len();
-    if target_total <= current_count || !supported_terminal_target(target_total) {
-        return;
-    }
-
+fn add_terminal_from_toolbar(context: &Rc<AppContext>) {
     if daemon_backed(context) {
         if let Some(beachhead) = context.beachhead.as_ref() {
-            let _ = beachhead.commands().send(ClientMessage::AddTerminalsTo {
-                source_session,
-                target_total,
-            });
-        }
-        return;
-    }
-
-    let additions = target_total - current_count;
-    let cwd = context
-        .state
-        .borrow()
-        .session(source_session)
-        .and_then(|session| session.launch.cwd.clone());
-    let mut last_session = None;
-    for _ in 0..additions {
-        let number = context.state.borrow().sessions().len() + 1;
-        let mut launch = default_shell_launch(context, number);
-        if matches!(context.mode, RunMode::Local) {
-            if let Some(cwd) = cwd.clone() {
-                launch = launch.with_cwd(cwd);
+            if let Some(source) = context.state.borrow().sessions().first() {
+                let _ = beachhead
+                    .commands()
+                    .send(ClientMessage::AddTerminals {
+                        source_session: source.id,
+                    });
+            } else {
+                let _ = beachhead
+                    .commands()
+                    .send(ClientMessage::CreateOrResumeDefaultWorkspace);
             }
         }
-        last_session = Some(append_session_card(context, launch));
+        return;
     }
 
-    let Some(new_session) = last_session else {
-        return;
-    };
-    context.state.borrow_mut().select_session(new_session);
-    if let Some(card) = context.session_cards.borrow().get(&new_session) {
-        context.cards.select_child(&card.row);
-    }
+    let idx = context.state.borrow().sessions().len();
+    let launch = default_shell_launch(context, idx + 1)
+        .with_env("EXATERM_IDX", idx.to_string())
+        .with_env("EXATERM_IDX_1", (idx + 1).to_string());
+    let session_id = append_session_card(context, launch);
+    context.state.borrow_mut().select_session(session_id);
     refresh_runtime_and_cards(context);
     refresh_workspace(context);
-    if context.state.borrow().focused_session().is_none()
-        && battlefield_embeds_terminal(context, new_session)
-    {
-        if let Some(card) = context.session_cards.borrow().get(&new_session) {
-            card.terminal.grab_focus();
-        }
-    }
     refresh_card_styles(context);
-}
-
-fn supported_terminal_target(count: usize) -> bool {
-    TERMINAL_LAYOUT_TARGETS.contains(&count)
-}
-
-fn reachable_terminal_targets(count: usize) -> Vec<usize> {
-    TERMINAL_LAYOUT_TARGETS
-        .iter()
-        .copied()
-        .filter(|target| *target > count)
-        .collect()
 }
 
 fn spawn_session(
@@ -1726,7 +1625,7 @@ fn apply_workspace_snapshot(context: &Rc<AppContext>, snapshot: WorkspaceSnapsho
             continue;
         }
         if let Some(card) = context.session_cards.borrow_mut().remove(&session_id) {
-            context.cards.remove(&card.row);
+            context.cards.remove(&card.frame);
         }
         context.observations.borrow_mut().remove(&session_id);
         context
@@ -1754,7 +1653,6 @@ fn apply_workspace_snapshot(context: &Rc<AppContext>, snapshot: WorkspaceSnapsho
             .contains_key(&session.record.id)
         {
             let card = build_battle_card_widgets(context, &session.record);
-            context.cards.insert(&card.row, -1);
             context
                 .session_cards
                 .borrow_mut()
@@ -1800,18 +1698,7 @@ fn apply_workspace_snapshot(context: &Rc<AppContext>, snapshot: WorkspaceSnapsho
         }
     }
 
-    let selected = context.state.borrow().selected_session();
-    if let Some(selected) = selected {
-        let row = context
-            .session_cards
-            .borrow()
-            .get(&selected)
-            .map(|card| card.row.clone());
-        if let Some(row) = row {
-            context.cards.select_child(&row);
-        }
-    }
-    update_flowbox_columns(context);
+    sync_grid_layout(context);
 }
 
 fn update_raw_stream_socket_name(
@@ -1897,7 +1784,7 @@ pub(crate) fn refresh_runtime_and_cards(context: &Rc<AppContext>) {
     drain_summary_results(context);
     drain_naming_results(context);
     drain_runtime_events(context);
-    update_flowbox_columns(context);
+    sync_grid_layout(context);
     let sessions = context.state.borrow().sessions().to_vec();
     for session in &sessions {
         refresh_observation(context, session);
@@ -2173,6 +2060,7 @@ fn update_battle_card_widgets(context: &Rc<AppContext>, session: &SessionRecord)
         live_summary.as_ref(),
         Some(observation.last_change.elapsed().as_secs()),
     );
+    apply_metric_bar_layout(&card, battlefield_embeds_terminal(context, session.id));
 
     card.alert.set_label("");
     card.alert.set_visible(false);
@@ -2374,6 +2262,7 @@ fn gallery_mock_summary(
                 "The loop is healthy and converging, but it is still worth watching.".into(),
             ),
             headline: Some("Tight edit-test loop, still failing but converging.".into()),
+            tool_not_likely_coding_agent: false,
         },
         "Agent B" => TacticalSynthesis {
             tactical_state: TacticalState::Stopped,
@@ -2383,6 +2272,7 @@ fn gallery_mock_summary(
                 "A simple continue prompt is probably enough to restart useful work.".into(),
             ),
             headline: Some("Looks done with this pass and waiting for a nudge.".into()),
+            tool_not_likely_coding_agent: false,
         },
         "Agent C" => TacticalSynthesis {
             tactical_state: TacticalState::Blocked,
@@ -2390,6 +2280,7 @@ fn gallery_mock_summary(
             attention_level: AttentionLevel::Intervene,
             attention_brief: Some("The next step is blocked on real operator approval.".into()),
             headline: Some("Hard stop on approval boundary; operator input required.".into()),
+            tool_not_likely_coding_agent: false,
         },
         "Agent D" => TacticalSynthesis {
             tactical_state: TacticalState::Working,
@@ -2400,6 +2291,7 @@ fn gallery_mock_summary(
                     .into(),
             ),
             headline: Some("Retry loop is repeating without a decisive new clue.".into()),
+            tool_not_likely_coding_agent: false,
         },
         "Agent E" => TacticalSynthesis {
             tactical_state: TacticalState::Idle,
@@ -2409,6 +2301,7 @@ fn gallery_mock_summary(
                 "This looks stably parked with no meaningful next step pending.".into(),
             ),
             headline: Some("Looks stably parked after validation, not suspiciously idle.".into()),
+            tool_not_likely_coding_agent: false,
         },
         "Agent F" => TacticalSynthesis {
             tactical_state: TacticalState::Working,
@@ -2423,6 +2316,7 @@ fn gallery_mock_summary(
             headline: Some(
                 "Blocked on disk space and drifting toward risky cleanup actions.".into(),
             ),
+            tool_not_likely_coding_agent: false,
         },
         _ => return None,
     })
@@ -2479,6 +2373,22 @@ fn apply_metric_widgets(
     let attention = attention_bar_presentation(summary);
     apply_segmented_bar(&card.momentum_bar, attention.as_ref(), summary.is_some());
     apply_segmented_bar(&card.risk_bar, None, false);
+}
+
+fn metric_bar_layout(shows_terminal: bool, visible_bar_count: usize) -> (gtk::Orientation, bool) {
+    if shows_terminal && visible_bar_count > 1 {
+        (gtk::Orientation::Horizontal, true)
+    } else {
+        (gtk::Orientation::Vertical, false)
+    }
+}
+
+fn apply_metric_bar_layout(card: &SessionCardWidgets, shows_terminal: bool) {
+    let visible_bar_count = usize::from(card.momentum_bar.frame.is_visible())
+        + usize::from(card.risk_bar.frame.is_visible());
+    let (orientation, homogeneous) = metric_bar_layout(shows_terminal, visible_bar_count);
+    card.bars.set_orientation(orientation);
+    card.bars.set_homogeneous(homogeneous);
 }
 
 fn apply_segmented_bar(
@@ -2641,28 +2551,22 @@ fn refresh_card_styles(context: &Rc<AppContext>) {
     let focus_mode = focused.is_some();
     let single_card_mode = !focus_mode && context.session_cards.borrow().len() == 1;
     for (session_id, card) in context.session_cards.borrow().iter() {
-        card.row.remove_css_class("selected-card");
-        card.row.remove_css_class("focused-card");
+        card.frame.remove_css_class("selected-card");
+        card.frame.remove_css_class("focused-card");
         card.frame.remove_css_class("single-card");
         if focus_mode && selected == Some(*session_id) {
-            card.row.add_css_class("selected-card");
+            card.frame.add_css_class("selected-card");
         }
         if focused == Some(*session_id) {
-            card.row.add_css_class("focused-card");
+            card.frame.add_css_class("focused-card");
         }
         if focus_mode {
-            card.row.set_hexpand(false);
             card.frame.set_hexpand(false);
-            card.row.set_halign(gtk::Align::Start);
             card.frame.set_halign(gtk::Align::Start);
-            card.row.set_width_request(FOCUS_RAIL_CARD_WIDTH);
             card.frame.set_width_request(FOCUS_RAIL_CARD_WIDTH);
         } else {
-            card.row.set_hexpand(true);
             card.frame.set_hexpand(true);
-            card.row.set_halign(gtk::Align::Fill);
             card.frame.set_halign(gtk::Align::Fill);
-            card.row.set_width_request(-1);
             card.frame.set_width_request(-1);
         }
         let chrome_visibility = card_chrome_visibility(
@@ -2725,12 +2629,7 @@ fn refresh_card_styles(context: &Rc<AppContext>) {
             .set_visible(focus_mode && summary.is_some());
         apply_summary_chrome_visibility(card, chrome_visibility);
         let shows_terminal = battlefield_embeds_terminal(context, *session_id);
-        card.bars.set_orientation(if shows_terminal {
-            gtk::Orientation::Horizontal
-        } else {
-            gtk::Orientation::Vertical
-        });
-        card.bars.set_homogeneous(shows_terminal);
+        apply_metric_bar_layout(card, shows_terminal);
         if shows_terminal {
             card.frame.remove_css_class("scrollback-card");
             card.terminal_slot
@@ -2763,19 +2662,17 @@ fn show_intervention(context: &Rc<AppContext>, session_id: SessionId) {
     context
         .sync_inputs_permitted
         .store(false, Ordering::Relaxed);
-    if let Some(card) = context.session_cards.borrow().get(&session_id) {
-        context.cards.select_child(&card.row);
-    }
     context.focus.panel.set_visible(true);
     context.content_root.add_css_class("focus-mode");
-    context.cards.set_homogeneous(false);
+    context.cards.set_column_homogeneous(false);
+    context.cards.set_row_homogeneous(false);
     context.cards.set_halign(gtk::Align::Start);
     context.battlefield_panel.set_vexpand(false);
     context.battlefield_panel.set_height_request(240);
     context
         .battlefield_panel
         .set_hscrollbar_policy(gtk::PolicyType::Automatic);
-    update_flowbox_columns(context);
+    sync_grid_layout(context);
     sync_terminal_parents(context);
     refresh_card_styles(context);
     refresh_focus_panel(context);
@@ -2788,14 +2685,15 @@ fn show_battlefield(context: &Rc<AppContext>) {
     context.sync_inputs_permitted.store(true, Ordering::Relaxed);
     context.focus.panel.set_visible(false);
     context.content_root.remove_css_class("focus-mode");
-    context.cards.set_homogeneous(true);
+    context.cards.set_column_homogeneous(true);
+    context.cards.set_row_homogeneous(true);
     context.cards.set_halign(gtk::Align::Fill);
     context.battlefield_panel.set_vexpand(true);
     context.battlefield_panel.set_height_request(-1);
     context
         .battlefield_panel
         .set_hscrollbar_policy(gtk::PolicyType::Never);
-    update_flowbox_columns(context);
+    sync_grid_layout(context);
     sync_terminal_parents(context);
     refresh_card_styles(context);
     refresh_workspace(context);
@@ -2890,20 +2788,46 @@ fn refresh_focus_panel(context: &Rc<AppContext>) {
     apply_segmented_bar(&context.focus.risk_bar, None, false);
 }
 
-fn update_flowbox_columns(context: &Rc<AppContext>) {
-    let total = context.session_cards.borrow().len();
+fn sync_grid_layout(context: &Rc<AppContext>) {
+    let order = context.state.borrow().ordered_session_ids().to_vec();
+    let total = order.len();
     if total == 0 {
+        *context.cached_tiling.borrow_mut() = None;
         return;
     }
 
+    let focused = context.state.borrow().focused_session().is_some();
     let available_width = context.battlefield_panel.width();
-    let columns = battlefield_columns(
-        total,
-        available_width,
-        context.state.borrow().focused_session().is_some(),
-    );
-    context.cards.set_max_children_per_line(columns);
-    context.cards.set_min_children_per_line(columns);
+    let tiling = compute_tiling(total, available_width, focused);
+
+    if context.cached_tiling.borrow().as_ref() == Some(&tiling) {
+        return;
+    }
+
+    let cards = context.session_cards.borrow();
+    for session_id in &order {
+        if let Some(card) = cards.get(session_id) {
+            if card.frame.parent().is_some() {
+                context.cards.remove(&card.frame);
+            }
+        }
+    }
+    for (i, placement) in tiling.placements.iter().enumerate() {
+        if let Some(session_id) = order.get(i) {
+            if let Some(card) = cards.get(session_id) {
+                context.cards.attach(
+                    &card.frame,
+                    placement.col as i32,
+                    placement.row as i32,
+                    placement.col_span as i32,
+                    1,
+                );
+            }
+        }
+    }
+    drop(cards);
+
+    *context.cached_tiling.borrow_mut() = Some(tiling);
 }
 
 fn battlefield_embeds_terminal(context: &Rc<AppContext>, _session_id: SessionId) -> bool {
@@ -2923,11 +2847,12 @@ fn battlefield_embeds_terminal(context: &Rc<AppContext>, _session_id: SessionId)
 }
 
 fn current_battlefield_columns(context: &Rc<AppContext>) -> usize {
-    let total = context.session_cards.borrow().len();
-    if total == 0 {
-        return 0;
-    }
-    context.cards.max_children_per_line().max(1) as usize
+    context
+        .cached_tiling
+        .borrow()
+        .as_ref()
+        .map_or(0, |t| t.columns)
+        .max(1)
 }
 
 fn focused_embedded_terminal_session(context: &Rc<AppContext>) -> Option<SessionId> {
@@ -3048,19 +2973,20 @@ fn reparent_widget_to_box<W: IsA<gtk::Widget>>(widget: &W, target: &gtk::Box) {
 #[cfg(test)]
 mod tests {
     use super::{
-        CardChromeMode, PROVIDER_DEMOTION_COOLDOWN, RunMode, SummaryCacheEntry,
-        active_provider_preferences, card_chrome_visibility, parse_run_mode,
-        record_provider_demotion, summary_refresh_interval,
+        active_provider_preferences, card_chrome_visibility, metric_bar_layout, parse_run_mode,
+        record_provider_demotion, summary_refresh_interval, CardChromeMode,
+        PROVIDER_DEMOTION_COOLDOWN, RunMode, SummaryCacheEntry,
     };
     use exaterm_core::synthesis::SynthesisProvider;
+    use gtk::Orientation;
     use std::collections::BTreeMap;
     use std::time::Duration;
 
     #[test]
     fn parses_ssh_run_mode() {
-        let mode = parse_run_mode(vec!["--ssh".into(), "user@example.com".into()]).unwrap();
+        let parsed = parse_run_mode(vec!["--ssh".into(), "user@example.com".into()]).unwrap();
         assert_eq!(
-            mode,
+            parsed.mode,
             RunMode::Ssh {
                 target: "user@example.com".into()
             }
@@ -3074,38 +3000,38 @@ mod tests {
     }
 
     #[test]
-    fn summary_refresh_interval_starts_fast_and_backs_off() {
+    fn summary_refresh_interval_is_fixed_at_five_minutes() {
         assert_eq!(
             summary_refresh_interval(Duration::from_secs(0)),
-            Duration::from_secs(5)
+            Duration::from_secs(300)
         );
         assert_eq!(
             summary_refresh_interval(Duration::from_secs(59)),
-            Duration::from_secs(5)
+            Duration::from_secs(300)
         );
         assert_eq!(
             summary_refresh_interval(Duration::from_secs(60)),
-            Duration::from_secs(10)
+            Duration::from_secs(300)
         );
         assert_eq!(
             summary_refresh_interval(Duration::from_secs(179)),
-            Duration::from_secs(10)
+            Duration::from_secs(300)
         );
         assert_eq!(
             summary_refresh_interval(Duration::from_secs(180)),
-            Duration::from_secs(20)
+            Duration::from_secs(300)
         );
         assert_eq!(
             summary_refresh_interval(Duration::from_secs(299)),
-            Duration::from_secs(20)
+            Duration::from_secs(300)
         );
         assert_eq!(
             summary_refresh_interval(Duration::from_secs(300)),
-            Duration::from_secs(30)
+            Duration::from_secs(300)
         );
         assert_eq!(
             summary_refresh_interval(Duration::from_secs(900)),
-            Duration::from_secs(30)
+            Duration::from_secs(300)
         );
     }
 
@@ -3161,5 +3087,15 @@ mod tests {
         assert!(preferences
             .skipped_providers
             .contains(&SynthesisProvider::ClaudeCli));
+    }
+
+    #[test]
+    fn single_visible_metric_bar_stacks_even_with_terminal() {
+        assert_eq!(metric_bar_layout(true, 1), (Orientation::Vertical, false));
+    }
+
+    #[test]
+    fn two_visible_metric_bars_share_horizontal_terminal_row() {
+        assert_eq!(metric_bar_layout(true, 2), (Orientation::Horizontal, true));
     }
 }

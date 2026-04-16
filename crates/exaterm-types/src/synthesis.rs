@@ -30,6 +30,8 @@ pub struct TacticalSynthesis {
     pub attention_level: AttentionLevel,
     pub attention_brief: Option<String>,
     pub headline: Option<String>,
+    #[serde(default)]
+    pub tool_not_likely_coding_agent: bool,
 }
 
 impl TacticalSynthesis {
@@ -37,6 +39,10 @@ impl TacticalSynthesis {
         self.headline = sanitize_optional(self.headline);
         self.tactical_state_brief = sanitize_optional(self.tactical_state_brief);
         self.attention_brief = sanitize_optional(self.attention_brief);
+        if self.tool_not_likely_coding_agent {
+            self.tactical_state = TacticalState::Idle;
+            self.attention_level = AttentionLevel::Autopilot;
+        }
         self
     }
 }
@@ -114,6 +120,7 @@ mod tests {
             attention_level: AttentionLevel::Guide,
             attention_brief: Some("  likely needs   a small nudge  ".into()),
             headline: Some("  parser   pass ".into()),
+            tool_not_likely_coding_agent: false,
         }
         .sanitize();
 
@@ -126,6 +133,38 @@ mod tests {
             summary.attention_brief.as_deref(),
             Some("likely needs a small nudge")
         );
+    }
+
+    #[test]
+    fn tactical_synthesis_sanitize_coerces_non_coding_sessions_to_idle_autopilot() {
+        let summary = TacticalSynthesis {
+            tactical_state: TacticalState::Working,
+            tactical_state_brief: Some("shell is active".into()),
+            attention_level: AttentionLevel::Guide,
+            attention_brief: Some("watch closely".into()),
+            headline: Some("tail -f is updating".into()),
+            tool_not_likely_coding_agent: true,
+        }
+        .sanitize();
+
+        assert_eq!(summary.tactical_state, TacticalState::Idle);
+        assert_eq!(summary.attention_level, AttentionLevel::Autopilot);
+    }
+
+    #[test]
+    fn tactical_synthesis_deserializes_without_new_boolean() {
+        let summary: TacticalSynthesis = serde_json::from_str(
+            r#"{
+                "tactical_state":"working",
+                "tactical_state_brief":"running tests",
+                "attention_level":"monitor",
+                "attention_brief":"worth watching",
+                "headline":"cargo test parser"
+            }"#,
+        )
+        .expect("deserialize legacy tactical synthesis");
+
+        assert!(!summary.tool_not_likely_coding_agent);
     }
 
     #[test]

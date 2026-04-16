@@ -12,7 +12,6 @@ pub(crate) struct SegmentedBarWidgets {
 
 #[derive(Clone)]
 pub(crate) struct SessionCardWidgets {
-    pub row: gtk::FlowBoxChild,
     pub frame: gtk::Frame,
     pub header: gtk::Box,
     pub title: gtk::Label,
@@ -65,10 +64,13 @@ pub(crate) fn build_segmented_bar(label: &str) -> SegmentedBarWidgets {
         .hexpand(true)
         .build();
     bar.add_css_class("segmented-bar");
+    bar.set_halign(gtk::Align::Fill);
+    bar.set_homogeneous(true);
     let segments = (0..5)
         .map(|_| {
             let segment = gtk::Box::builder().hexpand(true).build();
             segment.add_css_class("bar-segment");
+            segment.set_halign(gtk::Align::Fill);
             bar.append(&segment);
             segment
         })

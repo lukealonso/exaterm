@@ -22,6 +22,7 @@ pub fn shell_launch(
             format!("printf '%s\\r\\n' '{banner}'; exec bash --noprofile --norc -i"),
         ],
         cwd: None,
+        env: Vec::new(),
         kind: SessionKind::WaitingShell,
     }
 }
@@ -34,6 +35,7 @@ pub fn user_shell_launch(name: impl Into<String>, subtitle: impl Into<String>) -
         program,
         args,
         cwd: std::env::current_dir().ok(),
+        env: Vec::new(),
         kind: SessionKind::WaitingShell,
     }
 }
@@ -49,6 +51,7 @@ pub fn ssh_shell_launch(
         program: "/usr/bin/env".into(),
         args: vec!["ssh".into(), target.into()],
         cwd: None,
+        env: Vec::new(),
         kind: SessionKind::WaitingShell,
     }
 }
@@ -151,6 +154,7 @@ pub fn command_launch(
         program: program.into(),
         args,
         cwd: None,
+        env: Vec::new(),
         kind,
     }
 }
@@ -244,6 +248,12 @@ impl WorkspaceStore {
         });
         self.push_event(id, "Session added to workspace");
         id
+    }
+
+    pub fn remove_session(&mut self, session_id: SessionId) -> bool {
+        let before = self.sessions.len();
+        self.sessions.retain(|s| s.id != session_id);
+        self.sessions.len() < before
     }
 
     pub fn sessions(&self) -> &[SessionRecord] {

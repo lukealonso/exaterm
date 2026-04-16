@@ -22,10 +22,45 @@ pub enum RunMode {
     Ssh { target: String },
 }
 
+impl RunMode {
+    pub fn workspace_id(&self) -> Option<&str> {
+        None
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParsedArgs {
+    pub mode: RunMode,
+    pub workspace: Option<WorkspaceArg>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WorkspaceArg {
+    New(String),
+    Resume(String),
+}
+
+impl WorkspaceArg {
+    pub fn id(&self) -> &str {
+        match self {
+            WorkspaceArg::New(id) | WorkspaceArg::Resume(id) => id,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum BeachheadTarget {
     Local,
     Ssh(String),
+}
+
+impl BeachheadTarget {
+    pub fn from_parsed(args: &ParsedArgs) -> Self {
+        match &args.mode {
+            RunMode::Local => Self::Local,
+            RunMode::Ssh { target } => Self::Ssh(target.clone()),
+        }
+    }
 }
 
 impl From<&RunMode> for BeachheadTarget {
@@ -37,21 +72,40 @@ impl From<&RunMode> for BeachheadTarget {
     }
 }
 
-pub fn parse_run_mode(args: impl IntoIterator<Item = String>) -> Result<RunMode, String> {
-    let mut args = args.into_iter();
-    match args.next().as_deref() {
-        None => Ok(RunMode::Local),
-        Some("--ssh") => {
-            let Some(target) = args.next() else {
-                return Err("--ssh requires a target like user@host".into());
-            };
-            if args.next().is_some() {
-                return Err("unexpected extra arguments after --ssh target".into());
+pub fn parse_run_mode(args: impl IntoIterator<Item = String>) -> Result<ParsedArgs, String> {
+    let args: Vec<String> = args.into_iter().collect();
+    let mut mode = RunMode::Local;
+    let mut workspace: Option<WorkspaceArg> = None;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--ssh" => {
+                let target = args.get(i + 1).ok_or("--ssh requires a target like user@host")?;
+                mode = RunMode::Ssh {
+                    target: target.clone(),
+                };
+                i += 2;
             }
-            Ok(RunMode::Ssh { target })
+            "--new" => {
+                let id = args
+                    .get(i + 1)
+                    .ok_or("--new requires a workspace id")?;
+                workspace = Some(WorkspaceArg::New(id.clone()));
+                i += 2;
+            }
+            "--resume" => {
+                let id = args
+                    .get(i + 1)
+                    .ok_or("--resume requires a workspace id")?;
+                workspace = Some(WorkspaceArg::Resume(id.clone()));
+                i += 2;
+            }
+            other => return Err(format!("unknown argument: {other}")),
         }
-        Some(other) => Err(format!("unknown argument: {other}")),
     }
+
+    Ok(ParsedArgs { mode, workspace })
 }
 
 #[derive(Clone)]
@@ -534,21 +588,20 @@ fn wait_for_forwarded_control_socket(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_run_mode, shell_quote, ssh_shell_command, RunMode};
+    use super::{parse_run_mode, shell_quote, ssh_shell_command, RunMode, WorkspaceArg};
 
     #[test]
     fn parses_local_run_mode_without_args() {
-        assert_eq!(
-            parse_run_mode(Vec::<String>::new()).unwrap(),
-            RunMode::Local
-        );
+        let parsed = parse_run_mode(Vec::<String>::new()).unwrap();
+        assert_eq!(parsed.mode, RunMode::Local);
+        assert!(parsed.workspace.is_none());
     }
 
     #[test]
     fn parses_ssh_run_mode() {
-        let mode = parse_run_mode(vec!["--ssh".into(), "user@example.com".into()]).unwrap();
+        let parsed = parse_run_mode(vec!["--ssh".into(), "user@example.com".into()]).unwrap();
         assert_eq!(
-            mode,
+            parsed.mode,
             RunMode::Ssh {
                 target: "user@example.com".into(),
             }
@@ -556,8 +609,52 @@ mod tests {
     }
 
     #[test]
+    fn parses_new_workspace() {
+        let parsed = parse_run_mode(vec!["--new".into(), "mywork".into()]).unwrap();
+        assert_eq!(parsed.mode, RunMode::Local);
+        assert_eq!(parsed.workspace, Some(WorkspaceArg::New("mywork".into())));
+    }
+
+    #[test]
+    fn parses_resume_workspace() {
+        let parsed = parse_run_mode(vec!["--resume".into(), "mywork".into()]).unwrap();
+        assert_eq!(parsed.mode, RunMode::Local);
+        assert_eq!(
+            parsed.workspace,
+            Some(WorkspaceArg::Resume("mywork".into()))
+        );
+    }
+
+    #[test]
+    fn parses_ssh_with_workspace() {
+        let parsed = parse_run_mode(vec![
+            "--ssh".into(),
+            "user@host".into(),
+            "--new".into(),
+            "remote-work".into(),
+        ])
+        .unwrap();
+        assert_eq!(
+            parsed.mode,
+            RunMode::Ssh {
+                target: "user@host".into()
+            }
+        );
+        assert_eq!(
+            parsed.workspace,
+            Some(WorkspaceArg::New("remote-work".into()))
+        );
+    }
+
+    #[test]
     fn missing_ssh_target_is_error() {
         assert!(parse_run_mode(vec!["--ssh".into()]).is_err());
+    }
+
+    #[test]
+    fn missing_workspace_id_is_error() {
+        assert!(parse_run_mode(vec!["--new".into()]).is_err());
+        assert!(parse_run_mode(vec!["--resume".into()]).is_err());
     }
 
     #[test]

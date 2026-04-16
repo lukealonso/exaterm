@@ -32,12 +32,19 @@ pub struct SessionLaunch {
     pub program: String,
     pub args: Vec<String>,
     pub cwd: Option<PathBuf>,
+    #[serde(default)]
+    pub env: Vec<(String, String)>,
     pub kind: SessionKind,
 }
 
 impl SessionLaunch {
     pub fn with_cwd(mut self, cwd: impl Into<PathBuf>) -> Self {
         self.cwd = Some(cwd.into());
+        self
+    }
+
+    pub fn with_env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.env.push((key.into(), value.into()));
         self
     }
 }

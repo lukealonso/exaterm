@@ -220,7 +220,7 @@ pub fn build_nudge_evidence(
 }
 
 pub fn synthesis_terminal_activity(observation: &SessionObservation) -> Vec<String> {
-    let mut entries = model_terminal_history_window(observation, 5 * 60, 256);
+    let mut entries = model_terminal_history_window(observation, 60, 100);
 
     if let Some(painted) = observation.painted_line.as_deref() {
         let trimmed = painted.trim();
@@ -489,7 +489,7 @@ mod tests {
     }
 
     #[test]
-    fn synthesis_activity_keeps_at_least_256_lines_when_recent_activity_is_short() {
+    fn synthesis_activity_keeps_at_least_100_lines_when_recent_activity_is_short() {
         let mut observation = SessionObservation::new();
         let now = Instant::now();
         observation.terminal_activity = (0..300)
@@ -500,13 +500,32 @@ mod tests {
             .collect();
 
         let history = synthesis_terminal_activity(&observation);
-        assert_eq!(history.len(), 256);
+        assert_eq!(history.len(), 100);
         assert!(history
             .first()
-            .is_some_and(|line| line.ends_with("line 44")));
+            .is_some_and(|line| line.ends_with("line 200")));
         assert!(history
             .last()
             .is_some_and(|line| line.ends_with("line 299")));
+    }
+
+    #[test]
+    fn synthesis_activity_keeps_more_than_100_lines_when_one_minute_window_is_larger() {
+        let mut observation = SessionObservation::new();
+        let now = Instant::now();
+        observation.terminal_activity = (0..160)
+            .map(|index| TerminalActivityEntry {
+                at: now - Duration::from_millis(((160 - index) * 250) as u64),
+                text: format!("line {index}"),
+            })
+            .collect();
+
+        let history = synthesis_terminal_activity(&observation);
+        assert_eq!(history.len(), 160);
+        assert!(history.first().is_some_and(|line| line.ends_with("line 0")));
+        assert!(history
+            .last()
+            .is_some_and(|line| line.ends_with("line 159")));
     }
 
     #[test]
@@ -538,6 +557,7 @@ mod tests {
             program: "/bin/bash".into(),
             args: Vec::new(),
             cwd: None,
+            env: Vec::new(),
             kind: SessionKind::WaitingShell,
         };
         let session = SessionRecord {

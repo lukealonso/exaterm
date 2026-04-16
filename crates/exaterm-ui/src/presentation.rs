@@ -240,6 +240,7 @@ mod tests {
             attention_level: AttentionLevel::Takeover,
             attention_brief: Some("Human takeover needed".into()),
             headline: Some("Blocked".into()),
+            tool_not_likely_coding_agent: false,
         };
         let (presentation, reason) = attention_presentation(Some(&summary)).unwrap();
         assert_eq!(presentation.fill, 5);
@@ -255,6 +256,7 @@ mod tests {
             attention_level: AttentionLevel::Monitor,
             attention_brief: Some("Watch for drift".into()),
             headline: Some("Steady".into()),
+            tool_not_likely_coding_agent: false,
         };
         let (presentation, reason) = attention_bar_presentation(Some(&summary)).unwrap();
         assert_eq!(presentation.fill, 2);

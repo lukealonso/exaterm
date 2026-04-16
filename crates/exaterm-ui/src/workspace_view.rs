@@ -17,6 +17,7 @@ pub struct WorkspaceViewState {
     next_session_id: u32,
     next_event_sequence: u64,
     sessions: Vec<SessionRecord>,
+    session_order: Vec<SessionId>,
     selected_session: Option<SessionId>,
     focused_terminal: Option<SessionId>,
     presentation_mode: PresentationMode,
@@ -45,6 +46,15 @@ impl WorkspaceViewState {
             .unwrap_or(0)
             .saturating_add(1);
         self.sessions = sessions;
+
+        // Maintain session_order: prune removed, append new.
+        self.session_order
+            .retain(|id| self.sessions.iter().any(|s| s.id == *id));
+        for session in &self.sessions {
+            if !self.session_order.contains(&session.id) {
+                self.session_order.push(session.id);
+            }
+        }
 
         self.selected_session = previous_selected
             .filter(|session_id| {
@@ -80,14 +90,43 @@ impl WorkspaceViewState {
             pid: None,
             events: Vec::new(),
         });
+        self.session_order.push(id);
 
         self.selected_session.get_or_insert(id);
         self.push_event(id, "Session added to workspace");
         id
     }
 
+    pub fn remove_session(&mut self, session_id: SessionId) {
+        self.sessions.retain(|s| s.id != session_id);
+        self.session_order.retain(|id| *id != session_id);
+        if self.selected_session == Some(session_id) {
+            self.selected_session = self.sessions.first().map(|s| s.id);
+        }
+        if self.focused_terminal == Some(session_id) {
+            self.focused_terminal = None;
+        }
+        if self.presentation_mode == PresentationMode::Focused(session_id) {
+            self.presentation_mode = PresentationMode::Battlefield;
+        }
+    }
+
     pub fn sessions(&self) -> &[SessionRecord] {
         &self.sessions
+    }
+
+    /// Sessions in user-arranged display order.
+    pub fn ordered_session_ids(&self) -> &[SessionId] {
+        &self.session_order
+    }
+
+    /// Move `session_id` to `target_index` in the display order.
+    pub fn move_session(&mut self, session_id: SessionId, target_index: usize) {
+        if let Some(from) = self.session_order.iter().position(|id| *id == session_id) {
+            let id = self.session_order.remove(from);
+            let to = target_index.min(self.session_order.len());
+            self.session_order.insert(to, id);
+        }
     }
 
     pub fn selected_session(&self) -> Option<SessionId> {
