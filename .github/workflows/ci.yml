@@ -61,3 +61,23 @@ jobs:
 
       - name: Test workspace
         run: cargo test --workspace
+
+      - name: Build package
+        if: matrix.os == 'macos'
+        run: ./scripts/package-macos.sh
+
+      - name: Verify package structure
+        if: matrix.os == 'macos'
+        run: |
+          test -d target/package/Exaterm.app/Contents/MacOS
+          test -f target/package/Exaterm.app/Contents/Info.plist
+          test -x target/package/Exaterm.app/Contents/MacOS/exaterm
+          test -f target/package/Exaterm.app/Contents/PkgInfo
+          plutil -lint target/package/Exaterm.app/Contents/Info.plist
+
+      - name: Upload package
+        if: matrix.os == 'macos'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Exaterm.app
+          path: target/package/Exaterm.app

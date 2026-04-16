@@ -6,7 +6,7 @@ else
 APP_PACKAGE := exaterm-gtk
 endif
 
-.PHONY: all build build-app build-gtk build-macos run run-app run-gtk run-macos daemon check test test-workspace core-test core-check daemon-check clean help
+.PHONY: all build build-app build-gtk build-macos run run-app run-gtk run-macos daemon check test test-workspace core-test core-check daemon-check package package-macos package-macos-debug clean help
 
 all: build
 
@@ -53,6 +53,20 @@ core-check:
 daemon-check:
 	cargo check -p exatermd
 
+package-macos:
+	./scripts/package-macos.sh
+
+package-macos-debug:
+	./scripts/package-macos.sh --debug
+
+ifeq ($(UNAME_S),Darwin)
+package: package-macos
+else
+package:
+	@echo "Error: packaging is not yet supported on $(UNAME_S)" >&2
+	@exit 1
+endif
+
 clean:
 	cargo clean
 
@@ -70,4 +84,5 @@ help:
 		'make test         Run the default app, core, UI, and daemon tests' \
 		'make core-test    Run core library tests' \
 		'make daemon-check Check the daemon package' \
+		'make package      Build platform package (macOS: .app bundle)' \
 		'make clean        Remove build artifacts'
