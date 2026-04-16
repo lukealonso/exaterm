@@ -1,0 +1,15 @@
+{
+  "private": true,
+  "scripts": {
+    "build": "esbuild src/main.ts --bundle --outdir=dist --entry-names=[name] --minify --sourcemap",
+    "watch": "esbuild src/main.ts --bundle --outdir=dist --entry-names=[name] --sourcemap --watch"
+  },
+  "devDependencies": {
+    "esbuild": "^0.24.0",
+    "typescript": "^5.7.0"
+  },
+  "dependencies": {
+    "@xterm/xterm": "^5.5.0",
+    "@xterm/addon-fit": "^0.10.0"
+  }
+}

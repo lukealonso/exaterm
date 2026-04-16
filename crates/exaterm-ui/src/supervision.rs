@@ -181,6 +181,18 @@ mod tests {
     }
 
     #[test]
+    fn blocked_session_without_summary_shows_active() {
+        // The daemon's Blocked status means a blocking prompt (read, passwd, etc.)
+        // which looks like active work without LLM context. This must stay Active
+        // to match the GTK client behavior.
+        let observed = ObservedActivity::default();
+        assert_eq!(
+            derive_battle_card_status(SessionStatus::Blocked, &observed),
+            BattleCardStatus::Active
+        );
+    }
+
+    #[test]
     fn build_battle_card_leaves_text_fields_blank() {
         let card = build_battle_card(
             &session(SessionStatus::Running),

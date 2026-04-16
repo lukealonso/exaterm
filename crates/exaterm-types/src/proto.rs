@@ -14,6 +14,9 @@ pub enum ClientMessage {
         source_session: SessionId,
         target_total: usize,
     },
+    AddOneTerminal {
+        source_session: SessionId,
+    },
     ResizeTerminal {
         session_id: SessionId,
         rows: u16,
@@ -88,6 +91,22 @@ mod tests {
                 assert_eq!(session_id, SessionId(7));
                 assert_eq!(rows, 31);
                 assert_eq!(cols, 97);
+            }
+            other => panic!("unexpected decoded message: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn add_one_terminal_round_trips_through_json() {
+        let message = ClientMessage::AddOneTerminal {
+            source_session: SessionId(42),
+        };
+        let json = serde_json::to_string(&message).expect("serialize add_one_terminal");
+        let decoded: ClientMessage =
+            serde_json::from_str(&json).expect("deserialize add_one_terminal");
+        match decoded {
+            ClientMessage::AddOneTerminal { source_session } => {
+                assert_eq!(source_session, SessionId(42));
             }
             other => panic!("unexpected decoded message: {other:?}"),
         }

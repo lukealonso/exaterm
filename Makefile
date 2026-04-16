@@ -6,7 +6,7 @@ else
 APP_PACKAGE := exaterm-gtk
 endif
 
-.PHONY: all build build-app build-gtk build-macos run run-app run-gtk run-macos daemon check test test-workspace core-test core-check daemon-check package package-macos package-macos-debug clean help
+.PHONY: all build build-app build-gtk build-macos run run-app run-gtk run-macos daemon check test test-workspace core-test core-check daemon-check package package-macos package-macos-debug web web-deps web-run web-test clean help
 
 all: build
 
@@ -67,6 +67,18 @@ package:
 	@exit 1
 endif
 
+web: web-deps
+	cargo build -p exaterm-web -p exatermd
+
+web-deps:
+	cd crates/exaterm-web/frontend && npm install
+
+web-run: web
+	cargo run -p exaterm-web
+
+web-test: web
+	cd crates/exaterm-web && npx playwright test --reporter=line
+
 clean:
 	cargo clean
 
@@ -85,4 +97,7 @@ help:
 		'make core-test    Run core library tests' \
 		'make daemon-check Check the daemon package' \
 		'make package      Build platform package (macOS: .app bundle)' \
+		'make web          Build the web UI server' \
+		'make web-run      Build and run the web UI server' \
+		'make web-test     Run Playwright e2e tests for the web UI' \
 		'make clean        Remove build artifacts'

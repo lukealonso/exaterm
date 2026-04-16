@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 exaterm-types = { path = "../exaterm-types" }
+crossbeam-channel = "0.5"
 libc = "0.2"
 notify = "7"
 portable-pty = "0.8"
