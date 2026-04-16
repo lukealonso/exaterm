@@ -218,7 +218,10 @@ pub fn connect_remote(
     let remote_root = format!("{}/{}", info.home, REMOTE_STATE_SUBDIR);
     let remote_bin_dir = format!("{}/{}", info.home, REMOTE_BIN_SUBDIR);
     let remote_runtime_dir = format!("{}/{}", info.home, REMOTE_RUNTIME_SUBDIR);
-    let remote_socket_dir = format!("{remote_runtime_dir}/exaterm");
+    let remote_socket_dir = match std::env::var("EXATERM_WORKSPACE") {
+        Ok(ws) if !ws.is_empty() => format!("{remote_runtime_dir}/exaterm/{ws}"),
+        _ => format!("{remote_runtime_dir}/exaterm"),
+    };
     let remote_bin = format!("{remote_bin_dir}/exatermd");
     let remote_control = format!("{remote_socket_dir}/{CONTROL_SOCKET_NAME}");
 
@@ -506,6 +509,7 @@ fn launch_remote_daemon(
         "EXATERM_SUMMARY_MODEL",
         "EXATERM_NAMING_MODEL",
         "EXATERM_NUDGE_MODEL",
+        "EXATERM_WORKSPACE",
     ] {
         if let Some(value) = std::env::var_os(key) {
             exports.push(format!("export {key}={}", shell_quote_os(&value)));
