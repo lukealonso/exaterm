@@ -10,12 +10,62 @@ export interface ManagedTerminal {
   resizeObserver: ResizeObserver | null;
   /** When false, the stream WebSocket will not reconnect on close. */
   live: boolean;
+  /**
+   * Most recent non-empty selection text. Cached so that right-click
+   * handlers (which may race with xterm clearing the selection on
+   * mousedown) can still read what the user just highlighted.
+   */
+  lastSelection: string;
 }
 
 const terminals = new Map<number, ManagedTerminal>();
 
 let sendCommand: ((cmd: ClientMessage) => void) | null = null;
 let syncInputsEnabled = false;
+
+/**
+ * Copy text to the clipboard, falling back to execCommand when the async
+ * Clipboard API is unavailable (non-secure contexts: plain HTTP to a
+ * non-loopback host, common when accessing the web UI over a LAN).
+ */
+export function copyToClipboard(text: string): boolean {
+  if (!text) return false;
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(text).catch(() => {
+      execCommandCopy(text);
+    });
+    return true;
+  }
+  return execCommandCopy(text);
+}
+
+function execCommandCopy(text: string): boolean {
+  const previousFocus =
+    document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.top = "-1000px";
+  textarea.style.opacity = "0";
+  document.body.appendChild(textarea);
+  textarea.select();
+  let ok = false;
+  try {
+    ok = document.execCommand("copy");
+  } catch {
+    ok = false;
+  }
+  document.body.removeChild(textarea);
+  if (previousFocus && previousFocus !== document.body && previousFocus.isConnected) {
+    try {
+      previousFocus.focus({ preventScroll: true });
+    } catch {
+      previousFocus.focus();
+    }
+  }
+  return ok;
+}
 
 export function setSendCommand(fn: (cmd: ClientMessage) => void) {
   sendCommand = fn;
@@ -88,17 +138,76 @@ export function attachTerminal(
     fontFamily: "'Cascadia Code', 'Fira Code', 'JetBrains Mono', monospace",
     scrollback: 100_000,
     scrollOnUserInput: true,
+    // Let Mac users bypass app mouse tracking with Option+drag (xterm.js
+    // already bypasses it on Shift+drag on all platforms). TUIs like
+    // Claude Code enable mouse reporting, which otherwise eats the drag.
+    macOptionClickForcesSelection: true,
+    rightClickSelectsWord: true,
     theme: {
       background: "#070d14",
       foreground: "#e2e8f0",
       cursor: "#e2e8f0",
-      selectionBackground: "rgba(96, 165, 250, 0.3)",
+      selectionBackground: "rgba(96, 165, 250, 0.55)",
+      selectionInactiveBackground: "rgba(96, 165, 250, 0.35)",
     },
   });
   const fit = new FitAddon();
   term.loadAddon(fit);
   term.open(wrapper);
   fit.fit();
+
+  // OSC 52 clipboard passthrough. When a TUI inside the session (tmux,
+  // vim, helix, ...) is configured to emit OSC 52 on copy, xterm.js forwards
+  // the sequence here and we write the decoded payload to the browser
+  // clipboard. This is the only reliable path to the system clipboard when
+  // the selection is captured by the guest app (e.g. `tmux set -g mouse on`
+  // with `set -g set-clipboard on`). We deliberately ignore queries
+  // (payload === "?") so remote code can't exfiltrate clipboard contents.
+  term.parser.registerOscHandler(52, (data) => {
+    // data looks like `<targets>;<base64>` — e.g. `c;SGVsbG8=`.
+    const semi = data.indexOf(";");
+    if (semi < 0) return false;
+    const payload = data.slice(semi + 1);
+    if (!payload || payload === "?") return true; // refuse reads, but claim handled
+    let text: string;
+    try {
+      text = atob(payload);
+    } catch {
+      return false;
+    }
+    // atob yields a binary string; decode as UTF-8.
+    try {
+      const bytes = Uint8Array.from(text, (ch) => ch.charCodeAt(0));
+      text = new TextDecoder("utf-8").decode(bytes);
+    } catch {
+      // Fall back to the raw binary string if decoding fails.
+    }
+    copyToClipboard(text);
+    return true;
+  });
+
+  // Bulletproof copy shortcuts. A TUI with mouse reporting on (Claude Code,
+  // codex, tmux, vim) eats plain drag, so the user may Shift+drag to select
+  // — and then needs a key they can actually press. Ctrl+Shift+C is the
+  // standard Linux/Windows terminal copy shortcut; Cmd+C on Mac matches
+  // native apps. We only intercept when there is a selection, so copy never
+  // steals Ctrl+C / Cmd+C away from the shell.
+  const sid = session.record.id;
+  term.attachCustomKeyEventHandler((event) => {
+    if (event.type !== "keydown") return true;
+    const key = event.key.toLowerCase();
+    const isMac = navigator.platform.toLowerCase().includes("mac");
+    const copyCombo =
+      (event.ctrlKey && event.shiftKey && !event.altKey && key === "c") ||
+      (isMac && event.metaKey && !event.shiftKey && !event.altKey && key === "c");
+    if (!copyCombo) return true;
+    const text = term.hasSelection() ? term.getSelection() : "";
+    if (!text) return true; // let Ctrl+C / Cmd+C pass through as SIGINT / native
+    copyToClipboard(text);
+    event.preventDefault();
+    event.stopPropagation();
+    return false;
+  });
 
   // Send initial terminal size to the daemon immediately after fit.
   // Browsers don't guarantee a ResizeObserver callback on first attach,
@@ -113,14 +222,18 @@ export function attachTerminal(
   }
 
   // Auto-copy on select (matches GTK's connect_selection_changed behavior).
+  // Also cache the most recent non-empty selection so context-menu copy
+  // still works even if a subsequent right-click clears xterm's selection.
   term.onSelectionChange(() => {
     if (term.hasSelection()) {
-      navigator.clipboard.writeText(term.getSelection()).catch(() => {});
+      const selected = term.getSelection();
+      const managed = terminals.get(sid);
+      if (managed) managed.lastSelection = selected;
+      copyToClipboard(selected);
     }
   });
 
   // Stream WebSocket with auto-reconnect.
-  const sid = session.record.id;
   let ws: WebSocket = connectStream(sid, term);
   let reconnecting = false;
 
@@ -197,6 +310,7 @@ export function attachTerminal(
     ws,
     resizeObserver,
     live: true,
+    lastSelection: "",
   };
   terminals.set(session.record.id, managed);
   return managed;
@@ -286,4 +400,3 @@ export function detachTerminal(sessionId: number) {
   managed.term.dispose();
   terminals.delete(sessionId);
 }
-

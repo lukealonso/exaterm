@@ -9,6 +9,7 @@ import type {
 } from "./protocol";
 import {
   attachTerminal,
+  copyToClipboard,
   detachTerminal,
   hideTerminal,
   showTerminal,
@@ -445,11 +446,23 @@ function showContextMenu(x: number, y: number, sessionId: number) {
   const syncItem = contextMenuEl.querySelector('[data-action="sync-inputs"] .context-menu-check')!;
   syncItem.textContent = isSyncInputs() ? "\u2713 " : "";
 
-  // Update copy enabled state.
+  // Update copy enabled state. Prefer the live xterm selection; fall back
+  // to the cached last selection, because right-clicking can clear xterm's
+  // selection before this handler runs.
   const copyItem = contextMenuEl.querySelector('[data-action="copy"]') as HTMLElement;
   const managed = getTerminal(sessionId);
-  const hasSelection = managed?.term.hasSelection() ?? false;
+  const hasSelection =
+    (managed?.term.hasSelection() ?? false) ||
+    (managed?.lastSelection?.length ?? 0) > 0;
   copyItem.classList.toggle("disabled", !hasSelection);
+  // When a TUI (Claude Code, codex, tmux, etc.) enables mouse reporting,
+  // plain drag gets forwarded to the agent instead of selecting. Holding
+  // Shift bypasses that. Surface the tip as a tooltip + inline hint so
+  // the gesture is discoverable without docs.
+  copyItem.textContent = hasSelection ? "Copy" : "Copy  (Shift+drag to select)";
+  copyItem.title = hasSelection
+    ? ""
+    : "Hold Shift while dragging to select text when a terminal app is using mouse input (e.g. Claude Code, codex).";
 
   // Update add terminals enabled state — always enabled since we send add_one_terminal.
   const addItem = contextMenuEl.querySelector('[data-action="add-terminals"]') as HTMLElement;
@@ -473,11 +486,15 @@ function hideContextMenu() {
 function handleContextMenuAction(action: string, sessionId: number) {
   const managed = getTerminal(sessionId);
   switch (action) {
-    case "copy":
-      if (managed?.term.hasSelection()) {
-        navigator.clipboard.writeText(managed.term.getSelection());
+    case "copy": {
+      const text = managed?.term.hasSelection()
+        ? managed.term.getSelection()
+        : managed?.lastSelection ?? "";
+      if (text) {
+        copyToClipboard(text);
       }
       break;
+    }
     case "paste":
       navigator.clipboard.readText()
         .then((text) => {
@@ -613,6 +630,25 @@ export function init(appEl: HTMLElement, sendFn: (cmd: ClientMessage) => void) {
 
   // Keyboard shortcuts (capture phase to beat xterm.js).
   document.addEventListener("keydown", (e) => {
+    // Ctrl+Shift+C (Linux/Windows) / Cmd+C (Mac): copy current selection.
+    // Runs at capture phase, ahead of xterm.js, so it also works when the
+    // xterm canvas isn't the focused element.
+    const key = e.key.toLowerCase();
+    const isMac = navigator.platform.toLowerCase().includes("mac");
+    const copyCombo =
+      (e.ctrlKey && e.shiftKey && !e.altKey && key === "c") ||
+      (isMac && e.metaKey && !e.shiftKey && !e.altKey && key === "c");
+    if (copyCombo && selectedSessionId !== null) {
+      const managed = getTerminal(selectedSessionId);
+      const text = managed?.term.hasSelection() ? managed.term.getSelection() : "";
+      if (text) {
+        e.preventDefault();
+        e.stopPropagation();
+        copyToClipboard(text);
+        return;
+      }
+    }
+
     // Escape: exit focus mode — preserve selection (matches workspace_view.rs).
     if (e.key === "Escape" && focusedSessionId !== null) {
       e.preventDefault();
