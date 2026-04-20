@@ -9,6 +9,14 @@ use std::sync::Arc;
 
 #[tokio::main]
 async fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--beachhead-daemon") {
+        let code = exaterm_core::run_local_daemon();
+        std::process::exit(if code == std::process::ExitCode::SUCCESS {
+            0
+        } else {
+            1
+        });
+    }
     let opts = parse_args();
     let relay = Arc::new(DaemonRelay::start());
     let enable_test_hooks = std::env::var_os("EXATERM_ENABLE_TEST_HOOKS").is_some();
