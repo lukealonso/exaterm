@@ -103,13 +103,19 @@ if (testHooksEnabled()) {
  * Clipboard API is unavailable (non-secure contexts: plain HTTP to a
  * non-loopback host, common when accessing the web UI over a LAN).
  */
-export function copyToClipboard(text: string): boolean {
-  if (!text) return false;
+export function copyToClipboard(text: string): Promise<boolean> {
+  if (!text) return Promise.resolve(false);
+  return writeClipboardText(text);
+}
+
+async function writeClipboardText(text: string): Promise<boolean> {
   if (navigator.clipboard && window.isSecureContext) {
-    navigator.clipboard.writeText(text).catch(() => {
-      execCommandCopy(text);
-    });
-    return true;
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch {
+      return execCommandCopy(text);
+    }
   }
   return execCommandCopy(text);
 }
@@ -238,7 +244,18 @@ export function attachTerminal(
     const semi = data.indexOf(";");
     if (semi < 0) return false;
     const payload = data.slice(semi + 1);
-    if (!payload || payload === "?") return true; // refuse reads, but claim handled
+    if (payload === "?") return true; // refuse reads, but claim handled
+    if (payload === "") {
+      void writeClipboardText("").then((ok) => {
+        if (!ok) {
+          console.debug("OSC 52 clipboard clear was refused by the browser", {
+            secureContext: window.isSecureContext,
+            documentHasFocus: document.hasFocus(),
+          });
+        }
+      });
+      return true;
+    }
     let text: string;
     try {
       text = atob(payload);
@@ -252,7 +269,14 @@ export function attachTerminal(
     } catch {
       // Fall back to the raw binary string if decoding fails.
     }
-    copyToClipboard(text);
+    void writeClipboardText(text).then((ok) => {
+      if (!ok) {
+        console.debug("OSC 52 clipboard write was refused by the browser", {
+          secureContext: window.isSecureContext,
+          documentHasFocus: document.hasFocus(),
+        });
+      }
+    });
     return true;
   });
 
@@ -273,7 +297,7 @@ export function attachTerminal(
   // Auto-copy on select (matches GTK's connect_selection_changed behavior).
   term.onSelectionChange(() => {
     if (term.hasSelection()) {
-      copyToClipboard(term.getSelection());
+      void copyToClipboard(term.getSelection());
     }
   });
 

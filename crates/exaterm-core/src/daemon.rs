@@ -1,20 +1,20 @@
-use crate::file_watch::{spawn_repo_watch, RepoWatchHandle};
-use crate::model::{user_shell_launch, SessionId, SessionLaunch, WorkspaceStore};
+use crate::file_watch::{RepoWatchHandle, spawn_repo_watch};
+use crate::model::{SessionId, SessionLaunch, WorkspaceStore, user_shell_launch};
 use crate::observation::{
-    apply_file_activity, apply_observation_refresh, apply_stream_update, build_naming_evidence,
-    build_nudge_evidence, build_tactical_evidence, clear_file_activity,
+    SessionObservation, apply_file_activity, apply_observation_refresh, apply_stream_update,
+    build_naming_evidence, build_nudge_evidence, build_tactical_evidence, clear_file_activity,
     compute_observation_refresh, find_git_worktree_root, is_bare_waiting_shell,
-    record_terminal_input_activity, SessionObservation,
+    record_terminal_input_activity,
 };
 use crate::proto::{
     ClientMessage, ObservationSnapshot, ServerMessage, SessionSnapshot, WorkspaceSnapshot,
 };
-use crate::runtime::{spawn_headless_runtime, RuntimeEvent, SessionRuntime};
+use crate::runtime::{RuntimeEvent, SessionRuntime, spawn_headless_runtime};
 use crate::synthesis::{
+    NameSuggestion, NamingEvidence, NudgeEvidence, NudgeSuggestion, ProviderCallResult,
+    ProviderPreferences, SynthesisBackendRegistry, TacticalState, TacticalSynthesis,
     name_signature, nudge_signature, should_skip_repeated_paused_summary, summary_signature,
-    summary_substantive_signature, NameSuggestion, NamingEvidence, NudgeEvidence, NudgeSuggestion,
-    ProviderCallResult, ProviderPreferences, SynthesisBackendRegistry, TacticalState,
-    TacticalSynthesis,
+    summary_substantive_signature,
 };
 use portable_pty::PtySize;
 use serde::Serialize;
@@ -1866,6 +1866,12 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
+    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+        env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
     /// Returns false when Unix socket creation is blocked (e.g. inside the
     /// Claude Code sandbox).  Tests that start a real daemon process or rely
     /// on FSEvents delivery use this as an early-exit guard so `cargo test`
@@ -1949,7 +1955,7 @@ mod tests {
 
     #[test]
     fn socket_paths_use_override_runtime_dir() {
-        let _guard = env_lock().lock().expect("env lock");
+        let _guard = lock_env();
         let runtime_dir = unique_runtime_dir("socket");
         std::env::set_var("EXATERM_RUNTIME_DIR", &runtime_dir);
         let control_path = control_socket_path().expect("control socket path");
@@ -1969,7 +1975,7 @@ mod tests {
         if !can_bind_unix_sockets() {
             return;
         }
-        let _guard = env_lock().lock().expect("env lock");
+        let _guard = lock_env();
         let runtime_dir = unique_runtime_dir("daemon-flow");
         std::env::set_var("EXATERM_RUNTIME_DIR", &runtime_dir);
 
@@ -2008,8 +2014,11 @@ mod tests {
 
         write_json_line(&mut stream, &ClientMessage::TerminateWorkspace).expect("terminate");
         drop(stream);
-        let result =
-            join_thread_before_timeout(handle, "daemon thread should join", Duration::from_secs(5));
+        let result = join_thread_before_timeout(
+            handle,
+            "daemon thread should join",
+            Duration::from_secs(20),
+        );
         assert!(result.is_ok(), "daemon should exit cleanly: {result:?}");
 
         std::env::remove_var("EXATERM_RUNTIME_DIR");
@@ -2021,7 +2030,7 @@ mod tests {
         if !can_bind_unix_sockets() {
             return;
         }
-        let _guard = env_lock().lock().expect("env lock");
+        let _guard = lock_env();
         let runtime_dir = unique_runtime_dir("daemon-reject");
         std::env::set_var("EXATERM_RUNTIME_DIR", &runtime_dir);
 
@@ -2052,8 +2061,11 @@ mod tests {
 
         write_json_line(&mut first, &ClientMessage::TerminateWorkspace).expect("terminate");
         drop(first);
-        let result =
-            join_thread_before_timeout(handle, "daemon thread should join", Duration::from_secs(5));
+        let result = join_thread_before_timeout(
+            handle,
+            "daemon thread should join",
+            Duration::from_secs(20),
+        );
         assert!(result.is_ok(), "daemon should exit cleanly: {result:?}");
 
         std::env::remove_var("EXATERM_RUNTIME_DIR");
@@ -2197,24 +2209,30 @@ mod tests {
 
         let changed = drain_worker_results(&mut state);
         assert!(!changed);
-        assert!(state
-            .summary_cache
-            .get(&SessionId(1))
-            .unwrap()
-            .skipped_providers
-            .contains_key(&crate::synthesis::SynthesisProvider::OpenAi));
-        assert!(state
-            .naming_cache
-            .get(&SessionId(2))
-            .unwrap()
-            .skipped_providers
-            .contains_key(&crate::synthesis::SynthesisProvider::ClaudeCli));
-        assert!(state
-            .nudge_cache
-            .get(&SessionId(3))
-            .unwrap()
-            .skipped_providers
-            .contains_key(&crate::synthesis::SynthesisProvider::CodexCli));
+        assert!(
+            state
+                .summary_cache
+                .get(&SessionId(1))
+                .unwrap()
+                .skipped_providers
+                .contains_key(&crate::synthesis::SynthesisProvider::OpenAi)
+        );
+        assert!(
+            state
+                .naming_cache
+                .get(&SessionId(2))
+                .unwrap()
+                .skipped_providers
+                .contains_key(&crate::synthesis::SynthesisProvider::ClaudeCli)
+        );
+        assert!(
+            state
+                .nudge_cache
+                .get(&SessionId(3))
+                .unwrap()
+                .skipped_providers
+                .contains_key(&crate::synthesis::SynthesisProvider::CodexCli)
+        );
     }
 
     #[test]

@@ -498,7 +498,7 @@ function handleContextMenuAction(action: string, sessionId: number) {
         ? managed.term.getSelection()
         : contextMenuSelection;
       if (text) {
-        copyToClipboard(text);
+        void copyToClipboard(text);
       }
       break;
     }
@@ -577,7 +577,7 @@ function copySelectedTerminalText(): boolean {
   const managed = getTerminal(sessionId);
   const text = managed?.term.hasSelection() ? managed.term.getSelection() : "";
   if (!text) return false;
-  copyToClipboard(text);
+  void copyToClipboard(text);
   return true;
 }
 

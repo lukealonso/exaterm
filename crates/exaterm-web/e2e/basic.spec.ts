@@ -148,7 +148,7 @@ test.describe("Focus mode", () => {
     await ensureSessionCount(page, 2);
 
     await enterFocusMode(page);
-    await page.locator(".focused-card .card-header-row").click();
+    await page.locator(".focused-card").click();
     await expect(page.locator(".battlefield-grid")).not.toHaveClass(
       /focus-mode/
     );

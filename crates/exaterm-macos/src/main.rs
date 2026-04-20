@@ -48,10 +48,15 @@ fn main() {
         Ok(parsed) => parsed,
         Err(error) => {
             eprintln!("{error}");
-            eprintln!("usage: exaterm [--ssh user@host] [--new <id> | --resume <id>]");
+            eprintln!("usage: exaterm [--ssh user@host]");
             std::process::exit(2);
         }
     };
+    if parsed.workspace.is_some() {
+        eprintln!("named workspaces are not supported on macOS yet");
+        eprintln!("usage: exaterm [--ssh user@host]");
+        std::process::exit(2);
+    }
     run_app(parsed.mode);
 }
 
