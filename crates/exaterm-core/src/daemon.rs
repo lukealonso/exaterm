@@ -1941,6 +1941,7 @@ mod tests {
     }
 
     fn write_fake_shell(runtime_dir: &PathBuf) -> PathBuf {
+        fs::create_dir_all(runtime_dir).expect("create fake shell dir");
         let shell_path = runtime_dir.join("fake-shell.sh");
         fs::write(&shell_path, "#!/bin/sh\nexit 0\n").expect("write fake shell");
         let mut perms = fs::metadata(&shell_path)
