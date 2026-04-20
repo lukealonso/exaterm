@@ -1,20 +1,20 @@
-use crate::file_watch::{RepoWatchHandle, spawn_repo_watch};
-use crate::model::{SessionId, SessionLaunch, WorkspaceStore, user_shell_launch};
+use crate::file_watch::{spawn_repo_watch, RepoWatchHandle};
+use crate::model::{user_shell_launch, SessionId, SessionLaunch, WorkspaceStore};
 use crate::observation::{
-    SessionObservation, apply_file_activity, apply_observation_refresh, apply_stream_update,
-    build_naming_evidence, build_nudge_evidence, build_tactical_evidence, clear_file_activity,
+    apply_file_activity, apply_observation_refresh, apply_stream_update, build_naming_evidence,
+    build_nudge_evidence, build_tactical_evidence, clear_file_activity,
     compute_observation_refresh, find_git_worktree_root, is_bare_waiting_shell,
-    record_terminal_input_activity,
+    record_terminal_input_activity, SessionObservation,
 };
 use crate::proto::{
     ClientMessage, ObservationSnapshot, ServerMessage, SessionSnapshot, WorkspaceSnapshot,
 };
-use crate::runtime::{RuntimeEvent, SessionRuntime, spawn_headless_runtime};
+use crate::runtime::{spawn_headless_runtime, RuntimeEvent, SessionRuntime};
 use crate::synthesis::{
-    NameSuggestion, NamingEvidence, NudgeEvidence, NudgeSuggestion, ProviderCallResult,
-    ProviderPreferences, SynthesisBackendRegistry, TacticalState, TacticalSynthesis,
     name_signature, nudge_signature, should_skip_repeated_paused_summary, summary_signature,
-    summary_substantive_signature,
+    summary_substantive_signature, NameSuggestion, NamingEvidence, NudgeEvidence, NudgeSuggestion,
+    ProviderCallResult, ProviderPreferences, SynthesisBackendRegistry, TacticalState,
+    TacticalSynthesis,
 };
 use portable_pty::PtySize;
 use serde::Serialize;
@@ -298,7 +298,9 @@ impl DaemonState {
     ) -> Result<SessionId, String> {
         let idx = self.workspace.sessions().len();
         launch.env.push(("EXATERM_IDX".into(), idx.to_string()));
-        launch.env.push(("EXATERM_IDX_1".into(), (idx + 1).to_string()));
+        launch
+            .env
+            .push(("EXATERM_IDX_1".into(), (idx + 1).to_string()));
         let session_id = self.workspace.add_session(launch.clone());
         self.observations
             .insert(session_id, SessionObservation::new());
@@ -817,7 +819,12 @@ fn handle_client_message(
         } => {
             let current_total = state.workspace.sessions().len();
             if target_total > current_total && supported_terminal_target(target_total) {
-                add_n_terminals(state, source_session, target_total - current_total, control_tx)?;
+                add_n_terminals(
+                    state,
+                    source_session,
+                    target_total - current_total,
+                    control_tx,
+                )?;
             }
             Ok(false)
         }
@@ -834,10 +841,7 @@ fn handle_client_message(
                 let _ = fs::remove_file(&stream.socket_path);
             }
             if let Some(root) = state.session_repo_roots.remove(&session_id) {
-                let still_used = state
-                    .session_repo_roots
-                    .values()
-                    .any(|r| r == &root);
+                let still_used = state.session_repo_roots.values().any(|r| r == &root);
                 if !still_used {
                     if let Some(watch) = state.repo_watches.remove(&root) {
                         watch.handle.stop();
@@ -1910,6 +1914,31 @@ mod tests {
         serde_json::from_str(line.trim()).expect("parse daemon message")
     }
 
+    fn configure_test_reader(stream: &UnixStream) -> BufReader<UnixStream> {
+        let reader_stream = stream.try_clone().expect("clone stream");
+        reader_stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("set read timeout");
+        BufReader::new(reader_stream)
+    }
+
+    fn join_thread_before_timeout<T>(
+        handle: thread::JoinHandle<T>,
+        label: &str,
+        timeout: Duration,
+    ) -> T {
+        let deadline = Instant::now() + timeout;
+        while !handle.is_finished() {
+            assert!(
+                Instant::now() < deadline,
+                "{label} did not finish within {}s",
+                timeout.as_secs()
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        handle.join().unwrap_or_else(|_| panic!("{label} panicked"))
+    }
+
     #[test]
     fn replay_buffer_trims_to_limit() {
         let mut buffer = Vec::new();
@@ -1958,8 +1987,7 @@ mod tests {
                 Err(error) => panic!("failed to connect daemon: {error}"),
             }
         };
-        let reader_stream = stream.try_clone().expect("clone stream");
-        let mut reader = BufReader::new(reader_stream);
+        let mut reader = configure_test_reader(&stream);
 
         write_json_line(&mut stream, &ClientMessage::AttachClient).expect("attach client");
         match read_server_message(&mut reader) {
@@ -1980,7 +2008,8 @@ mod tests {
 
         write_json_line(&mut stream, &ClientMessage::TerminateWorkspace).expect("terminate");
         drop(stream);
-        let result = handle.join().expect("daemon thread should join");
+        let result =
+            join_thread_before_timeout(handle, "daemon thread should join", Duration::from_secs(5));
         assert!(result.is_ok(), "daemon should exit cleanly: {result:?}");
 
         std::env::remove_var("EXATERM_RUNTIME_DIR");
@@ -2013,7 +2042,7 @@ mod tests {
         write_json_line(&mut first, &ClientMessage::AttachClient).expect("attach first");
 
         let second = UnixStream::connect(&control_path).expect("connect second");
-        let mut second_reader = BufReader::new(second);
+        let mut second_reader = configure_test_reader(&second);
         match read_server_message(&mut second_reader) {
             ServerMessage::Error { message } => {
                 assert!(message.contains("already attached"));
@@ -2023,7 +2052,8 @@ mod tests {
 
         write_json_line(&mut first, &ClientMessage::TerminateWorkspace).expect("terminate");
         drop(first);
-        let result = handle.join().expect("daemon thread should join");
+        let result =
+            join_thread_before_timeout(handle, "daemon thread should join", Duration::from_secs(5));
         assert!(result.is_ok(), "daemon should exit cleanly: {result:?}");
 
         std::env::remove_var("EXATERM_RUNTIME_DIR");
@@ -2167,30 +2197,24 @@ mod tests {
 
         let changed = drain_worker_results(&mut state);
         assert!(!changed);
-        assert!(
-            state
-                .summary_cache
-                .get(&SessionId(1))
-                .unwrap()
-                .skipped_providers
-                .contains_key(&crate::synthesis::SynthesisProvider::OpenAi)
-        );
-        assert!(
-            state
-                .naming_cache
-                .get(&SessionId(2))
-                .unwrap()
-                .skipped_providers
-                .contains_key(&crate::synthesis::SynthesisProvider::ClaudeCli)
-        );
-        assert!(
-            state
-                .nudge_cache
-                .get(&SessionId(3))
-                .unwrap()
-                .skipped_providers
-                .contains_key(&crate::synthesis::SynthesisProvider::CodexCli)
-        );
+        assert!(state
+            .summary_cache
+            .get(&SessionId(1))
+            .unwrap()
+            .skipped_providers
+            .contains_key(&crate::synthesis::SynthesisProvider::OpenAi));
+        assert!(state
+            .naming_cache
+            .get(&SessionId(2))
+            .unwrap()
+            .skipped_providers
+            .contains_key(&crate::synthesis::SynthesisProvider::ClaudeCli));
+        assert!(state
+            .nudge_cache
+            .get(&SessionId(3))
+            .unwrap()
+            .skipped_providers
+            .contains_key(&crate::synthesis::SynthesisProvider::CodexCli));
     }
 
     #[test]

@@ -2,14 +2,28 @@ use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::PathBuf;
 use std::sync::mpsc;
 
+enum WatchMessage {
+    Event(notify::Result<Event>),
+    Stop,
+}
+
 pub struct RepoWatchHandle {
     _watcher: Option<RecommendedWatcher>,
     thread: Option<std::thread::JoinHandle<()>>,
+    stop_tx: Option<mpsc::Sender<WatchMessage>>,
 }
 
 impl RepoWatchHandle {
     pub fn stop(mut self) {
-        // Drop the watcher first to close the sender, unblocking the receiver thread
+        self.finish();
+    }
+
+    fn finish(&mut self) {
+        if let Some(stop_tx) = self.stop_tx.take() {
+            let _ = stop_tx.send(WatchMessage::Stop);
+        }
+        // Drop the watcher first so platforms that close the channel promptly
+        // still closes any underlying backend resources before we join.
         drop(self._watcher.take());
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -19,11 +33,7 @@ impl RepoWatchHandle {
 
 impl Drop for RepoWatchHandle {
     fn drop(&mut self) {
-        // Drop the watcher first to close the sender, unblocking the receiver thread
-        drop(self._watcher.take());
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
+        self.finish();
     }
 }
 
@@ -39,10 +49,16 @@ pub fn spawn_repo_watch<F>(root: PathBuf, mut on_event: F) -> Result<RepoWatchHa
 where
     F: FnMut(String) + Send + 'static,
 {
-    let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
+    let (tx, rx) = mpsc::channel::<WatchMessage>();
+    let event_tx = tx.clone();
 
-    let mut watcher = RecommendedWatcher::new(tx, notify::Config::default())
-        .map_err(|e| format!("failed to create watcher: {e}"))?;
+    let mut watcher = RecommendedWatcher::new(
+        move |result| {
+            let _ = event_tx.send(WatchMessage::Event(result));
+        },
+        notify::Config::default(),
+    )
+    .map_err(|e| format!("failed to create watcher: {e}"))?;
 
     watcher
         .watch(&root, RecursiveMode::Recursive)
@@ -53,7 +69,10 @@ where
     let original_root = root.clone();
     let watch_root = root.canonicalize().unwrap_or(root);
     let thread = std::thread::spawn(move || {
-        for result in rx {
+        while let Ok(message) = rx.recv() {
+            let WatchMessage::Event(result) = message else {
+                break;
+            };
             let Ok(event) = result else {
                 continue;
             };
@@ -90,6 +109,7 @@ where
     Ok(RepoWatchHandle {
         _watcher: Some(watcher),
         thread: Some(thread),
+        stop_tx: Some(tx),
     })
 }
 
