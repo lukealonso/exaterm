@@ -45,16 +45,21 @@ jobs:
         if: matrix.os == 'linux'
         run: |
           dnf install -y --setopt=install_weak_deps=False \
+            cargo \
             curl \
             gcc \
             gcc-c++ \
             gtk4-devel \
             libadwaita-devel \
             pkgconf-pkg-config \
+            rust \
             vte291-gtk4-devel
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust toolchain (macOS)
+        if: matrix.os == 'macos'
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
 
       - name: Check workspace
         run: cargo check --workspace

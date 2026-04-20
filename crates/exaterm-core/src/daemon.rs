@@ -903,6 +903,7 @@ fn handle_client_message(
             }
         }
         ClientMessage::TerminateWorkspace => {
+            *client_writer = None;
             state.shutdown_workspace();
             Ok(true)
         }
@@ -2056,6 +2057,7 @@ mod tests {
         assert_eq!(snapshot.sessions.len(), 1);
         assert_eq!(snapshot.sessions[0].record.launch.name, "Shell 1");
 
+        drop(reader);
         write_json_line(&mut stream, &ClientMessage::TerminateWorkspace).expect("terminate");
         drop(stream);
         let result = join_thread_before_timeout(
