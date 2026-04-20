@@ -228,9 +228,12 @@ test.describe("Terminal interaction", () => {
     await ensureSessionCount(page, 2);
 
     await enterFocusMode(page, 1);
-    const sessionId = Number(
-      await page.locator(".battle-card").nth(1).getAttribute("data-session-id")
-    );
+    const rawSessionId = await page
+      .locator(".battle-card")
+      .nth(1)
+      .getAttribute("data-session-id");
+    expect(rawSessionId).not.toBeNull();
+    const sessionId = Number(rawSessionId);
     expect(Number.isNaN(sessionId)).toBe(false);
     const termScreen = page.locator(".focused-card .xterm-screen");
     await expect(termScreen).toBeVisible({ timeout: 15_000 });
