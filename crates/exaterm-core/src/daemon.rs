@@ -35,7 +35,7 @@ const CONTROL_SOCKET_NAME: &str = "beachhead-control.sock";
 const CANONICAL_TERMINAL_ROWS: u16 = 40;
 const CANONICAL_TERMINAL_COLS: u16 = 120;
 const REPLAY_BYTES_LIMIT: usize = 8 * 1024 * 1024;
-const REFRESH_INTERVAL: Duration = Duration::from_millis(900);
+const REFRESH_INTERVAL: Duration = Duration::from_millis(300);
 const CONTROL_EVENTS_PER_TICK: usize = 128;
 const TERMINAL_RETURN_DELAY: Duration = Duration::from_millis(35);
 const MIN_IDLE_SECS_FOR_NUDGE: u64 = 20;
@@ -145,6 +145,7 @@ struct SummaryCacheEntry {
     requested_signature: Option<String>,
     last_summary: Option<TacticalSynthesis>,
     last_attempt: Option<Instant>,
+    suppressed_until_input: bool,
     in_flight: bool,
     skipped_providers: BTreeMap<crate::synthesis::SynthesisProvider, Instant>,
 }
@@ -182,6 +183,7 @@ impl SummaryCacheEntry {
             requested_signature: None,
             last_summary: None,
             last_attempt: None,
+            suppressed_until_input: false,
             in_flight: false,
             skipped_providers: BTreeMap::new(),
         }
@@ -292,8 +294,11 @@ impl DaemonState {
 
     fn add_shell_session_without_watch(
         &mut self,
-        launch: SessionLaunch,
+        mut launch: SessionLaunch,
     ) -> Result<SessionId, String> {
+        let idx = self.workspace.sessions().len();
+        launch.env.push(("EXATERM_IDX".into(), idx.to_string()));
+        launch.env.push(("EXATERM_IDX_1".into(), (idx + 1).to_string()));
         let session_id = self.workspace.add_session(launch.clone());
         self.observations
             .insert(session_id, SessionObservation::new());
@@ -820,6 +825,33 @@ fn handle_client_message(
             add_n_terminals(state, source_session, 1, control_tx)?;
             Ok(false)
         }
+        ClientMessage::CloseSession { session_id } => {
+            state.runtimes.remove(&session_id);
+            state.observations.remove(&session_id);
+            state.observation_cache.remove(&session_id);
+            state.replay_buffers.remove(&session_id);
+            if let Some(stream) = state.session_streams.remove(&session_id) {
+                let _ = fs::remove_file(&stream.socket_path);
+            }
+            if let Some(root) = state.session_repo_roots.remove(&session_id) {
+                let still_used = state
+                    .session_repo_roots
+                    .values()
+                    .any(|r| r == &root);
+                if !still_used {
+                    if let Some(watch) = state.repo_watches.remove(&root) {
+                        watch.handle.stop();
+                    }
+                }
+            }
+            state.summary_cache.remove(&session_id);
+            state.naming_cache.remove(&session_id);
+            state.nudge_cache.remove(&session_id);
+            state.forwarded_sessions.remove(&session_id);
+            state.workspace.remove_session(session_id);
+            state.snapshot_dirty = true;
+            Ok(false)
+        }
         ClientMessage::ResizeTerminal {
             session_id,
             rows,
@@ -882,6 +914,9 @@ fn refresh_state(state: &mut DaemonState) {
         };
 
         if is_bare_waiting_shell(session, &observation) {
+            continue;
+        }
+        if supervision_suppressed(state, session.id) {
             continue;
         }
 
@@ -1133,6 +1168,7 @@ fn drain_worker_results(state: &mut DaemonState) -> bool {
             if let Ok(summary) = result.summary.value {
                 entry.completed_signature = Some(result.signature);
                 entry.completed_substantive_signature = Some(result.substantive_signature);
+                entry.suppressed_until_input = summary.tool_not_likely_coding_agent;
                 entry.last_summary = Some(summary);
                 changed = true;
             }
@@ -1287,6 +1323,9 @@ fn send_runtime_input_bytes(
 fn note_terminal_input_activity(state: &mut DaemonState, session_id: SessionId) {
     let observation = state.observations.entry(session_id).or_default();
     record_terminal_input_activity(observation);
+    if let Some(entry) = state.summary_cache.get_mut(&session_id) {
+        entry.suppressed_until_input = false;
+    }
     state.snapshot_dirty = true;
 }
 
@@ -1295,6 +1334,13 @@ fn looks_like_coding_agent(command: &str) -> bool {
         command,
         "codex" | "claude" | "claude-code" | "aider" | "opencode" | "goose" | "gemini"
     )
+}
+
+fn supervision_suppressed(state: &DaemonState, session_id: SessionId) -> bool {
+    state
+        .summary_cache
+        .get(&session_id)
+        .is_some_and(|entry| entry.suppressed_until_input)
 }
 
 fn observation_snapshot(observation: &SessionObservation) -> ObservationSnapshot {
@@ -1322,17 +1368,8 @@ fn append_replay_buffer(buffer: &mut Vec<u8>, chunk: &[u8]) {
     }
 }
 
-fn summary_refresh_interval(session_age: Duration) -> Duration {
-    let seconds = session_age.as_secs();
-    if seconds < 60 {
-        Duration::from_secs(5)
-    } else if seconds < 180 {
-        Duration::from_secs(10)
-    } else if seconds < 300 {
-        Duration::from_secs(20)
-    } else {
-        Duration::from_secs(30)
-    }
+fn summary_refresh_interval(_session_age: Duration) -> Duration {
+    Duration::from_secs(5 * 60)
 }
 
 fn spawn_summary_worker() -> Option<SummaryWorker> {
@@ -1591,6 +1628,7 @@ fn inherit_beachhead_env(command: &mut Command) {
         "EXATERM_NUDGE_MODEL",
         "EXATERM_CODEX_CLI_MODEL",
         "EXATERM_CLAUDE_CLI_MODEL",
+        "EXATERM_WORKSPACE",
     ] {
         if let Some(value) = env::var_os(key) {
             command.env(key, value);
@@ -1690,23 +1728,26 @@ fn session_raw_socket_name(session_id: SessionId) -> String {
 }
 
 pub fn control_socket_path() -> Result<PathBuf, String> {
-    let runtime_dir = daemon_runtime_dir();
-    Ok(runtime_dir.join("exaterm").join(CONTROL_SOCKET_NAME))
+    Ok(daemon_socket_dir().join(CONTROL_SOCKET_NAME))
 }
 
 pub fn session_raw_socket_path(socket_name: &str) -> Result<PathBuf, String> {
-    let runtime_dir = daemon_runtime_dir();
-    Ok(runtime_dir.join("exaterm").join(socket_name))
+    Ok(daemon_socket_dir().join(socket_name))
 }
 
-fn daemon_runtime_dir() -> PathBuf {
-    env::var_os("EXATERM_RUNTIME_DIR")
+fn daemon_socket_dir() -> PathBuf {
+    let base = env::var_os("EXATERM_RUNTIME_DIR")
         .map(PathBuf::from)
         .or_else(|| env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from))
         .unwrap_or_else(|| {
             let uid = unsafe { libc::geteuid() };
             PathBuf::from(format!("/tmp/exaterm-{uid}"))
-        })
+        });
+    let dir = base.join("exaterm");
+    match env::var_os("EXATERM_WORKSPACE") {
+        Some(workspace) if !workspace.is_empty() => dir.join(PathBuf::from(workspace)),
+        _ => dir,
+    }
 }
 
 fn refresh_timeout_ms(elapsed: Duration) -> i32 {
@@ -1796,6 +1837,24 @@ mod tests {
         note_terminal_input_activity(&mut state, session_id);
 
         assert!(!session_still_accepts_nudge(&state, session_id));
+    }
+
+    #[test]
+    fn terminal_input_activity_reenables_suppressed_supervision() {
+        let mut state = DaemonState::new();
+        let session_id = SessionId(7);
+        state
+            .summary_cache
+            .insert(session_id, SummaryCacheEntry::new());
+        state
+            .summary_cache
+            .get_mut(&session_id)
+            .expect("summary cache entry")
+            .suppressed_until_input = true;
+
+        assert!(supervision_suppressed(&state, session_id));
+        note_terminal_input_activity(&mut state, session_id);
+        assert!(!supervision_suppressed(&state, session_id));
     }
 
     fn env_lock() -> &'static Mutex<()> {

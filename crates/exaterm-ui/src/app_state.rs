@@ -566,6 +566,7 @@ mod tests {
             attention_level: AttentionLevel::Guide,
             attention_brief: Some("Operator should keep watching this setup.".into()),
             headline: Some("Setup is moving but still deserves active supervision.".into()),
+            tool_not_likely_coding_agent: false,
         });
         snap.auto_nudge_enabled = true;
         snap.last_sent_age_secs = Some(30);
@@ -648,6 +649,7 @@ mod tests {
             attention_level: AttentionLevel::Autopilot,
             attention_brief: None,
             headline: Some("Build passing".into()),
+            tool_not_likely_coding_agent: false,
         };
         let (headline, detail, alert) = extract_synthesis_fields(Some(&synth));
         assert_eq!(headline, "Build passing");
@@ -667,6 +669,7 @@ mod tests {
             attention_level: AttentionLevel::Intervene,
             attention_brief: Some("Process stuck, needs input".into()),
             headline: Some("Blocked on user".into()),
+            tool_not_likely_coding_agent: false,
         };
         let (headline, _detail, alert) = extract_synthesis_fields(Some(&synth));
         assert_eq!(headline, "Blocked on user");
@@ -684,6 +687,7 @@ mod tests {
             attention_level: AttentionLevel::Monitor,
             attention_brief: None,
             headline: Some("Tests passing".into()),
+            tool_not_likely_coding_agent: false,
         });
 
         state.apply_snapshot(&make_snapshot(vec![snap]));
@@ -706,6 +710,7 @@ mod tests {
             attention_level: AttentionLevel::Monitor,
             attention_brief: None,
             headline: Some("Active".into()),
+            tool_not_likely_coding_agent: false,
         });
         state.apply_snapshot(&make_snapshot(vec![snap]));
         assert!(state.summaries.contains_key(&SessionId(1)));
@@ -727,6 +732,7 @@ mod tests {
             attention_level: AttentionLevel::Guide,
             attention_brief: Some("Monitor closely".into()),
             headline: Some("Compiling".into()),
+            tool_not_likely_coding_agent: false,
         });
 
         state.apply_snapshot(&make_snapshot(vec![snap]));
@@ -803,6 +809,7 @@ mod tests {
             attention_level: AttentionLevel::Intervene,
             attention_brief: Some("Operator action is required before progress can resume.".into()),
             headline: Some("Hard stop waiting on operator input.".into()),
+            tool_not_likely_coding_agent: false,
         });
 
         state.apply_snapshot(&make_snapshot(vec![snap]));

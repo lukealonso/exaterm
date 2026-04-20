@@ -22,6 +22,9 @@ pub enum ClientMessage {
         rows: u16,
         cols: u16,
     },
+    CloseSession {
+        session_id: SessionId,
+    },
     ToggleAutoNudge {
         session_id: SessionId,
         enabled: bool,

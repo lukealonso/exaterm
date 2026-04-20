@@ -1060,6 +1060,8 @@ Use only the provided evidence.
 Do not invent hidden thoughts, unseen tools, unseen files, or internal model state.
 Prefer multi-line terminal history and concrete machine evidence over a single optimistic status line when they disagree.
 Treat the terminal history age labels and terminal_status_line_age as relative recency hints. Older evidence should count less than fresh evidence.
+Treat a fresh terminal_status_line plus a very recent terminal_status_line_age as strong evidence that the session is still actively working, even if the rest of the visible scrollback is sparse.
+Do not dismiss a live-looking spinner/progress/status line as mere optimism when it is updating recently.
 
 Return one compact JSON object only.
 
@@ -1067,6 +1069,7 @@ You must fill these dimensions:
 - tactical_state plus tactical_state_brief: the broad present-tense state of the session
 - attention_level plus attention_brief: how closely and urgently the human operator should be paying attention to this session right now
 - headline: one short operator-facing sentence that will appear directly under the terminal name
+- tool_not_likely_coding_agent: true only when the current session does not appear to be an AI coding-agent workflow and the operator should stop spending supervision budget on it until fresh user input arrives
 
 You must always choose a real tactical_state and a real attention_level.
 
@@ -1084,6 +1087,8 @@ Guidance:
 - use idle only for truly passive no-goal states
 - do not use idle just because the agent tried one or two things and then went quiet
 - after recent concrete work, a quiet pause is usually stopped, not idle, if a simple continue could resume useful work
+- if tool_not_likely_coding_agent is true, set tactical_state to idle and attention_level to autopilot
+- set tool_not_likely_coding_agent to false when the evidence suggests a real coding-agent session, even if the agent is currently running a subprocess like cargo, pytest, git, or bash under that agent
 - use complete rarely; the bar is high
 - do not use complete for 'looks good', 'standing by', 'ready for the next instruction', or a single successful substep
 - when unsure between idle and stopped after recent work, prefer stopped
@@ -1190,6 +1195,7 @@ fn synthesis_schema() -> Value {
             },
             "attention_brief": { "type": ["string", "null"] },
             "headline": { "type": ["string", "null"] },
+            "tool_not_likely_coding_agent": { "type": "boolean" },
         },
         "required": [
             "tactical_state",
@@ -1197,6 +1203,7 @@ fn synthesis_schema() -> Value {
             "attention_level",
             "attention_brief",
             "headline",
+            "tool_not_likely_coding_agent",
         ],
         "additionalProperties": false
     })
@@ -1315,15 +1322,15 @@ mod tests {
 
     #[test]
     fn summary_model_defaults_and_preserves_exact_name() {
-        assert_eq!(normalize_summary_model("gpt-5.4-mini"), "gpt-5.4-mini");
-        assert_eq!(normalize_summary_model(""), "gpt-5.4-mini");
+        assert_eq!(normalize_summary_model("gpt-5.4-nano"), "gpt-5.4-nano");
+        assert_eq!(normalize_summary_model(""), "gpt-5.4-nano");
         assert_eq!(normalize_summary_model("gpt-5.4"), "gpt-5.4");
     }
 
     #[test]
     fn naming_model_defaults_and_preserves_exact_name() {
-        assert_eq!(normalize_naming_model("gpt-5.4-mini"), "gpt-5.4-mini");
-        assert_eq!(normalize_naming_model(""), "gpt-5.4-mini");
+        assert_eq!(normalize_naming_model("gpt-5.4-nano"), "gpt-5.4-nano");
+        assert_eq!(normalize_naming_model(""), "gpt-5.4-nano");
         assert_eq!(normalize_naming_model("gpt-5.4"), "gpt-5.4");
     }
 
@@ -1769,6 +1776,7 @@ printf 'stdin:%s\n' "$input"
             attention_level: AttentionLevel::Intervene,
             attention_brief: Some("human input required".into()),
             headline: Some("awaiting approval".into()),
+            tool_not_likely_coding_agent: false,
         };
 
         assert!(should_skip_repeated_paused_summary(
@@ -1856,6 +1864,7 @@ printf 'stdin:%s\n' "$input"
             attention_level: AttentionLevel::Monitor,
             attention_brief: Some(" keep watching this loop ".into()),
             headline: Some("  cargo   test parser ".into()),
+            tool_not_likely_coding_agent: false,
         }
         .sanitize();
 
@@ -2477,6 +2486,10 @@ printf 'stdin:%s\n' "$input"
             prompt
                 .contains("when unsure between idle and stopped after recent work, prefer stopped")
         );
+        assert!(prompt.contains(
+            "Treat a fresh terminal_status_line plus a very recent terminal_status_line_age as strong evidence"
+        ));
+        assert!(prompt.contains("tool_not_likely_coding_agent"));
     }
 
     #[test]
@@ -2487,5 +2500,9 @@ printf 'stdin:%s\n' "$input"
             .as_array()
             .expect("tactical_state enum should be an array");
         assert!(!enum_values.iter().any(serde_json::Value::is_null));
+        assert_eq!(
+            schema["properties"]["tool_not_likely_coding_agent"]["type"],
+            "boolean"
+        );
     }
 }
