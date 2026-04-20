@@ -1782,6 +1782,8 @@ fn drain_wake_socket(reader: &mut UnixStream) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1872,6 +1874,30 @@ mod tests {
             .unwrap_or_else(|poison| poison.into_inner())
     }
 
+    struct EnvVarRestore {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarRestore {
+        fn new(key: &'static str) -> Self {
+            Self {
+                key,
+                previous: std::env::var_os(key),
+            }
+        }
+    }
+
+    impl Drop for EnvVarRestore {
+        fn drop(&mut self) {
+            if let Some(value) = self.previous.take() {
+                std::env::set_var(self.key, value);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
     /// Returns false when Unix socket creation is blocked (e.g. inside the
     /// Claude Code sandbox).  Tests that start a real daemon process or rely
     /// on FSEvents delivery use this as an early-exit guard so `cargo test`
@@ -1912,6 +1938,17 @@ mod tests {
         } else {
             candidate
         }
+    }
+
+    fn write_fake_shell(runtime_dir: &PathBuf) -> PathBuf {
+        let shell_path = runtime_dir.join("fake-shell.sh");
+        fs::write(&shell_path, "#!/bin/sh\nexit 0\n").expect("write fake shell");
+        let mut perms = fs::metadata(&shell_path)
+            .expect("shell metadata")
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&shell_path, perms).expect("chmod fake shell");
+        shell_path
     }
 
     fn read_server_message(reader: &mut BufReader<UnixStream>) -> ServerMessage {
@@ -1976,8 +2013,14 @@ mod tests {
             return;
         }
         let _guard = lock_env();
+        let _runtime_guard = EnvVarRestore::new("EXATERM_RUNTIME_DIR");
+        let _shell_guard = EnvVarRestore::new("SHELL");
+        let _shell_mode_guard = EnvVarRestore::new("EXATERM_SHELL_MODE");
         let runtime_dir = unique_runtime_dir("daemon-flow");
+        let fake_shell = write_fake_shell(&runtime_dir);
         std::env::set_var("EXATERM_RUNTIME_DIR", &runtime_dir);
+        std::env::set_var("SHELL", &fake_shell);
+        std::env::remove_var("EXATERM_SHELL_MODE");
 
         let handle = thread::spawn(run_local_daemon_inner);
 
@@ -2021,7 +2064,6 @@ mod tests {
         );
         assert!(result.is_ok(), "daemon should exit cleanly: {result:?}");
 
-        std::env::remove_var("EXATERM_RUNTIME_DIR");
         let _ = fs::remove_dir_all(runtime_dir);
     }
 
@@ -2031,8 +2073,14 @@ mod tests {
             return;
         }
         let _guard = lock_env();
+        let _runtime_guard = EnvVarRestore::new("EXATERM_RUNTIME_DIR");
+        let _shell_guard = EnvVarRestore::new("SHELL");
+        let _shell_mode_guard = EnvVarRestore::new("EXATERM_SHELL_MODE");
         let runtime_dir = unique_runtime_dir("daemon-reject");
+        let fake_shell = write_fake_shell(&runtime_dir);
         std::env::set_var("EXATERM_RUNTIME_DIR", &runtime_dir);
+        std::env::set_var("SHELL", &fake_shell);
+        std::env::remove_var("EXATERM_SHELL_MODE");
 
         let handle = thread::spawn(run_local_daemon_inner);
 
@@ -2068,7 +2116,6 @@ mod tests {
         );
         assert!(result.is_ok(), "daemon should exit cleanly: {result:?}");
 
-        std::env::remove_var("EXATERM_RUNTIME_DIR");
         let _ = fs::remove_dir_all(runtime_dir);
     }
 
