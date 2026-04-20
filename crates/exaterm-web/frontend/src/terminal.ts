@@ -2,26 +2,101 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import type { ClientMessage, SessionSnapshot } from "./protocol";
 
+interface ExatermTestHooks {
+  clearTerminalSelection(sessionId: number): boolean;
+  connectionState(sessionId: number): number | null;
+  terminalContainsText(sessionId: number, needle: string): boolean;
+  terminalTextCenter(
+    sessionId: number,
+    needle: string
+  ): { x: number; y: number } | null;
+  selectTerminalText(sessionId: number, needle: string): boolean;
+}
+
+declare global {
+  interface Window {
+    __EXATERM_TEST__?: ExatermTestHooks;
+  }
+}
+
 export interface ManagedTerminal {
   sessionId: number;
   term: Terminal;
   fit: FitAddon;
+  wrapper: HTMLElement;
   ws: WebSocket;
   resizeObserver: ResizeObserver | null;
   /** When false, the stream WebSocket will not reconnect on close. */
   live: boolean;
-  /**
-   * Most recent non-empty selection text. Cached so that right-click
-   * handlers (which may race with xterm clearing the selection on
-   * mousedown) can still read what the user just highlighted.
-   */
-  lastSelection: string;
 }
 
 const terminals = new Map<number, ManagedTerminal>();
 
 let sendCommand: ((cmd: ClientMessage) => void) | null = null;
 let syncInputsEnabled = false;
+
+function findBufferText(term: Terminal, needle: string): { column: number; row: number } | null {
+  const buffer = term.buffer.active;
+  for (let row = 0; row < buffer.length; row++) {
+    const line = buffer.getLine(row);
+    const text = line?.translateToString(true) ?? "";
+    const column = text.indexOf(needle);
+    if (column >= 0) {
+      return { column, row };
+    }
+  }
+  return null;
+}
+
+function installTestHooks() {
+  window.__EXATERM_TEST__ = {
+    clearTerminalSelection(sessionId) {
+      const managed = terminals.get(sessionId);
+      if (!managed) return false;
+      managed.term.clearSelection();
+      return true;
+    },
+    connectionState(sessionId) {
+      return terminals.get(sessionId)?.ws.readyState ?? null;
+    },
+    selectTerminalText(sessionId, needle) {
+      const managed = terminals.get(sessionId);
+      if (!managed) return false;
+      const location = findBufferText(managed.term, needle);
+      if (!location) return false;
+      managed.term.select(location.column, location.row, needle.length);
+      return true;
+    },
+    terminalContainsText(sessionId, needle) {
+      const managed = terminals.get(sessionId);
+      if (!managed) return false;
+      return findBufferText(managed.term, needle) !== null;
+    },
+    terminalTextCenter(sessionId, needle) {
+      const managed = terminals.get(sessionId);
+      if (!managed) return null;
+      const location = findBufferText(managed.term, needle);
+      if (!location) return null;
+      const screen = managed.term.element?.querySelector(".xterm-screen");
+      if (!(screen instanceof HTMLElement)) return null;
+      const rect = screen.getBoundingClientRect();
+      const visibleRow = location.row - managed.term.buffer.active.viewportY;
+      if (visibleRow < 0 || visibleRow >= managed.term.rows) return null;
+      return {
+        x: rect.left + ((location.column + needle.length / 2) / managed.term.cols) * rect.width,
+        y: rect.top + ((visibleRow + 0.5) / managed.term.rows) * rect.height,
+      };
+    },
+  };
+}
+
+function testHooksEnabled(): boolean {
+  return document.body?.dataset.exatermTestHooks === "true";
+}
+
+if (testHooksEnabled()) {
+  installTestHooks();
+}
 
 /**
  * Copy text to the clipboard, falling back to execCommand when the async
@@ -114,13 +189,9 @@ export function attachTerminal(
 ): ManagedTerminal {
   const existing = terminals.get(session.record.id);
   if (existing) {
-    const wrapper = container.querySelector(".xterm-wrapper");
-    if (existing.term.element && existing.term.element.parentElement !== wrapper) {
+    if (existing.wrapper.parentElement !== container) {
       container.innerHTML = "";
-      const newWrapper = document.createElement("div");
-      newWrapper.className = "xterm-wrapper";
-      container.appendChild(newWrapper);
-      newWrapper.appendChild(existing.term.element);
+      container.appendChild(existing.wrapper);
       existing.fit.fit();
     }
     return existing;
@@ -142,7 +213,6 @@ export function attachTerminal(
     // already bypasses it on Shift+drag on all platforms). TUIs like
     // Claude Code enable mouse reporting, which otherwise eats the drag.
     macOptionClickForcesSelection: true,
-    rightClickSelectsWord: true,
     theme: {
       background: "#070d14",
       foreground: "#e2e8f0",
@@ -222,14 +292,9 @@ export function attachTerminal(
   }
 
   // Auto-copy on select (matches GTK's connect_selection_changed behavior).
-  // Also cache the most recent non-empty selection so context-menu copy
-  // still works even if a subsequent right-click clears xterm's selection.
   term.onSelectionChange(() => {
     if (term.hasSelection()) {
-      const selected = term.getSelection();
-      const managed = terminals.get(sid);
-      if (managed) managed.lastSelection = selected;
-      copyToClipboard(selected);
+      copyToClipboard(term.getSelection());
     }
   });
 
@@ -307,10 +372,10 @@ export function attachTerminal(
     sessionId: session.record.id,
     term,
     fit,
+    wrapper,
     ws,
     resizeObserver,
     live: true,
-    lastSelection: "",
   };
   terminals.set(session.record.id, managed);
   return managed;
@@ -322,15 +387,9 @@ export function hideTerminal(sessionId: number) {
   if (!managed) return;
   managed.resizeObserver?.disconnect();
   managed.resizeObserver = null;
-  // Move the xterm element out of the visible DOM into a hidden holder.
-  if (managed.term.element) {
-    if (!hiddenHolder) {
-      hiddenHolder = document.createElement("div");
-      hiddenHolder.style.display = "none";
-      document.body.appendChild(hiddenHolder);
-    }
-    hiddenHolder.appendChild(managed.term.element);
-  }
+  managed.term.clearSelection();
+  managed.term.blur();
+  managed.wrapper.style.display = "none";
 }
 
 /** Re-show a hidden terminal in a container. */
@@ -339,22 +398,21 @@ export function showTerminal(sessionId: number, container: HTMLElement) {
   if (!managed) return;
 
   // If the terminal is already in this container, do nothing.
-  const existingWrapper = container.querySelector(".xterm-wrapper");
-  if (existingWrapper && managed.term.element?.parentElement === existingWrapper) {
+  if (
+    managed.wrapper.parentElement === container &&
+    managed.wrapper.style.display !== "none"
+  ) {
     return;
   }
 
-  // Ensure the container has a wrapper.
-  let wrapper = existingWrapper as HTMLElement | null;
-  if (!wrapper) {
-    container.innerHTML = "";
-    wrapper = document.createElement("div");
-    wrapper.className = "xterm-wrapper";
-    container.appendChild(wrapper);
+  if (managed.wrapper.parentElement !== container) {
+    container.replaceChildren(managed.wrapper);
+  } else {
+    container
+      .querySelectorAll(".card-scrollback-text, .card-scrollback-empty")
+      .forEach((node) => node.remove());
   }
-  if (managed.term.element) {
-    wrapper.appendChild(managed.term.element);
-  }
+  managed.wrapper.style.display = "";
   // Re-attach resize observer.
   let resizeTimer: ReturnType<typeof setTimeout> | null = null;
   const ro = new ResizeObserver(() => {
@@ -378,12 +436,10 @@ export function showTerminal(sessionId: number, container: HTMLElement) {
   requestAnimationFrame(() => {
     requestAnimationFrame(() => {
       managed.fit.fit();
-      ro.observe(wrapper!);
+      ro.observe(managed.wrapper);
     });
   });
 }
-
-let hiddenHolder: HTMLElement | null = null;
 
 /** Stop reconnecting the stream WebSocket for a dead session.
  *  The terminal stays in the map (scrollback preserved) until detached. */

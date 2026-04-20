@@ -387,19 +387,24 @@ function updateCard(card: CardElements, session: SessionSnapshot, embedTerminal:
     }
     const scrollbackText = previewLines.join("\n");
     const pre = card.terminalSlot.querySelector(".card-scrollback-text");
+    const empty = card.terminalSlot.querySelector(".card-scrollback-empty");
     if (previewLines.length > 0) {
-      if (!pre || pre.textContent !== scrollbackText) {
+      empty?.remove();
+      if (!pre) {
         const el = document.createElement("pre");
         el.className = "card-scrollback-text";
         el.textContent = scrollbackText;
-        card.terminalSlot.replaceChildren(el);
+        card.terminalSlot.appendChild(el);
+      } else if (pre.textContent !== scrollbackText) {
+        pre.textContent = scrollbackText;
       }
     } else {
-      if (!card.terminalSlot.querySelector(".card-scrollback-empty")) {
+      pre?.remove();
+      if (!empty) {
         const el = document.createElement("div");
         el.className = "card-scrollback-empty";
         el.textContent = "Waiting for output...";
-        card.terminalSlot.replaceChildren(el);
+        card.terminalSlot.appendChild(el);
       }
     }
   }
@@ -409,6 +414,7 @@ function updateCard(card: CardElements, session: SessionSnapshot, embedTerminal:
 
 let contextMenuEl: HTMLElement | null = null;
 let contextMenuSessionId: number | null = null;
+let contextMenuSelection = "";
 
 function createContextMenu(): HTMLElement {
   const menu = document.createElement("div");
@@ -447,13 +453,13 @@ function showContextMenu(x: number, y: number, sessionId: number) {
   syncItem.textContent = isSyncInputs() ? "\u2713 " : "";
 
   // Update copy enabled state. Prefer the live xterm selection; fall back
-  // to the cached last selection, because right-clicking can clear xterm's
-  // selection before this handler runs.
+  // to the selection snapshotted on right-click, because xterm can clear
+  // the highlight before this handler runs.
   const copyItem = contextMenuEl.querySelector('[data-action="copy"]') as HTMLElement;
   const managed = getTerminal(sessionId);
   const hasSelection =
     (managed?.term.hasSelection() ?? false) ||
-    (managed?.lastSelection?.length ?? 0) > 0;
+    contextMenuSelection.length > 0;
   copyItem.classList.toggle("disabled", !hasSelection);
   // When a TUI (Claude Code, codex, tmux, etc.) enables mouse reporting,
   // plain drag gets forwarded to the agent instead of selecting. Holding
@@ -481,6 +487,7 @@ function showContextMenu(x: number, y: number, sessionId: number) {
 function hideContextMenu() {
   if (contextMenuEl) contextMenuEl.classList.add("hidden");
   contextMenuSessionId = null;
+  contextMenuSelection = "";
 }
 
 function handleContextMenuAction(action: string, sessionId: number) {
@@ -489,7 +496,7 @@ function handleContextMenuAction(action: string, sessionId: number) {
     case "copy": {
       const text = managed?.term.hasSelection()
         ? managed.term.getSelection()
-        : managed?.lastSelection ?? "";
+        : contextMenuSelection;
       if (text) {
         copyToClipboard(text);
       }
@@ -619,6 +626,19 @@ export function init(appEl: HTMLElement, sendFn: (cmd: ClientMessage) => void) {
       focusCard(sid);
     }
   });
+
+  // Right-click: snapshot any live selection before xterm clears it, then
+  // open the menu on the later contextmenu event.
+  gridEl.addEventListener("pointerdown", (e) => {
+    if (e.button !== 2) return;
+    const cardEl = (e.target as HTMLElement).closest(".battle-card") as HTMLElement | null;
+    if (!cardEl || !cardEl.dataset.sessionId) {
+      contextMenuSelection = "";
+      return;
+    }
+    const managed = getTerminal(Number(cardEl.dataset.sessionId));
+    contextMenuSelection = managed?.term.hasSelection() ? managed.term.getSelection() : "";
+  }, true);
 
   // Right-click: context menu.
   gridEl.addEventListener("contextmenu", (e) => {

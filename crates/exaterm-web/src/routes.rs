@@ -11,8 +11,16 @@ use std::sync::Arc;
 
 static FRONTEND_DIST: Dir = include_dir!("$CARGO_MANIFEST_DIR/frontend/dist");
 
-pub fn build_router(relay: Arc<DaemonRelay>, dev_assets: Option<PathBuf>) -> Router {
-    let state = AppState { relay, dev_assets };
+pub fn build_router(
+    relay: Arc<DaemonRelay>,
+    dev_assets: Option<PathBuf>,
+    enable_test_hooks: bool,
+) -> Router {
+    let state = AppState {
+        relay,
+        dev_assets,
+        enable_test_hooks,
+    };
     Router::new()
         .route("/", get(index))
         .route("/assets/{*path}", get(static_asset))
@@ -49,19 +57,37 @@ async fn security_headers(request: axum::extract::Request, next: Next) -> Respon
 pub struct AppState {
     pub relay: Arc<DaemonRelay>,
     pub dev_assets: Option<PathBuf>,
+    pub enable_test_hooks: bool,
 }
 
 async fn index(state: axum::extract::State<Arc<AppState>>) -> impl IntoResponse {
     if let Some(dir) = &state.dev_assets {
         match tokio::fs::read_to_string(dir.join("index.html")).await {
-            Ok(html) => return Html(html).into_response(),
+            Ok(html) => {
+                return Html(render_index_html(&html, state.enable_test_hooks)).into_response()
+            }
             Err(e) => eprintln!("dev assets: failed to read index.html: {e}"),
         }
     }
     match FRONTEND_DIST.get_file("index.html") {
-        Some(file) => Html(file.contents_utf8().unwrap_or_default()).into_response(),
+        Some(file) => Html(render_index_html(
+            file.contents_utf8().unwrap_or_default(),
+            state.enable_test_hooks,
+        ))
+        .into_response(),
         None => (StatusCode::NOT_FOUND, "index.html not found").into_response(),
     }
+}
+
+fn render_index_html(html: &str, enable_test_hooks: bool) -> String {
+    if !enable_test_hooks {
+        return html.to_owned();
+    }
+    html.replacen(
+        "<body>",
+        r#"<body data-exaterm-test-hooks="true">"#,
+        1,
+    )
 }
 
 async fn static_asset(
@@ -175,5 +201,21 @@ mod tests {
             html.contains("/assets/main.css"),
             "index.html should reference main.css"
         );
+    }
+
+    #[test]
+    fn render_index_html_injects_test_hook_flag() {
+        let html = "<html><body><div id=\"app\"></div></body></html>";
+        let rendered = render_index_html(html, true);
+        assert!(
+            rendered.contains(r#"<body data-exaterm-test-hooks="true">"#),
+            "test-hook flag should be injected into the body tag"
+        );
+    }
+
+    #[test]
+    fn render_index_html_is_unchanged_without_test_hooks() {
+        let html = "<html><body><div id=\"app\"></div></body></html>";
+        assert_eq!(render_index_html(html, false), html);
     }
 }
