@@ -18,8 +18,6 @@ test.describe("Add one terminal", () => {
   test("Add Shell button and Ctrl+Shift+N each add exactly one session", async ({
     page,
   }) => {
-    await page.goto("/");
-    await waitForCards(page, 1);
     let before = await page.locator(".battle-card").count();
     await page.click("#add-shell-btn");
     let after = await waitForCardCountIncrease(page, before);
@@ -36,9 +34,6 @@ test.describe("Terminal scrollback preservation", () => {
   test("terminal scrollback survives focus/unfocus cycle", async ({
     page,
   }) => {
-    await page.goto("/");
-    await waitForCards(page, 1);
-
     await enterFocusMode(page);
     const sessionId = await firstSessionId(page);
     const screen = page.locator(".focused-card .xterm-screen");
@@ -67,9 +62,6 @@ test.describe("Focus preservation", () => {
   test("render does not remove focused-card class during snapshot updates", async ({
     page,
   }) => {
-    await page.goto("/");
-    await waitForCards(page, 1);
-
     await enterFocusMode(page);
     await page.waitForTimeout(2200);
     await expect(page.locator(".focused-card")).toBeVisible();
@@ -78,8 +70,6 @@ test.describe("Focus preservation", () => {
 
 test.describe("Stream WebSocket reconnection", () => {
   test("terminal remains functional after page reload", async ({ page }) => {
-    await page.goto("/");
-    await waitForCards(page, 1);
     await page.reload();
     await waitForCards(page, 1);
     const sessionId = await firstSessionId(page);
@@ -100,9 +90,6 @@ test.describe("Scrollback preview", () => {
   test("preview updates from xterm buffer when available", async ({
     page,
   }) => {
-    await page.goto("/");
-    await waitForCards(page, 1);
-
     await enterFocusMode(page);
     const sessionId = await firstSessionId(page);
     const screen = page.locator(".focused-card .xterm-screen");
@@ -111,7 +98,9 @@ test.describe("Scrollback preview", () => {
     await waitForTerminalInputFocus(page);
     await page.keyboard.type("echo PREVIEW_MARKER_XYZ\n", { delay: 20 });
     await expect
-      .poll(() => terminalContainsText(page, sessionId, "PREVIEW_MARKER_XYZ"))
+      .poll(() => terminalContainsText(page, sessionId, "PREVIEW_MARKER_XYZ"), {
+        timeout: 10_000,
+      })
       .toBe(true);
 
     await page.keyboard.press("Escape");

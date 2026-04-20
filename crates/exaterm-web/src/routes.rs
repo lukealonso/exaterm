@@ -83,11 +83,24 @@ fn render_index_html(html: &str, enable_test_hooks: bool) -> String {
     if !enable_test_hooks {
         return html.to_owned();
     }
-    html.replacen(
-        "<body>",
-        r#"<body data-exaterm-test-hooks="true">"#,
-        1,
-    )
+    let Some(body_start) = html.find("<body") else {
+        eprintln!("render_index_html: <body> tag not found; test hooks flag not injected");
+        return html.to_owned();
+    };
+    let Some(tag_end_offset) = html[body_start..].find('>') else {
+        eprintln!("render_index_html: malformed <body> tag; test hooks flag not injected");
+        return html.to_owned();
+    };
+    let tag_end = body_start + tag_end_offset;
+    if html[body_start..tag_end].contains("data-exaterm-test-hooks=") {
+        return html.to_owned();
+    }
+
+    let mut rendered = String::with_capacity(html.len() + 32);
+    rendered.push_str(&html[..tag_end]);
+    rendered.push_str(r#" data-exaterm-test-hooks="true""#);
+    rendered.push_str(&html[tag_end..]);
+    rendered
 }
 
 async fn static_asset(
@@ -205,11 +218,15 @@ mod tests {
 
     #[test]
     fn render_index_html_injects_test_hook_flag() {
-        let html = "<html><body><div id=\"app\"></div></body></html>";
+        let html = r#"<html><body class="app"><div id="app"></div></body></html>"#;
         let rendered = render_index_html(html, true);
         assert!(
-            rendered.contains(r#"<body data-exaterm-test-hooks="true">"#),
+            rendered.contains(r#"data-exaterm-test-hooks="true""#),
             "test-hook flag should be injected into the body tag"
+        );
+        assert!(
+            rendered.contains(r#"<body class="app" data-exaterm-test-hooks="true">"#),
+            "existing body attributes should be preserved"
         );
     }
 

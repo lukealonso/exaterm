@@ -1,6 +1,5 @@
 import { test, expect } from "@playwright/test";
 import {
-  waitForCards,
   ensureSessionCount,
   resetWorkspace,
 } from "./helpers";
@@ -23,8 +22,6 @@ test.describe("Terminal clipping", () => {
   test("focused terminal content stays fully inside the visible slot after scrolling", async ({
     page,
   }) => {
-    await page.goto("/");
-    await waitForCards(page, 1);
     await ensureSessionCount(page, 4);
     await enterFocusModeWithWait(page);
 

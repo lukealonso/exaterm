@@ -503,13 +503,11 @@ function handleContextMenuAction(action: string, sessionId: number) {
       break;
     }
     case "paste":
-      navigator.clipboard.readText()
-        .then((text) => {
+      void readClipboardText().then((text) => {
+        if (text !== null) {
           sendTextToSession(sessionId, text);
-        })
-        .catch(() => {
-          console.warn("Clipboard access denied or unavailable");
-        });
+        }
+      });
       break;
     case "add-terminals":
       if (onSendCommand) {
@@ -556,6 +554,45 @@ let onSendCommand: ((cmd: ClientMessage) => void) | null = null;
 let selectedSessionId: number | null = null;
 let focusedSessionId: number | null = null;
 const dismissedSessionIds = new Set<number>();
+
+function isCopyShortcut(event: KeyboardEvent): boolean {
+  const key = event.key.toLowerCase();
+  return (
+    (event.ctrlKey &&
+      event.shiftKey &&
+      !event.metaKey &&
+      !event.altKey &&
+      key === "c") ||
+    (event.metaKey &&
+      !event.ctrlKey &&
+      !event.shiftKey &&
+      !event.altKey &&
+      key === "c")
+  );
+}
+
+function copySelectedTerminalText(): boolean {
+  const sessionId = focusedSessionId ?? selectedSessionId;
+  if (sessionId === null) return false;
+  const managed = getTerminal(sessionId);
+  const text = managed?.term.hasSelection() ? managed.term.getSelection() : "";
+  if (!text) return false;
+  copyToClipboard(text);
+  return true;
+}
+
+async function readClipboardText(): Promise<string | null> {
+  if (!navigator.clipboard?.readText) {
+    console.warn("Clipboard read is unavailable in this browser context");
+    return null;
+  }
+  try {
+    return await navigator.clipboard.readText();
+  } catch {
+    console.warn("Clipboard access denied or unavailable");
+    return null;
+  }
+}
 
 export function init(appEl: HTMLElement, sendFn: (cmd: ClientMessage) => void) {
   onSendCommand = sendFn;
@@ -650,23 +687,13 @@ export function init(appEl: HTMLElement, sendFn: (cmd: ClientMessage) => void) {
 
   // Keyboard shortcuts (capture phase to beat xterm.js).
   document.addEventListener("keydown", (e) => {
-    // Ctrl+Shift+C (Linux/Windows) / Cmd+C (Mac): copy current selection.
+    // Ctrl+Shift+C / Cmd+C: copy the active terminal selection.
     // Runs at capture phase, ahead of xterm.js, so it also works when the
     // xterm canvas isn't the focused element.
-    const key = e.key.toLowerCase();
-    const isMac = navigator.platform.toLowerCase().includes("mac");
-    const copyCombo =
-      (e.ctrlKey && e.shiftKey && !e.altKey && key === "c") ||
-      (isMac && e.metaKey && !e.shiftKey && !e.altKey && key === "c");
-    if (copyCombo && selectedSessionId !== null) {
-      const managed = getTerminal(selectedSessionId);
-      const text = managed?.term.hasSelection() ? managed.term.getSelection() : "";
-      if (text) {
-        e.preventDefault();
-        e.stopPropagation();
-        copyToClipboard(text);
-        return;
-      }
+    if (isCopyShortcut(e) && copySelectedTerminalText()) {
+      e.preventDefault();
+      e.stopPropagation();
+      return;
     }
 
     // Escape: exit focus mode — preserve selection (matches workspace_view.rs).

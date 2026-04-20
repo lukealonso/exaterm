@@ -5,7 +5,6 @@ import {
   firstSessionId,
   resetWorkspace,
   terminalContainsText,
-  waitForCards,
   waitForTerminalInputFocus,
 } from "./helpers";
 import type { Page } from "@playwright/test";
@@ -33,8 +32,6 @@ test.describe("Terminal reattach after embed/scrollback transition", () => {
   test("terminal is functional after adding shells and re-focusing", async ({
     page,
   }) => {
-    await page.goto("/");
-    await waitForCards(page, 1);
     await enterFocusModeWithWait(page);
     const sessionId = await firstSessionId(page);
     await expect
@@ -71,8 +68,6 @@ test.describe("Terminal reattach after embed/scrollback transition", () => {
   });
 
   test("terminal is scrollable to bottom after reattach", async ({ page }) => {
-    await page.goto("/");
-    await waitForCards(page, 1);
     await enterFocusModeWithWait(page);
     const sessionId = await firstSessionId(page);
     await expect
@@ -85,7 +80,9 @@ test.describe("Terminal reattach after embed/scrollback transition", () => {
       "for i in $(seq 1 80); do echo reattach-line-$i; done\n"
     );
     await expect
-      .poll(() => terminalContainsText(page, sessionId, "reattach-line-80"))
+      .poll(() => terminalContainsText(page, sessionId, "reattach-line-80"), {
+        timeout: 10_000,
+      })
       .toBe(true);
 
     // Return to battlefield and add shells so the terminal has to reattach.
@@ -107,11 +104,13 @@ test.describe("Terminal reattach after embed/scrollback transition", () => {
     await expect
       .poll(() => terminalContainsText(page, sessionId, "BOTTOM_CHECK"))
       .toBe(true);
-    const scrollInfo = await page.locator(".xterm-viewport").first().evaluate((el) => ({
-      scrollTop: el.scrollTop,
-      scrollHeight: el.scrollHeight,
-      clientHeight: el.clientHeight,
-    }));
+    const scrollInfo = await page
+      .locator(".focused-card .xterm-viewport")
+      .evaluate((el) => ({
+        scrollTop: el.scrollTop,
+        scrollHeight: el.scrollHeight,
+        clientHeight: el.clientHeight,
+      }));
     const distFromBottom =
       scrollInfo.scrollHeight - scrollInfo.scrollTop - scrollInfo.clientHeight;
     expect(distFromBottom).toBeLessThan(50);

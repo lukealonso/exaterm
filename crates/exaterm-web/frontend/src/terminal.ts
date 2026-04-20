@@ -256,28 +256,7 @@ export function attachTerminal(
     return true;
   });
 
-  // Bulletproof copy shortcuts. A TUI with mouse reporting on (Claude Code,
-  // codex, tmux, vim) eats plain drag, so the user may Shift+drag to select
-  // — and then needs a key they can actually press. Ctrl+Shift+C is the
-  // standard Linux/Windows terminal copy shortcut; Cmd+C on Mac matches
-  // native apps. We only intercept when there is a selection, so copy never
-  // steals Ctrl+C / Cmd+C away from the shell.
   const sid = session.record.id;
-  term.attachCustomKeyEventHandler((event) => {
-    if (event.type !== "keydown") return true;
-    const key = event.key.toLowerCase();
-    const isMac = navigator.platform.toLowerCase().includes("mac");
-    const copyCombo =
-      (event.ctrlKey && event.shiftKey && !event.altKey && key === "c") ||
-      (isMac && event.metaKey && !event.shiftKey && !event.altKey && key === "c");
-    if (!copyCombo) return true;
-    const text = term.hasSelection() ? term.getSelection() : "";
-    if (!text) return true; // let Ctrl+C / Cmd+C pass through as SIGINT / native
-    copyToClipboard(text);
-    event.preventDefault();
-    event.stopPropagation();
-    return false;
-  });
 
   // Send initial terminal size to the daemon immediately after fit.
   // Browsers don't guarantee a ResizeObserver callback on first attach,

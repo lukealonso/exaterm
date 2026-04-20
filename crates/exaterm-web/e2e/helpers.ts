@@ -10,6 +10,10 @@ export async function waitForCards(page: Page, count: number, timeout = 10_000) 
 /** Restart the shared daemon-backed workspace so each test starts clean. */
 export async function resetWorkspace(page: Page) {
   await page.addInitScript(() => {
+    if ((window as any).__exaterm_confirm_overridden) {
+      return;
+    }
+    (window as any).__exaterm_confirm_overridden = true;
     window.confirm = () => true;
   });
   await page.goto("/");
@@ -107,7 +111,7 @@ export async function installClipboardStub(page: Page, initialText = "") {
 }
 
 export async function installExecCommandCopyStub(page: Page) {
-  await page.evaluate(() => {
+  const installStub = () => {
     let copiedText = "";
     Object.defineProperty(window, "__EXATERM_EXEC_COMMAND_COPY__", {
       configurable: true,
@@ -137,7 +141,9 @@ export async function installExecCommandCopyStub(page: Page) {
         return true;
       },
     });
-  });
+  };
+  await page.addInitScript(installStub);
+  await page.evaluate(installStub);
 }
 
 export async function getClipboardText(page: Page): Promise<string> {

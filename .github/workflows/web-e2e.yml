@@ -56,20 +56,15 @@ jobs:
   playwright:
     name: Playwright (Linux)
     needs: changes
+    if: needs.changes.outputs.web_e2e == 'true'
     runs-on: ubuntu-latest
     env:
       CARGO_TERM_COLOR: always
     steps:
-      - name: Skip when no relevant files changed
-        if: needs.changes.outputs.web_e2e != 'true'
-        run: echo "No exaterm-web, exaterm-core, or exaterm-types changes; skipping Playwright."
-
       - name: Check out repository
-        if: needs.changes.outputs.web_e2e == 'true'
         uses: actions/checkout@v4
 
       - name: Set up Node.js
-        if: needs.changes.outputs.web_e2e == 'true'
         uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -79,35 +74,38 @@ jobs:
             crates/exaterm-web/frontend/package-lock.json
 
       - name: Install Rust toolchain
-        if: needs.changes.outputs.web_e2e == 'true'
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Cache Playwright browser
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ hashFiles('crates/exaterm-web/package-lock.json') }}
+
       - name: Install frontend dependencies
-        if: needs.changes.outputs.web_e2e == 'true'
         working-directory: crates/exaterm-web/frontend
         run: npm ci
 
       - name: Build exaterm-web
-        if: needs.changes.outputs.web_e2e == 'true'
         run: cargo build --locked -p exaterm-web
 
       - name: Install Playwright dependencies
-        if: needs.changes.outputs.web_e2e == 'true'
         working-directory: crates/exaterm-web
         run: npm ci
 
       - name: Install Playwright browser
-        if: needs.changes.outputs.web_e2e == 'true'
         working-directory: crates/exaterm-web
         run: npx playwright install --with-deps chromium
 
       - name: Run Playwright suite
-        if: needs.changes.outputs.web_e2e == 'true'
         working-directory: crates/exaterm-web
         run: npm run test:e2e:ci
 
       - name: Upload Playwright report
-        if: failure() && needs.changes.outputs.web_e2e == 'true'
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: playwright-report
