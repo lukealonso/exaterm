@@ -1,0 +1,10 @@
+{
+  "private": true,
+  "scripts": {
+    "test:e2e": "playwright test",
+    "test:e2e:ci": "playwright test --reporter=line,html"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.54.0"
+  }
+}

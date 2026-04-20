@@ -1,6 +1,14 @@
 import { test, expect } from "@playwright/test";
-import { waitForCards, ensureSessionCount } from "./helpers";
+import {
+  waitForCards,
+  ensureSessionCount,
+  resetWorkspace,
+} from "./helpers";
 import type { Page } from "@playwright/test";
+
+test.beforeEach(async ({ page }) => {
+  await resetWorkspace(page);
+});
 
 async function enterFocusModeWithWait(page: Page) {
   await page.locator(".battle-card").first().click();
@@ -12,7 +20,7 @@ async function enterFocusModeWithWait(page: Page) {
 }
 
 test.describe("Terminal clipping", () => {
-  test.fixme("cursor row is fully visible after scrolling in focus mode", async ({
+  test("focused terminal content stays fully inside the visible slot after scrolling", async ({
     page,
   }) => {
     await page.goto("/");
@@ -20,14 +28,15 @@ test.describe("Terminal clipping", () => {
     await ensureSessionCount(page, 4);
     await enterFocusModeWithWait(page);
 
-    await page.locator(".focused-card .xterm-screen").click();
+    const screen = page.locator(".focused-card .xterm-screen");
+    await screen.click();
     await page.keyboard.type(
-      "for i in $(seq 1 100); do echo line-$i; done\n",
+      "for i in $(seq 1 200); do echo line-$i; done\n",
       { delay: 10 }
     );
     await page.waitForTimeout(1000);
 
-    const overflow = await page.locator(".focused-card .xterm-wrapper").evaluate((el) => {
+    const wrapperOverflow = await page.locator(".focused-card .xterm-wrapper").evaluate((el) => {
       const wrapper = el as HTMLElement;
       const screen = wrapper.querySelector(".xterm-screen") as HTMLElement | null;
       if (!screen) return { overflows: false, reason: "no screen" };
@@ -38,23 +47,11 @@ test.describe("Terminal clipping", () => {
         diff: screenRect.bottom - wrapperRect.bottom,
       };
     });
-    expect(overflow.overflows).toBe(false);
-  });
+    expect(wrapperOverflow.overflows).toBe(false);
 
-  test.fixme("last xterm row is not clipped in focus mode", async ({ page }) => {
-    await page.goto("/");
-    await waitForCards(page, 1);
-    await enterFocusModeWithWait(page);
-
-    await page.locator(".focused-card .xterm-screen").click();
-    await page.keyboard.type(
-      "for i in $(seq 1 200); do echo line-$i; done\n",
-      { delay: 10 }
-    );
-    await page.waitForTimeout(1000);
-
-    const viewport = page.locator(".focused-card .xterm-viewport").first();
-    const screen = page.locator(".focused-card .xterm-screen").first();
+    const viewport = page.locator(".xterm-viewport").first();
+    await expect(viewport).toBeVisible({ timeout: 10_000 });
+    await expect(screen).toBeVisible({ timeout: 10_000 });
     const viewportBox = await viewport.boundingBox();
     const screenBox = await screen.boundingBox();
 
@@ -65,14 +62,8 @@ test.describe("Terminal clipping", () => {
       const viewportBottom = viewportBox.y + viewportBox.height;
       expect(screenBottom).toBeLessThanOrEqual(viewportBottom + 2);
     }
-  });
 
-  test("xterm rows element fits within terminal slot", async ({ page }) => {
-    await page.goto("/");
-    await waitForCards(page, 1);
-    await enterFocusModeWithWait(page);
-
-    const overflow = await page.locator(".focused-card .card-terminal-slot").evaluate((el) => {
+    const slotOverflow = await page.locator(".focused-card .card-terminal-slot").evaluate((el) => {
       const slot = el as HTMLElement;
       const xterm = slot.querySelector(".xterm") as HTMLElement | null;
       if (!xterm) return { overflows: false, reason: "no xterm" };
@@ -83,6 +74,6 @@ test.describe("Terminal clipping", () => {
         diff: xtermRect.bottom - slotRect.bottom,
       };
     });
-    expect(overflow.overflows).toBe(false);
+    expect(slotOverflow.overflows).toBe(false);
   });
 });
