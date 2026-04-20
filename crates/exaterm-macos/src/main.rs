@@ -44,15 +44,15 @@ fn main() {
             1
         });
     }
-    let mode = match exaterm_ui::beachhead::parse_run_mode(argv.into_iter().skip(1)) {
-        Ok(mode) => mode,
+    let parsed = match exaterm_ui::beachhead::parse_run_mode(argv.into_iter().skip(1)) {
+        Ok(parsed) => parsed,
         Err(error) => {
             eprintln!("{error}");
-            eprintln!("usage: exaterm [--ssh user@host]");
+            eprintln!("usage: exaterm [--ssh user@host] [--new <id> | --resume <id>]");
             std::process::exit(2);
         }
     };
-    run_app(mode);
+    run_app(parsed.mode);
 }
 
 #[cfg(not(target_os = "macos"))]

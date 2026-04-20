@@ -291,6 +291,7 @@ mod tests {
                         program: "/bin/sh".into(),
                         args: vec![],
                         cwd: None,
+                        env: vec![],
                         kind: SessionKind::WaitingShell,
                     },
                     display_name: None,
