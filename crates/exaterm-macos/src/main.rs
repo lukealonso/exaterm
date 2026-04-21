@@ -44,15 +44,20 @@ fn main() {
             1
         });
     }
-    let mode = match exaterm_ui::beachhead::parse_run_mode(argv.into_iter().skip(1)) {
-        Ok(mode) => mode,
+    let parsed = match exaterm_ui::beachhead::parse_run_mode(argv.into_iter().skip(1)) {
+        Ok(parsed) => parsed,
         Err(error) => {
             eprintln!("{error}");
             eprintln!("usage: exaterm [--ssh user@host]");
             std::process::exit(2);
         }
     };
-    run_app(mode);
+    if parsed.workspace.is_some() {
+        eprintln!("named workspaces are not supported on macOS yet");
+        eprintln!("usage: exaterm [--ssh user@host]");
+        std::process::exit(2);
+    }
+    run_app(parsed.mode);
 }
 
 #[cfg(not(target_os = "macos"))]

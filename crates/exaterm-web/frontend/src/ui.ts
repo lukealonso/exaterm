@@ -9,6 +9,7 @@ import type {
 } from "./protocol";
 import {
   attachTerminal,
+  copyToClipboard,
   detachTerminal,
   hideTerminal,
   showTerminal,
@@ -386,19 +387,24 @@ function updateCard(card: CardElements, session: SessionSnapshot, embedTerminal:
     }
     const scrollbackText = previewLines.join("\n");
     const pre = card.terminalSlot.querySelector(".card-scrollback-text");
+    const empty = card.terminalSlot.querySelector(".card-scrollback-empty");
     if (previewLines.length > 0) {
-      if (!pre || pre.textContent !== scrollbackText) {
+      empty?.remove();
+      if (!pre) {
         const el = document.createElement("pre");
         el.className = "card-scrollback-text";
         el.textContent = scrollbackText;
-        card.terminalSlot.replaceChildren(el);
+        card.terminalSlot.appendChild(el);
+      } else if (pre.textContent !== scrollbackText) {
+        pre.textContent = scrollbackText;
       }
     } else {
-      if (!card.terminalSlot.querySelector(".card-scrollback-empty")) {
+      pre?.remove();
+      if (!empty) {
         const el = document.createElement("div");
         el.className = "card-scrollback-empty";
         el.textContent = "Waiting for output...";
-        card.terminalSlot.replaceChildren(el);
+        card.terminalSlot.appendChild(el);
       }
     }
   }
@@ -408,6 +414,7 @@ function updateCard(card: CardElements, session: SessionSnapshot, embedTerminal:
 
 let contextMenuEl: HTMLElement | null = null;
 let contextMenuSessionId: number | null = null;
+let contextMenuSelection = "";
 
 function createContextMenu(): HTMLElement {
   const menu = document.createElement("div");
@@ -445,11 +452,23 @@ function showContextMenu(x: number, y: number, sessionId: number) {
   const syncItem = contextMenuEl.querySelector('[data-action="sync-inputs"] .context-menu-check')!;
   syncItem.textContent = isSyncInputs() ? "\u2713 " : "";
 
-  // Update copy enabled state.
+  // Update copy enabled state. Prefer the live xterm selection; fall back
+  // to the selection snapshotted on right-click, because xterm can clear
+  // the highlight before this handler runs.
   const copyItem = contextMenuEl.querySelector('[data-action="copy"]') as HTMLElement;
   const managed = getTerminal(sessionId);
-  const hasSelection = managed?.term.hasSelection() ?? false;
+  const hasSelection =
+    (managed?.term.hasSelection() ?? false) ||
+    contextMenuSelection.length > 0;
   copyItem.classList.toggle("disabled", !hasSelection);
+  // When a TUI (Claude Code, codex, tmux, etc.) enables mouse reporting,
+  // plain drag gets forwarded to the agent instead of selecting. Holding
+  // Shift bypasses that. Surface the tip as a tooltip + inline hint so
+  // the gesture is discoverable without docs.
+  copyItem.textContent = hasSelection ? "Copy" : "Copy  (Shift+drag to select)";
+  copyItem.title = hasSelection
+    ? ""
+    : "Hold Shift while dragging to select text when a terminal app is using mouse input (e.g. Claude Code, codex).";
 
   // Update add terminals enabled state — always enabled since we send add_one_terminal.
   const addItem = contextMenuEl.querySelector('[data-action="add-terminals"]') as HTMLElement;
@@ -468,24 +487,27 @@ function showContextMenu(x: number, y: number, sessionId: number) {
 function hideContextMenu() {
   if (contextMenuEl) contextMenuEl.classList.add("hidden");
   contextMenuSessionId = null;
+  contextMenuSelection = "";
 }
 
 function handleContextMenuAction(action: string, sessionId: number) {
   const managed = getTerminal(sessionId);
   switch (action) {
-    case "copy":
-      if (managed?.term.hasSelection()) {
-        navigator.clipboard.writeText(managed.term.getSelection());
+    case "copy": {
+      const text = managed?.term.hasSelection()
+        ? managed.term.getSelection()
+        : contextMenuSelection;
+      if (text) {
+        void copyToClipboard(text);
       }
       break;
+    }
     case "paste":
-      navigator.clipboard.readText()
-        .then((text) => {
+      void readClipboardText().then((text) => {
+        if (text !== null) {
           sendTextToSession(sessionId, text);
-        })
-        .catch(() => {
-          console.warn("Clipboard access denied or unavailable");
-        });
+        }
+      });
       break;
     case "add-terminals":
       if (onSendCommand) {
@@ -532,6 +554,45 @@ let onSendCommand: ((cmd: ClientMessage) => void) | null = null;
 let selectedSessionId: number | null = null;
 let focusedSessionId: number | null = null;
 const dismissedSessionIds = new Set<number>();
+
+function isCopyShortcut(event: KeyboardEvent): boolean {
+  const key = event.key.toLowerCase();
+  return (
+    (event.ctrlKey &&
+      event.shiftKey &&
+      !event.metaKey &&
+      !event.altKey &&
+      key === "c") ||
+    (event.metaKey &&
+      !event.ctrlKey &&
+      !event.shiftKey &&
+      !event.altKey &&
+      key === "c")
+  );
+}
+
+function copySelectedTerminalText(): boolean {
+  const sessionId = focusedSessionId ?? selectedSessionId;
+  if (sessionId === null) return false;
+  const managed = getTerminal(sessionId);
+  const text = managed?.term.hasSelection() ? managed.term.getSelection() : "";
+  if (!text) return false;
+  void copyToClipboard(text);
+  return true;
+}
+
+async function readClipboardText(): Promise<string | null> {
+  if (!navigator.clipboard?.readText) {
+    console.warn("Clipboard read is unavailable in this browser context");
+    return null;
+  }
+  try {
+    return await navigator.clipboard.readText();
+  } catch {
+    console.warn("Clipboard access denied or unavailable");
+    return null;
+  }
+}
 
 export function init(appEl: HTMLElement, sendFn: (cmd: ClientMessage) => void) {
   onSendCommand = sendFn;
@@ -603,6 +664,19 @@ export function init(appEl: HTMLElement, sendFn: (cmd: ClientMessage) => void) {
     }
   });
 
+  // Right-click: snapshot any live selection before xterm clears it, then
+  // open the menu on the later contextmenu event.
+  gridEl.addEventListener("pointerdown", (e) => {
+    if (e.button !== 2) return;
+    const cardEl = (e.target as HTMLElement).closest(".battle-card") as HTMLElement | null;
+    if (!cardEl || !cardEl.dataset.sessionId) {
+      contextMenuSelection = "";
+      return;
+    }
+    const managed = getTerminal(Number(cardEl.dataset.sessionId));
+    contextMenuSelection = managed?.term.hasSelection() ? managed.term.getSelection() : "";
+  }, true);
+
   // Right-click: context menu.
   gridEl.addEventListener("contextmenu", (e) => {
     const cardEl = (e.target as HTMLElement).closest(".battle-card") as HTMLElement | null;
@@ -613,6 +687,15 @@ export function init(appEl: HTMLElement, sendFn: (cmd: ClientMessage) => void) {
 
   // Keyboard shortcuts (capture phase to beat xterm.js).
   document.addEventListener("keydown", (e) => {
+    // Ctrl+Shift+C / Cmd+C: copy the active terminal selection.
+    // Runs at capture phase, ahead of xterm.js, so it also works when the
+    // xterm canvas isn't the focused element.
+    if (isCopyShortcut(e) && copySelectedTerminalText()) {
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
+
     // Escape: exit focus mode — preserve selection (matches workspace_view.rs).
     if (e.key === "Escape" && focusedSessionId !== null) {
       e.preventDefault();

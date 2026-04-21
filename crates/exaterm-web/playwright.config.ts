@@ -15,7 +15,11 @@ export default defineConfig({
     viewport: { width: 1920, height: 1080 },
   },
   webServer: {
-    command: `EXATERM_RUNTIME_DIR=/tmp/exaterm-e2e-${process.pid} ${webBin} --port ${testPort}`,
+    command: `${webBin} --port ${testPort}`,
+    env: {
+      EXATERM_ENABLE_TEST_HOOKS: "1",
+      EXATERM_RUNTIME_DIR: `/tmp/exaterm-e2e-${process.pid}`,
+    },
     port: testPort,
     timeout: 15_000,
     reuseExistingServer: false,

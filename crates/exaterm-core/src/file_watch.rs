@@ -1,15 +1,24 @@
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::PathBuf;
-use std::sync::mpsc;
+use crossbeam_channel::{Receiver, Sender};
 
 pub struct RepoWatchHandle {
     _watcher: Option<RecommendedWatcher>,
     thread: Option<std::thread::JoinHandle<()>>,
+    stop_tx: Option<Sender<()>>,
 }
 
 impl RepoWatchHandle {
     pub fn stop(mut self) {
-        // Drop the watcher first to close the sender, unblocking the receiver thread
+        self.finish();
+    }
+
+    fn finish(&mut self) {
+        if let Some(stop_tx) = self.stop_tx.take() {
+            let _ = stop_tx.send(());
+        }
+        // Drop the watcher first so platforms that close the channel promptly
+        // still closes any underlying backend resources before we join.
         drop(self._watcher.take());
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -19,11 +28,7 @@ impl RepoWatchHandle {
 
 impl Drop for RepoWatchHandle {
     fn drop(&mut self) {
-        // Drop the watcher first to close the sender, unblocking the receiver thread
-        drop(self._watcher.take());
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
+        self.finish();
     }
 }
 
@@ -39,10 +44,16 @@ pub fn spawn_repo_watch<F>(root: PathBuf, mut on_event: F) -> Result<RepoWatchHa
 where
     F: FnMut(String) + Send + 'static,
 {
-    let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
+    let (event_tx, event_rx) = crossbeam_channel::unbounded::<notify::Result<Event>>();
+    let (stop_tx, stop_rx) = crossbeam_channel::bounded::<()>(1);
 
-    let mut watcher = RecommendedWatcher::new(tx, notify::Config::default())
-        .map_err(|e| format!("failed to create watcher: {e}"))?;
+    let mut watcher = RecommendedWatcher::new(
+        move |result| {
+            let _ = event_tx.send(result);
+        },
+        notify::Config::default(),
+    )
+    .map_err(|e| format!("failed to create watcher: {e}"))?;
 
     watcher
         .watch(&root, RecursiveMode::Recursive)
@@ -53,44 +64,65 @@ where
     let original_root = root.clone();
     let watch_root = root.canonicalize().unwrap_or(root);
     let thread = std::thread::spawn(move || {
-        for result in rx {
-            let Ok(event) = result else {
-                continue;
-            };
-            if !is_relevant_event(&event.kind) {
-                continue;
-            }
-            // Skip directory-specific events — only report files
-            if is_directory_event(&event.kind) {
-                continue;
-            }
-            for path in &event.paths {
-                if path
-                    .components()
-                    .any(|c| is_ignored_dir_name(c.as_os_str()))
-                {
-                    continue;
-                }
-                // Canonicalize the event path too, since on some platforms
-                // the event path may use a different form than the watch root
-                let canonical_path = path.canonicalize().unwrap_or_else(|_| path.clone());
-                let relative = canonical_path
-                    .strip_prefix(&watch_root)
-                    .or_else(|_| canonical_path.strip_prefix(&original_root));
-                if let Ok(relative) = relative {
-                    let rel_str = relative.display().to_string();
-                    if !rel_str.is_empty() {
-                        on_event(rel_str);
-                    }
-                }
-            }
-        }
+        watch_loop(event_rx, stop_rx, watch_root, original_root, &mut on_event);
     });
 
     Ok(RepoWatchHandle {
         _watcher: Some(watcher),
         thread: Some(thread),
+        stop_tx: Some(stop_tx),
     })
+}
+
+fn watch_loop<F>(
+    event_rx: Receiver<notify::Result<Event>>,
+    stop_rx: Receiver<()>,
+    watch_root: PathBuf,
+    original_root: PathBuf,
+    on_event: &mut F,
+) where
+    F: FnMut(String),
+{
+    loop {
+        crossbeam_channel::select_biased! {
+            recv(stop_rx) -> _ => break,
+            recv(event_rx) -> result => {
+                let Ok(result) = result else {
+                    break;
+                };
+                let Ok(event) = result else {
+                    continue;
+                };
+                if !is_relevant_event(&event.kind) {
+                    continue;
+                }
+                // Skip directory-specific events — only report files
+                if is_directory_event(&event.kind) {
+                    continue;
+                }
+                for path in &event.paths {
+                    if path
+                        .components()
+                        .any(|c| is_ignored_dir_name(c.as_os_str()))
+                    {
+                        continue;
+                    }
+                    // Canonicalize the event path too, since on some platforms
+                    // the event path may use a different form than the watch root
+                    let canonical_path = path.canonicalize().unwrap_or_else(|_| path.clone());
+                    let relative = canonical_path
+                        .strip_prefix(&watch_root)
+                        .or_else(|_| canonical_path.strip_prefix(&original_root));
+                    if let Ok(relative) = relative {
+                        let rel_str = relative.display().to_string();
+                        if !rel_str.is_empty() {
+                            on_event(rel_str);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn is_relevant_event(kind: &EventKind) -> bool {

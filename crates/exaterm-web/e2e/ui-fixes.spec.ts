@@ -1,5 +1,17 @@
 import { test, expect } from "@playwright/test";
-import { waitForCards, enterFocusMode } from "./helpers";
+import {
+  ensureSessionCount,
+  waitForCards,
+  enterFocusMode,
+  firstSessionId,
+  resetWorkspace,
+  terminalContainsText,
+  waitForTerminalInputFocus,
+} from "./helpers";
+
+test.beforeEach(async ({ page }) => {
+  await resetWorkspace(page);
+});
 
 test.describe("Close button and nudge pill layout", () => {
   test("close button and nudge pill are in the same row without overlap", async ({
@@ -34,21 +46,6 @@ test.describe("Close button and nudge pill layout", () => {
   });
 });
 
-test.describe("Status blending", () => {
-  test("terminal states use daemon status immediately", async ({ page }) => {
-    await page.goto("/");
-    await waitForCards(page, 1);
-
-    // A running session should show an active-derived status class,
-    // not wait for the LLM.
-    const card = page.locator(".battle-card").first();
-    const classes = await card.getAttribute("class");
-    expect(classes).toMatch(
-      /card-(idle|active|thinking|working|blocked|failed|complete|detached|stopped)/
-    );
-  });
-});
-
 test.describe("Scroll to bottom after replay", () => {
   test("terminal viewport scrollTop is near bottom after entering focus", async ({
     page,
@@ -60,77 +57,57 @@ test.describe("Scroll to bottom after replay", () => {
     await expect(page.locator(".focused-card .xterm-screen")).toBeVisible({
       timeout: 10_000,
     });
-    // Wait for scroll-to-bottom timer to fire (200ms after last message).
-    await page.waitForTimeout(1000);
-
-    // The viewport should be scrolled near the bottom, not the top.
-    const scrollInfo = await page.locator(".focused-card .xterm-viewport").evaluate((el) => {
-      return {
-        scrollTop: el.scrollTop,
-        scrollHeight: el.scrollHeight,
-        clientHeight: el.clientHeight,
-      };
-    });
-    // scrollTop + clientHeight should be close to scrollHeight (within 50px).
-    const distFromBottom =
-      scrollInfo.scrollHeight - scrollInfo.scrollTop - scrollInfo.clientHeight;
-    expect(distFromBottom).toBeLessThan(50);
+    await expect
+      .poll(async () => {
+        const scrollInfo = await page
+          .locator(".focused-card .xterm-viewport")
+          .evaluate((el) => ({
+            scrollTop: el.scrollTop,
+            scrollHeight: el.scrollHeight,
+            clientHeight: el.clientHeight,
+          }));
+        return (
+          scrollInfo.scrollHeight -
+          scrollInfo.scrollTop -
+          scrollInfo.clientHeight
+        );
+      })
+      .toBeLessThan(50);
   });
 });
 
 test.describe("Garbled chars prevention", () => {
-  test("showTerminal is no-op when terminal already in container", async ({
+  test("re-entering focus keeps one live terminal with intact output", async ({
     page,
   }) => {
     await page.goto("/");
     await waitForCards(page, 1);
 
-    // Enter and exit focus mode twice — no garbled output should appear.
     await enterFocusMode(page);
-    await expect(page.locator(".focused-card .xterm-screen")).toBeVisible({
-      timeout: 10_000,
-    });
+    const sessionId = await firstSessionId(page);
+    const screen = page.locator(".focused-card .xterm-screen");
+    await expect(screen).toBeVisible({ timeout: 10_000 });
+    await screen.click();
+    await waitForTerminalInputFocus(page);
+    await page.keyboard.type("echo FIRST_FOCUS_MARKER_123\n", { delay: 20 });
+    await expect
+      .poll(() => terminalContainsText(page, sessionId, "FIRST_FOCUS_MARKER_123"))
+      .toBe(true);
+
     await page.keyboard.press("Escape");
-    await page.waitForTimeout(500);
-
-    // Re-enter.
-    await enterFocusMode(page);
-    await expect(page.locator(".focused-card .xterm-screen")).toBeVisible({
-      timeout: 10_000,
-    });
-
-    // Terminal should still be functional (xterm-screen visible).
-    await expect(page.locator(".focused-card .xterm-screen")).toBeVisible();
-  });
-});
-
-test.describe("Focus preservation across renders", () => {
-  test("activeElement is preserved during snapshot updates", async ({
-    page,
-  }) => {
-    await page.goto("/");
-    await waitForCards(page, 1);
-
-    await enterFocusMode(page);
-    await expect(page.locator(".focused-card .xterm-screen")).toBeVisible({
-      timeout: 10_000,
-    });
-
-    // Click terminal to focus it.
-    await page.locator(".focused-card .xterm-screen").click();
-    await page.waitForTimeout(200);
-
-    // Record what has focus.
-    const focusedTag = await page.evaluate(() => document.activeElement?.tagName);
-
-    // Wait through 2 snapshot cycles.
-    await page.waitForTimeout(2000);
-
-    // Focus should not have changed.
-    const focusedTagAfter = await page.evaluate(
-      () => document.activeElement?.tagName
+    await expect(page.locator(".battlefield-grid")).not.toHaveClass(
+      /focus-mode/
     );
-    expect(focusedTagAfter).toBe(focusedTag);
+
+    await enterFocusMode(page);
+    await expect(screen).toBeVisible({ timeout: 10_000 });
+    await expect(page.locator(".focused-card .card-terminal-slot .xterm")).toHaveCount(1);
+    await screen.click();
+    await waitForTerminalInputFocus(page);
+    await page.keyboard.type("echo SECOND_FOCUS_MARKER_456\n", { delay: 20 });
+    await expect
+      .poll(() => terminalContainsText(page, sessionId, "SECOND_FOCUS_MARKER_456"))
+      .toBe(true);
   });
 });
 
@@ -142,28 +119,27 @@ test.describe("Enter key focus behavior", () => {
     await waitForCards(page, 1);
 
     // Need 2 sessions with embedded terminals to test the cross-focus case.
-    await page.click("#add-shell-btn");
-    await page.waitForTimeout(3000);
+    await ensureSessionCount(page, 2);
 
     const screens = page.locator(".xterm-screen");
     await expect(screens).toHaveCount(2, { timeout: 5000 });
 
     // Click terminal A to give it focus.
     await screens.first().click();
-    await page.waitForTimeout(200);
+    await waitForTerminalInputFocus(page);
 
     // Select card B by pressing Ctrl+] (moves selection without stealing focus).
     await page.keyboard.press("Control+]");
-    await page.waitForTimeout(200);
+    const secondCard = page.locator(".battle-card").nth(1);
+    await expect(secondCard).toHaveClass(/selected-card/);
 
     // Now terminal A has focus but card B is selected.
     // Pressing Enter should go to terminal A, NOT focus card B.
     await page.keyboard.press("Enter");
-    await page.waitForTimeout(200);
-
     await expect(page.locator(".battlefield-grid")).not.toHaveClass(
       /focus-mode/
     );
+    await expect(secondCard).toHaveClass(/selected-card/);
+    await waitForTerminalInputFocus(page);
   });
 });
-

@@ -1,0 +1,126 @@
+name: Web E2E
+
+on:
+  pull_request:
+    branches:
+      - master
+  push:
+    branches:
+      - master
+  schedule:
+    - cron: "0 4 * * *"
+
+concurrency:
+  group: web-e2e-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  changes:
+    name: Detect web E2E changes
+    runs-on: ubuntu-latest
+    outputs:
+      web_e2e: ${{ steps.set.outputs.web_e2e }}
+    steps:
+      - name: Check out repository
+        if: github.event_name != 'schedule'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect relevant changes
+        id: filter
+        if: github.event_name != 'schedule'
+        run: |
+          base_sha="${{ github.event.pull_request.base.sha || github.event.before }}"
+          head_sha="${{ github.sha }}"
+
+          if [ -z "$base_sha" ] || [ "$base_sha" = "0000000000000000000000000000000000000000" ]; then
+            base_sha="$(git rev-parse HEAD^ 2>/dev/null || true)"
+          fi
+
+          if [ -z "$base_sha" ]; then
+            echo "web_e2e=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          changed_files="$(git diff --name-only "$base_sha" "$head_sha")"
+          if printf '%s\n' "$changed_files" | grep -Eq '^(\\.github/workflows/web-e2e\\.yml|Cargo\\.toml|Cargo\\.lock|crates/exaterm-core/|crates/exaterm-types/|crates/exaterm-web/)'; then
+            echo "web_e2e=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "web_e2e=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set decision
+        id: set
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            echo "web_e2e=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "web_e2e=${{ steps.filter.outputs.web_e2e }}" >> "$GITHUB_OUTPUT"
+          fi
+
+  playwright:
+    name: Playwright (Linux)
+    needs: changes
+    if: needs.changes.outputs.web_e2e == 'true'
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: |
+            crates/exaterm-web/package-lock.json
+            crates/exaterm-web/frontend/package-lock.json
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Cache Playwright browser
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ hashFiles('crates/exaterm-web/package-lock.json') }}
+
+      - name: Install frontend dependencies
+        working-directory: crates/exaterm-web/frontend
+        run: npm ci
+
+      - name: Build exaterm-web
+        run: cargo build --locked -p exaterm-web
+
+      - name: Install Playwright dependencies
+        working-directory: crates/exaterm-web
+        run: npm ci
+
+      - name: Install Playwright browser
+        working-directory: crates/exaterm-web
+        run: npx playwright install --with-deps chromium
+
+      - name: Run Playwright suite
+        working-directory: crates/exaterm-web
+        run: npm run test:e2e:ci
+
+      - name: Upload Playwright report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: |
+            crates/exaterm-web/playwright-report
+            crates/exaterm-web/test-results
+          if-no-files-found: ignore

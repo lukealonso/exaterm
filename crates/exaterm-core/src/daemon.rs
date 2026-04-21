@@ -298,7 +298,9 @@ impl DaemonState {
     ) -> Result<SessionId, String> {
         let idx = self.workspace.sessions().len();
         launch.env.push(("EXATERM_IDX".into(), idx.to_string()));
-        launch.env.push(("EXATERM_IDX_1".into(), (idx + 1).to_string()));
+        launch
+            .env
+            .push(("EXATERM_IDX_1".into(), (idx + 1).to_string()));
         let session_id = self.workspace.add_session(launch.clone());
         self.observations
             .insert(session_id, SessionObservation::new());
@@ -817,7 +819,12 @@ fn handle_client_message(
         } => {
             let current_total = state.workspace.sessions().len();
             if target_total > current_total && supported_terminal_target(target_total) {
-                add_n_terminals(state, source_session, target_total - current_total, control_tx)?;
+                add_n_terminals(
+                    state,
+                    source_session,
+                    target_total - current_total,
+                    control_tx,
+                )?;
             }
             Ok(false)
         }
@@ -834,10 +841,7 @@ fn handle_client_message(
                 let _ = fs::remove_file(&stream.socket_path);
             }
             if let Some(root) = state.session_repo_roots.remove(&session_id) {
-                let still_used = state
-                    .session_repo_roots
-                    .values()
-                    .any(|r| r == &root);
+                let still_used = state.session_repo_roots.values().any(|r| r == &root);
                 if !still_used {
                     if let Some(watch) = state.repo_watches.remove(&root) {
                         watch.handle.stop();
@@ -899,6 +903,7 @@ fn handle_client_message(
             }
         }
         ClientMessage::TerminateWorkspace => {
+            *client_writer = None;
             state.shutdown_workspace();
             Ok(true)
         }
@@ -1778,6 +1783,8 @@ fn drain_wake_socket(reader: &mut UnixStream) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1862,6 +1869,36 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
+    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+        env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    struct EnvVarRestore {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarRestore {
+        fn new(key: &'static str) -> Self {
+            Self {
+                key,
+                previous: std::env::var_os(key),
+            }
+        }
+    }
+
+    impl Drop for EnvVarRestore {
+        fn drop(&mut self) {
+            if let Some(value) = self.previous.take() {
+                std::env::set_var(self.key, value);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
     /// Returns false when Unix socket creation is blocked (e.g. inside the
     /// Claude Code sandbox).  Tests that start a real daemon process or rely
     /// on FSEvents delivery use this as an early-exit guard so `cargo test`
@@ -1904,10 +1941,47 @@ mod tests {
         }
     }
 
+    fn write_fake_shell(runtime_dir: &PathBuf) -> PathBuf {
+        fs::create_dir_all(runtime_dir).expect("create fake shell dir");
+        let shell_path = runtime_dir.join("fake-shell.sh");
+        fs::write(&shell_path, "#!/bin/sh\nexit 0\n").expect("write fake shell");
+        let mut perms = fs::metadata(&shell_path)
+            .expect("shell metadata")
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&shell_path, perms).expect("chmod fake shell");
+        shell_path
+    }
+
     fn read_server_message(reader: &mut BufReader<UnixStream>) -> ServerMessage {
         let mut line = String::new();
         reader.read_line(&mut line).expect("read daemon message");
         serde_json::from_str(line.trim()).expect("parse daemon message")
+    }
+
+    fn configure_test_reader(stream: &UnixStream) -> BufReader<UnixStream> {
+        let reader_stream = stream.try_clone().expect("clone stream");
+        reader_stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("set read timeout");
+        BufReader::new(reader_stream)
+    }
+
+    fn join_thread_before_timeout<T>(
+        handle: thread::JoinHandle<T>,
+        label: &str,
+        timeout: Duration,
+    ) -> T {
+        let deadline = Instant::now() + timeout;
+        while !handle.is_finished() {
+            assert!(
+                Instant::now() < deadline,
+                "{label} did not finish within {}s",
+                timeout.as_secs()
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        handle.join().unwrap_or_else(|_| panic!("{label} panicked"))
     }
 
     #[test]
@@ -1920,9 +1994,12 @@ mod tests {
 
     #[test]
     fn socket_paths_use_override_runtime_dir() {
-        let _guard = env_lock().lock().expect("env lock");
+        let _guard = lock_env();
+        let _runtime_guard = EnvVarRestore::new("EXATERM_RUNTIME_DIR");
+        let _workspace_guard = EnvVarRestore::new("EXATERM_WORKSPACE");
         let runtime_dir = unique_runtime_dir("socket");
         std::env::set_var("EXATERM_RUNTIME_DIR", &runtime_dir);
+        std::env::remove_var("EXATERM_WORKSPACE");
         let control_path = control_socket_path().expect("control socket path");
         assert_eq!(
             control_path,
@@ -1932,7 +2009,6 @@ mod tests {
             session_raw_socket_path("session-7-stream.sock").expect("session raw socket path"),
             runtime_dir.join("exaterm").join("session-7-stream.sock")
         );
-        std::env::remove_var("EXATERM_RUNTIME_DIR");
     }
 
     #[test]
@@ -1940,9 +2016,17 @@ mod tests {
         if !can_bind_unix_sockets() {
             return;
         }
-        let _guard = env_lock().lock().expect("env lock");
+        let _guard = lock_env();
+        let _runtime_guard = EnvVarRestore::new("EXATERM_RUNTIME_DIR");
+        let _workspace_guard = EnvVarRestore::new("EXATERM_WORKSPACE");
+        let _shell_guard = EnvVarRestore::new("SHELL");
+        let _shell_mode_guard = EnvVarRestore::new("EXATERM_SHELL_MODE");
         let runtime_dir = unique_runtime_dir("daemon-flow");
+        let fake_shell = write_fake_shell(&runtime_dir);
         std::env::set_var("EXATERM_RUNTIME_DIR", &runtime_dir);
+        std::env::remove_var("EXATERM_WORKSPACE");
+        std::env::set_var("SHELL", &fake_shell);
+        std::env::remove_var("EXATERM_SHELL_MODE");
 
         let handle = thread::spawn(run_local_daemon_inner);
 
@@ -1958,8 +2042,7 @@ mod tests {
                 Err(error) => panic!("failed to connect daemon: {error}"),
             }
         };
-        let reader_stream = stream.try_clone().expect("clone stream");
-        let mut reader = BufReader::new(reader_stream);
+        let mut reader = configure_test_reader(&stream);
 
         write_json_line(&mut stream, &ClientMessage::AttachClient).expect("attach client");
         match read_server_message(&mut reader) {
@@ -1978,12 +2061,16 @@ mod tests {
         assert_eq!(snapshot.sessions.len(), 1);
         assert_eq!(snapshot.sessions[0].record.launch.name, "Shell 1");
 
+        drop(reader);
         write_json_line(&mut stream, &ClientMessage::TerminateWorkspace).expect("terminate");
         drop(stream);
-        let result = handle.join().expect("daemon thread should join");
+        let result = join_thread_before_timeout(
+            handle,
+            "daemon thread should join",
+            Duration::from_secs(20),
+        );
         assert!(result.is_ok(), "daemon should exit cleanly: {result:?}");
 
-        std::env::remove_var("EXATERM_RUNTIME_DIR");
         let _ = fs::remove_dir_all(runtime_dir);
     }
 
@@ -1992,9 +2079,17 @@ mod tests {
         if !can_bind_unix_sockets() {
             return;
         }
-        let _guard = env_lock().lock().expect("env lock");
+        let _guard = lock_env();
+        let _runtime_guard = EnvVarRestore::new("EXATERM_RUNTIME_DIR");
+        let _workspace_guard = EnvVarRestore::new("EXATERM_WORKSPACE");
+        let _shell_guard = EnvVarRestore::new("SHELL");
+        let _shell_mode_guard = EnvVarRestore::new("EXATERM_SHELL_MODE");
         let runtime_dir = unique_runtime_dir("daemon-reject");
+        let fake_shell = write_fake_shell(&runtime_dir);
         std::env::set_var("EXATERM_RUNTIME_DIR", &runtime_dir);
+        std::env::remove_var("EXATERM_WORKSPACE");
+        std::env::set_var("SHELL", &fake_shell);
+        std::env::remove_var("EXATERM_SHELL_MODE");
 
         let handle = thread::spawn(run_local_daemon_inner);
 
@@ -2013,7 +2108,7 @@ mod tests {
         write_json_line(&mut first, &ClientMessage::AttachClient).expect("attach first");
 
         let second = UnixStream::connect(&control_path).expect("connect second");
-        let mut second_reader = BufReader::new(second);
+        let mut second_reader = configure_test_reader(&second);
         match read_server_message(&mut second_reader) {
             ServerMessage::Error { message } => {
                 assert!(message.contains("already attached"));
@@ -2023,10 +2118,13 @@ mod tests {
 
         write_json_line(&mut first, &ClientMessage::TerminateWorkspace).expect("terminate");
         drop(first);
-        let result = handle.join().expect("daemon thread should join");
+        let result = join_thread_before_timeout(
+            handle,
+            "daemon thread should join",
+            Duration::from_secs(20),
+        );
         assert!(result.is_ok(), "daemon should exit cleanly: {result:?}");
 
-        std::env::remove_var("EXATERM_RUNTIME_DIR");
         let _ = fs::remove_dir_all(runtime_dir);
     }
 

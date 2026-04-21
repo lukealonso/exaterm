@@ -9,15 +9,24 @@ use std::sync::Arc;
 
 #[tokio::main]
 async fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--beachhead-daemon") {
+        let code = exaterm_core::run_local_daemon();
+        std::process::exit(if code == std::process::ExitCode::SUCCESS {
+            0
+        } else {
+            1
+        });
+    }
     let opts = parse_args();
     let relay = Arc::new(DaemonRelay::start());
+    let enable_test_hooks = std::env::var_os("EXATERM_ENABLE_TEST_HOOKS").is_some();
     if !opts.bind.ip().is_loopback() {
         eprintln!("WARNING: binding to non-localhost address {}. The web UI has no authentication — anyone who can reach this address gets full terminal access.", opts.bind.ip());
     }
     if opts.dev_assets.is_some() {
         eprintln!("dev mode: serving assets from filesystem");
     }
-    let router = routes::build_router(relay, opts.dev_assets);
+    let router = routes::build_router(relay, opts.dev_assets, enable_test_hooks);
     let listener = tokio::net::TcpListener::bind(opts.bind)
         .await
         .unwrap_or_else(|e| {

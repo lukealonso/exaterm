@@ -2,10 +2,28 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import type { ClientMessage, SessionSnapshot } from "./protocol";
 
+interface ExatermTestHooks {
+  clearTerminalSelection(sessionId: number): boolean;
+  connectionState(sessionId: number): number | null;
+  terminalContainsText(sessionId: number, needle: string): boolean;
+  terminalTextCenter(
+    sessionId: number,
+    needle: string
+  ): { x: number; y: number } | null;
+  selectTerminalText(sessionId: number, needle: string): boolean;
+}
+
+declare global {
+  interface Window {
+    __EXATERM_TEST__?: ExatermTestHooks;
+  }
+}
+
 export interface ManagedTerminal {
   sessionId: number;
   term: Terminal;
   fit: FitAddon;
+  wrapper: HTMLElement;
   ws: WebSocket;
   resizeObserver: ResizeObserver | null;
   /** When false, the stream WebSocket will not reconnect on close. */
@@ -16,6 +34,119 @@ const terminals = new Map<number, ManagedTerminal>();
 
 let sendCommand: ((cmd: ClientMessage) => void) | null = null;
 let syncInputsEnabled = false;
+
+function findBufferText(term: Terminal, needle: string): { column: number; row: number } | null {
+  const buffer = term.buffer.active;
+  for (let row = 0; row < buffer.length; row++) {
+    const line = buffer.getLine(row);
+    const text = line?.translateToString(true) ?? "";
+    const column = text.indexOf(needle);
+    if (column >= 0) {
+      return { column, row };
+    }
+  }
+  return null;
+}
+
+function installTestHooks() {
+  window.__EXATERM_TEST__ = {
+    clearTerminalSelection(sessionId) {
+      const managed = terminals.get(sessionId);
+      if (!managed) return false;
+      managed.term.clearSelection();
+      return true;
+    },
+    connectionState(sessionId) {
+      return terminals.get(sessionId)?.ws.readyState ?? null;
+    },
+    selectTerminalText(sessionId, needle) {
+      const managed = terminals.get(sessionId);
+      if (!managed) return false;
+      const location = findBufferText(managed.term, needle);
+      if (!location) return false;
+      managed.term.select(location.column, location.row, needle.length);
+      return true;
+    },
+    terminalContainsText(sessionId, needle) {
+      const managed = terminals.get(sessionId);
+      if (!managed) return false;
+      return findBufferText(managed.term, needle) !== null;
+    },
+    terminalTextCenter(sessionId, needle) {
+      const managed = terminals.get(sessionId);
+      if (!managed) return null;
+      const location = findBufferText(managed.term, needle);
+      if (!location) return null;
+      const screen = managed.term.element?.querySelector(".xterm-screen");
+      if (!(screen instanceof HTMLElement)) return null;
+      const rect = screen.getBoundingClientRect();
+      const visibleRow = location.row - managed.term.buffer.active.viewportY;
+      if (visibleRow < 0 || visibleRow >= managed.term.rows) return null;
+      return {
+        x: rect.left + ((location.column + needle.length / 2) / managed.term.cols) * rect.width,
+        y: rect.top + ((visibleRow + 0.5) / managed.term.rows) * rect.height,
+      };
+    },
+  };
+}
+
+function testHooksEnabled(): boolean {
+  return document.body?.dataset.exatermTestHooks === "true";
+}
+
+if (testHooksEnabled()) {
+  installTestHooks();
+}
+
+/**
+ * Copy text to the clipboard, falling back to execCommand when the async
+ * Clipboard API is unavailable (non-secure contexts: plain HTTP to a
+ * non-loopback host, common when accessing the web UI over a LAN).
+ */
+export function copyToClipboard(text: string): Promise<boolean> {
+  if (!text) return Promise.resolve(false);
+  return writeClipboardText(text);
+}
+
+async function writeClipboardText(text: string): Promise<boolean> {
+  if (navigator.clipboard && window.isSecureContext) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch {
+      return execCommandCopy(text);
+    }
+  }
+  return execCommandCopy(text);
+}
+
+function execCommandCopy(text: string): boolean {
+  const previousFocus =
+    document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.top = "-1000px";
+  textarea.style.opacity = "0";
+  document.body.appendChild(textarea);
+  textarea.select();
+  let ok = false;
+  try {
+    ok = document.execCommand("copy");
+  } catch {
+    ok = false;
+  }
+  document.body.removeChild(textarea);
+  if (previousFocus && previousFocus !== document.body && previousFocus.isConnected) {
+    try {
+      previousFocus.focus({ preventScroll: true });
+    } catch {
+      previousFocus.focus();
+    }
+  }
+  return ok;
+}
 
 export function setSendCommand(fn: (cmd: ClientMessage) => void) {
   sendCommand = fn;
@@ -64,13 +195,9 @@ export function attachTerminal(
 ): ManagedTerminal {
   const existing = terminals.get(session.record.id);
   if (existing) {
-    const wrapper = container.querySelector(".xterm-wrapper");
-    if (existing.term.element && existing.term.element.parentElement !== wrapper) {
+    if (existing.wrapper.parentElement !== container) {
       container.innerHTML = "";
-      const newWrapper = document.createElement("div");
-      newWrapper.className = "xterm-wrapper";
-      container.appendChild(newWrapper);
-      newWrapper.appendChild(existing.term.element);
+      container.appendChild(existing.wrapper);
       existing.fit.fit();
     }
     return existing;
@@ -88,17 +215,72 @@ export function attachTerminal(
     fontFamily: "'Cascadia Code', 'Fira Code', 'JetBrains Mono', monospace",
     scrollback: 100_000,
     scrollOnUserInput: true,
+    // Let Mac users bypass app mouse tracking with Option+drag (xterm.js
+    // already bypasses it on Shift+drag on all platforms). TUIs like
+    // Claude Code enable mouse reporting, which otherwise eats the drag.
+    macOptionClickForcesSelection: true,
     theme: {
       background: "#070d14",
       foreground: "#e2e8f0",
       cursor: "#e2e8f0",
-      selectionBackground: "rgba(96, 165, 250, 0.3)",
+      selectionBackground: "rgba(96, 165, 250, 0.55)",
+      selectionInactiveBackground: "rgba(96, 165, 250, 0.35)",
     },
   });
   const fit = new FitAddon();
   term.loadAddon(fit);
   term.open(wrapper);
   fit.fit();
+
+  // OSC 52 clipboard passthrough. When a TUI inside the session (tmux,
+  // vim, helix, ...) is configured to emit OSC 52 on copy, xterm.js forwards
+  // the sequence here and we write the decoded payload to the browser
+  // clipboard. This is the only reliable path to the system clipboard when
+  // the selection is captured by the guest app (e.g. `tmux set -g mouse on`
+  // with `set -g set-clipboard on`). We deliberately ignore queries
+  // (payload === "?") so remote code can't exfiltrate clipboard contents.
+  term.parser.registerOscHandler(52, (data) => {
+    // data looks like `<targets>;<base64>` — e.g. `c;SGVsbG8=`.
+    const semi = data.indexOf(";");
+    if (semi < 0) return false;
+    const payload = data.slice(semi + 1);
+    if (payload === "?") return true; // refuse reads, but claim handled
+    if (payload === "") {
+      void writeClipboardText("").then((ok) => {
+        if (!ok) {
+          console.debug("OSC 52 clipboard clear was refused by the browser", {
+            secureContext: window.isSecureContext,
+            documentHasFocus: document.hasFocus(),
+          });
+        }
+      });
+      return true;
+    }
+    let text: string;
+    try {
+      text = atob(payload);
+    } catch {
+      return false;
+    }
+    // atob yields a binary string; decode as UTF-8.
+    try {
+      const bytes = Uint8Array.from(text, (ch) => ch.charCodeAt(0));
+      text = new TextDecoder("utf-8").decode(bytes);
+    } catch {
+      // Fall back to the raw binary string if decoding fails.
+    }
+    void writeClipboardText(text).then((ok) => {
+      if (!ok) {
+        console.debug("OSC 52 clipboard write was refused by the browser", {
+          secureContext: window.isSecureContext,
+          documentHasFocus: document.hasFocus(),
+        });
+      }
+    });
+    return true;
+  });
+
+  const sid = session.record.id;
 
   // Send initial terminal size to the daemon immediately after fit.
   // Browsers don't guarantee a ResizeObserver callback on first attach,
@@ -115,12 +297,11 @@ export function attachTerminal(
   // Auto-copy on select (matches GTK's connect_selection_changed behavior).
   term.onSelectionChange(() => {
     if (term.hasSelection()) {
-      navigator.clipboard.writeText(term.getSelection()).catch(() => {});
+      void copyToClipboard(term.getSelection());
     }
   });
 
   // Stream WebSocket with auto-reconnect.
-  const sid = session.record.id;
   let ws: WebSocket = connectStream(sid, term);
   let reconnecting = false;
 
@@ -194,6 +375,7 @@ export function attachTerminal(
     sessionId: session.record.id,
     term,
     fit,
+    wrapper,
     ws,
     resizeObserver,
     live: true,
@@ -208,15 +390,9 @@ export function hideTerminal(sessionId: number) {
   if (!managed) return;
   managed.resizeObserver?.disconnect();
   managed.resizeObserver = null;
-  // Move the xterm element out of the visible DOM into a hidden holder.
-  if (managed.term.element) {
-    if (!hiddenHolder) {
-      hiddenHolder = document.createElement("div");
-      hiddenHolder.style.display = "none";
-      document.body.appendChild(hiddenHolder);
-    }
-    hiddenHolder.appendChild(managed.term.element);
-  }
+  managed.term.clearSelection();
+  managed.term.blur();
+  managed.wrapper.style.display = "none";
 }
 
 /** Re-show a hidden terminal in a container. */
@@ -225,22 +401,21 @@ export function showTerminal(sessionId: number, container: HTMLElement) {
   if (!managed) return;
 
   // If the terminal is already in this container, do nothing.
-  const existingWrapper = container.querySelector(".xterm-wrapper");
-  if (existingWrapper && managed.term.element?.parentElement === existingWrapper) {
+  if (
+    managed.wrapper.parentElement === container &&
+    managed.wrapper.style.display !== "none"
+  ) {
     return;
   }
 
-  // Ensure the container has a wrapper.
-  let wrapper = existingWrapper as HTMLElement | null;
-  if (!wrapper) {
-    container.innerHTML = "";
-    wrapper = document.createElement("div");
-    wrapper.className = "xterm-wrapper";
-    container.appendChild(wrapper);
+  if (managed.wrapper.parentElement !== container) {
+    container.replaceChildren(managed.wrapper);
+  } else {
+    container
+      .querySelectorAll(".card-scrollback-text, .card-scrollback-empty")
+      .forEach((node) => node.remove());
   }
-  if (managed.term.element) {
-    wrapper.appendChild(managed.term.element);
-  }
+  managed.wrapper.style.display = "";
   // Re-attach resize observer.
   let resizeTimer: ReturnType<typeof setTimeout> | null = null;
   const ro = new ResizeObserver(() => {
@@ -264,12 +439,10 @@ export function showTerminal(sessionId: number, container: HTMLElement) {
   requestAnimationFrame(() => {
     requestAnimationFrame(() => {
       managed.fit.fit();
-      ro.observe(wrapper!);
+      ro.observe(managed.wrapper);
     });
   });
 }
-
-let hiddenHolder: HTMLElement | null = null;
 
 /** Stop reconnecting the stream WebSocket for a dead session.
  *  The terminal stays in the map (scrollback preserved) until detached. */
@@ -286,4 +459,3 @@ export function detachTerminal(sessionId: number) {
   managed.term.dispose();
   terminals.delete(sessionId);
 }
-
