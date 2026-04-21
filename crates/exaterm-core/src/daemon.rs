@@ -1995,8 +1995,11 @@ mod tests {
     #[test]
     fn socket_paths_use_override_runtime_dir() {
         let _guard = lock_env();
+        let _runtime_guard = EnvVarRestore::new("EXATERM_RUNTIME_DIR");
+        let _workspace_guard = EnvVarRestore::new("EXATERM_WORKSPACE");
         let runtime_dir = unique_runtime_dir("socket");
         std::env::set_var("EXATERM_RUNTIME_DIR", &runtime_dir);
+        std::env::remove_var("EXATERM_WORKSPACE");
         let control_path = control_socket_path().expect("control socket path");
         assert_eq!(
             control_path,
@@ -2006,7 +2009,6 @@ mod tests {
             session_raw_socket_path("session-7-stream.sock").expect("session raw socket path"),
             runtime_dir.join("exaterm").join("session-7-stream.sock")
         );
-        std::env::remove_var("EXATERM_RUNTIME_DIR");
     }
 
     #[test]
@@ -2016,11 +2018,13 @@ mod tests {
         }
         let _guard = lock_env();
         let _runtime_guard = EnvVarRestore::new("EXATERM_RUNTIME_DIR");
+        let _workspace_guard = EnvVarRestore::new("EXATERM_WORKSPACE");
         let _shell_guard = EnvVarRestore::new("SHELL");
         let _shell_mode_guard = EnvVarRestore::new("EXATERM_SHELL_MODE");
         let runtime_dir = unique_runtime_dir("daemon-flow");
         let fake_shell = write_fake_shell(&runtime_dir);
         std::env::set_var("EXATERM_RUNTIME_DIR", &runtime_dir);
+        std::env::remove_var("EXATERM_WORKSPACE");
         std::env::set_var("SHELL", &fake_shell);
         std::env::remove_var("EXATERM_SHELL_MODE");
 
@@ -2077,11 +2081,13 @@ mod tests {
         }
         let _guard = lock_env();
         let _runtime_guard = EnvVarRestore::new("EXATERM_RUNTIME_DIR");
+        let _workspace_guard = EnvVarRestore::new("EXATERM_WORKSPACE");
         let _shell_guard = EnvVarRestore::new("SHELL");
         let _shell_mode_guard = EnvVarRestore::new("EXATERM_SHELL_MODE");
         let runtime_dir = unique_runtime_dir("daemon-reject");
         let fake_shell = write_fake_shell(&runtime_dir);
         std::env::set_var("EXATERM_RUNTIME_DIR", &runtime_dir);
+        std::env::remove_var("EXATERM_WORKSPACE");
         std::env::set_var("SHELL", &fake_shell);
         std::env::remove_var("EXATERM_SHELL_MODE");
 
