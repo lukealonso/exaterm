@@ -55,13 +55,14 @@ Exaterm should unfold naturally from a familiar terminal experience.
 That means:
 - the app should launch into a real terminal, not an empty dashboard
 - low-density layouts should feel close to a normal terminal workflow
-- higher-density layouts may compress into supervision cards and scrollback
-- the transition should feel like progressive abstraction, not mode-switch whiplash
+- higher-density layouts should keep terminal sessions as terminal tiles
+- supervised groups may appear as cards, but ordinary terminals should not collapse into cards or scrollback previews
+- the transition should feel like progressive organization, not mode-switch whiplash
 
 The design target is:
 - 1 session: full terminal-first
 - 2 sessions: still terminal-first if viable
-- higher density: adaptive mix of real terminals and supervisory cards depending on space
+- higher density: fixed grid of real terminals plus supervised group cards when groups exist
 
 Exaterm should feel like a normal terminal first and only gradually reveal more supervision structure as density rises.
 
@@ -92,19 +93,16 @@ The deterministic substrate owns:
 - generic activity baselines
 
 The model layer may refine and classify:
-- thinking vs working
-- idle vs stopped vs blocked vs complete
-- momentum
-- risk posture
-- one short operator-facing headline
-- auto-nudge text
+- Ctrl-K terminal command suggestions
+- supervisor-authored group summaries
+- supervisor-authored worker messages
 
 The model must not be used as an excuse to skip building good observability.
 
 State semantics matter:
-- `idle` means there is no meaningful active goal to resume; there is nothing to nudge
-- `stopped` means the agent has unnecessarily paused after a coherent pass and a nudge may help
-- `blocked` means human intervention is actually required; a nudge or simple continue will not fix it
+- `idle` means no meaningful terminal activity has been observed recently
+- `stopped` means a supervisor or operator may need to inspect whether the agent paused unnecessarily
+- `blocked` means human intervention is actually required
 - `complete` means the task is genuinely done
 
 ### 5. Honest Degradation Matters
@@ -118,9 +116,9 @@ Examples:
 
 ## UX Rules
 
-### Cards
+### Supervised Group Cards
 
-Battlefield cards should be:
+Supervised group cards should be:
 - consistent in structure
 - fast to scan
 - minimal in wording
@@ -134,18 +132,17 @@ Avoid:
 
 Preferred card hierarchy:
 - identity
-- state
-- one short operator-facing headline
-- a few concrete evidence lines
-- stable metric locations
+- current Markdown summary
+- recent supervisor actions
+- supervisor terminal toggle
 
 ### Focus and Intervention
 
 Intervention should feel direct.
 
 Rules:
-- if a card is already showing a live terminal, interacting with it should stay in place
-- focused mode should still feel like the same session/card system, not a different product
+- if a tile is showing a live terminal, interacting with it should stay in place
+- do not reintroduce a separate focus mode or top-rail card system
 - avoid obvious or repetitive instructional chrome when the interaction is already clear
 
 ### Idleness and Stoppage
@@ -153,20 +150,16 @@ Rules:
 `idle` and `stopped` are distinct and should stay distinct.
 
 Rules:
-- `idle` is passive, muted, and not nudgeable
-- `stopped` is the nudgeable paused state and should be more attention-grabbing than idle
+- `idle` is passive and muted
+- `stopped` is a paused state that deserves more attention than idle
 - `blocked` is more severe than `stopped`
 - do not confuse quiet repaint churn or a checkpoint pause with healthy active work
 
-### Auto-Nudge
+### Direct Assistance
 
-Auto-nudge is an assistive feature, not a spam machine.
-
-Rules:
-- only fire for LLM-determined `stopped` states
-- only for sessions that actually look like coding agents
-- use cooldowns
-- prefer no nudge over a bad nudge
+Operator assistance should be explicit. Ctrl-K may ask for a command to insert
+at the active terminal prompt, and supervisors may send direct messages through
+the group protocol, but the app should not run hidden auto-nudge loops.
 
 ## Architecture Guidance
 

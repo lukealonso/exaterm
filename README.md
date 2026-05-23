@@ -8,7 +8,7 @@ The current build is Linux-first and still moving quickly, but the core shape is
 - real terminal sessions, not fake transcript widgets
 - a battlefield view that scales from one terminal upward
 - lightweight LLM-backed headlines and status signals for each session
-- a persistent beachhead daemon behind the UI so sessions can outlive the window
+- a host session service behind the UI so sessions can outlive the window
 
 ## What It Feels Like
 
@@ -33,7 +33,7 @@ Exaterm is split into several crates:
   - headless daemon-side logic
   - observation, synthesis, daemon runtime, process/file inspection, protocol handling
 - `crates/exatermd`
-  - the headless beachhead daemon
+  - the headless host session service
   - owns PTYs, session state, summaries, and nudging
 - `crates/exaterm-ui`
   - shared UI model
@@ -45,28 +45,29 @@ Exaterm is split into several crates:
   - browser-based web UI (axum + TypeScript/xterm.js)
   - connects to the daemon over Unix sockets, serves a single-page app with WebSocket relay
 
-The UI is intended to always be beachhead-backed in normal operation.
+The UI is intended to connect to a host session service in normal operation.
 
-Locally, the client talks to the beachhead over Unix domain sockets:
+Locally, the client talks to the session service over Unix domain sockets:
 - one control socket for snapshots, commands, lifecycle, and model state
 - one raw PTY byte socket per live session
 
-The remote path uses the same beachhead protocol over SSH-forwarded Unix sockets.
+The remote path uses the same session protocol over SSH-forwarded Unix sockets.
 
 ## Current Status
 
 This is a working prototype, not a polished release.
 
 What works well right now:
-- low-latency terminal interaction through the beachhead
+- low-latency terminal interaction through host sessions
 - local persistent daemon-backed sessions
 - terminal-native VTE rendering
-- battlefield/focus layouts for supervising multiple sessions
-- LLM-backed summaries, naming, and auto-nudge behavior
-- remote beachhead sessions over SSH in an experimental but working form
+- fixed-grid terminal layouts for supervising multiple sessions
+- supervised group cards with Markdown summaries and supervisor-terminal toggles
+- Ctrl-K terminal assist
+- remote hosts over SSH in an experimental but working form
 
 What is still evolving:
-- remote beachhead bootstrap and packaging
+- remote session bootstrap and packaging
 - portability beyond Linux
 - session lifecycle UX
 - packaging/distribution
@@ -81,7 +82,7 @@ You’ll need:
 
 The exact package names depend on distro.
 
-Exaterm also uses the OpenAI API for summaries, naming, and nudges.
+Exaterm can use OpenAI for Ctrl-K terminal assist.
 
 On macOS, initialize the SwiftTerm submodule before building:
 
@@ -90,27 +91,19 @@ git submodule update --init --recursive
 ```
 
 Required:
-- `OPENAI_API_KEY`
+- no model credential is required to run the app
 
-Optional overrides:
-- `EXATERM_OPENAI_BASE_URL`
-  - preferred base URL override for an OpenAI-compatible API endpoint
-- `OPENAI_BASE_URL`
-  - fallback base URL override if `EXATERM_OPENAI_BASE_URL` is not set
-- `EXATERM_SUMMARY_MODEL`
-  - model override for session summaries
-- `EXATERM_NAMING_MODEL`
-  - model override for session naming
-- `EXATERM_NUDGE_MODEL`
-  - model override for auto-nudges
+Configuration:
+- open the launcher Settings panel before choosing a workspace
+- leave the terminal audible bell disabled, or enable it there if wanted
+- set the OpenAI API key, base URL, and Ctrl-K model there
+- the default base URL is `https://api.openai.com/v1`
+- the default Ctrl-K model is `gpt-5.5-nano`
+- settings are stored in the Exaterm application config file at `$XDG_CONFIG_HOME/exaterm/config.json`, or `~/.config/exaterm/config.json`
 
 Notes:
-- `OPENAI_*` is used for the API key and compatible base URL
-- model overrides are Exaterm-specific: `EXATERM_SUMMARY_MODEL`, `EXATERM_NAMING_MODEL`, and `EXATERM_NUDGE_MODEL`
-- if neither base URL variable is set, Exaterm uses `https://api.openai.com/v1`
 - Exaterm appends `/chat/completions` automatically when needed
-- these variables can also be provided in a repo-local `.env` file
-- without `OPENAI_API_KEY`, the app still runs, but summaries, naming, and nudges stay disabled
+- without an OpenAI API key in application settings, the app still runs, but Ctrl-K terminal assist is unavailable
 
 ## Building
 
@@ -144,8 +137,8 @@ Local:
 make run
 ```
 
-That launches the native frontend for your platform and connects to a local
-beachhead, spawning one if needed.
+That launches the native frontend for your platform and connects to local
+host sessions, starting the service if needed.
 
 You can also run the daemon directly:
 
@@ -165,7 +158,7 @@ The intended direction is:
 - copy a Linux `exatermd` to the remote host
 - launch it remotely
 - forward its Unix sockets back over SSH
-- keep the UI talking to the same beachhead protocol it uses locally
+- keep the UI talking to the same session protocol it uses locally
 
 If you are on macOS, use `exaterm-macos` instead of `exaterm-gtk`.
 
@@ -173,7 +166,7 @@ Treat this as in-progress rather than finished product UX.
 
 ## Web UI
 
-The web UI is a browser-based alternative to the GTK app. It connects to the same beachhead daemon and presents the same battle cards, terminal output, and autonudge controls — just in a browser tab instead of a native window.
+The web UI is a browser-based alternative to the GTK app. It connects to the same host session service, but it is not the primary platform and may lag the Linux GTK surface.
 
 ### Running locally
 
