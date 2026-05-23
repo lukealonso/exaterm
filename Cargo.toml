@@ -7,6 +7,7 @@ members = [
     "crates/exaterm-macos",
     "crates/exaterm-swiftterm",
     "crates/exatermd",
+    "crates/exaterm",
     "crates/exaterm-web",
 ]
 default-members = [
@@ -17,5 +18,6 @@ default-members = [
     "crates/exaterm-macos",
     "crates/exaterm-swiftterm",
     "crates/exatermd",
+    "crates/exaterm",
 ]
 resolver = "2"

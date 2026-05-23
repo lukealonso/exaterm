@@ -342,9 +342,8 @@ impl WorkspaceStore {
 #[cfg(test)]
 mod tests {
     use super::{
-        SessionStatus, WorkspaceStore, blocking_prompt_launch, launch_argv,
-        preferred_user_shell_args, session_status_hint, shell_launch, ssh_shell_launch,
-        user_shell_launch,
+        blocking_prompt_launch, launch_argv, preferred_user_shell_args, session_status_hint,
+        shell_launch, ssh_shell_launch, user_shell_launch, SessionStatus, WorkspaceStore,
     };
 
     #[test]
@@ -359,10 +358,9 @@ mod tests {
     fn shell_launch_uses_banner_script() {
         let launch = shell_launch("Smoke", "shell", "hello from smoke");
         let argv = launch_argv(&launch);
-        assert!(
-            argv.last()
-                .is_some_and(|arg| arg.contains("hello from smoke"))
-        );
+        assert!(argv
+            .last()
+            .is_some_and(|arg| arg.contains("hello from smoke")));
     }
 
     #[test]

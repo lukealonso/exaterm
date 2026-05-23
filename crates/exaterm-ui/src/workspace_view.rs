@@ -1,26 +1,18 @@
-use exaterm_types::model::{SessionEvent, SessionId, SessionLaunch, SessionRecord, SessionStatus};
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PresentationMode {
-    Battlefield,
-    Focused(SessionId),
-}
-
-impl Default for PresentationMode {
-    fn default() -> Self {
-        Self::Battlefield
-    }
-}
+use exaterm_types::model::{
+    GroupId, SessionEvent, SessionId, SessionLaunch, SessionRecord, SessionStatus,
+    SupervisedGroupRecord, WorkspaceItem,
+};
 
 #[derive(Debug, Default)]
 pub struct WorkspaceViewState {
     next_session_id: u32,
     next_event_sequence: u64,
     sessions: Vec<SessionRecord>,
+    groups: Vec<SupervisedGroupRecord>,
+    item_order: Vec<WorkspaceItem>,
     session_order: Vec<SessionId>,
     selected_session: Option<SessionId>,
-    focused_terminal: Option<SessionId>,
-    presentation_mode: PresentationMode,
+    selected_workspace_item: Option<WorkspaceItem>,
 }
 
 impl WorkspaceViewState {
@@ -30,8 +22,7 @@ impl WorkspaceViewState {
 
     pub fn replace_sessions(&mut self, sessions: Vec<SessionRecord>) {
         let previous_selected = self.selected_session;
-        let previous_focus = self.focused_terminal;
-        let previous_presentation = self.presentation_mode;
+        let previous_selected_item = self.selected_workspace_item;
 
         self.next_session_id = sessions
             .iter()
@@ -46,6 +37,7 @@ impl WorkspaceViewState {
             .unwrap_or(0)
             .saturating_add(1);
         self.sessions = sessions;
+        self.groups.clear();
 
         // Maintain session_order: prune removed, append new.
         self.session_order
@@ -55,6 +47,12 @@ impl WorkspaceViewState {
                 self.session_order.push(session.id);
             }
         }
+        self.item_order = self
+            .session_order
+            .iter()
+            .copied()
+            .map(WorkspaceItem::Session)
+            .collect();
 
         self.selected_session = previous_selected
             .filter(|session_id| {
@@ -63,19 +61,58 @@ impl WorkspaceViewState {
                     .any(|session| session.id == *session_id)
             })
             .or_else(|| self.sessions.first().map(|session| session.id));
-        self.focused_terminal = previous_focus.filter(|session_id| {
-            self.sessions
-                .iter()
-                .any(|session| session.id == *session_id)
-        });
-        self.presentation_mode = match previous_presentation {
-            PresentationMode::Focused(session_id)
-                if self.sessions.iter().any(|session| session.id == session_id) =>
-            {
-                PresentationMode::Focused(session_id)
+        self.selected_workspace_item = previous_selected_item
+            .filter(|item| self.item_exists(*item))
+            .or_else(|| self.ordered_visible_items().first().copied())
+            .or_else(|| self.selected_session.map(WorkspaceItem::Session));
+    }
+
+    pub fn replace_workspace(
+        &mut self,
+        sessions: Vec<SessionRecord>,
+        groups: Vec<SupervisedGroupRecord>,
+        items: Vec<WorkspaceItem>,
+    ) {
+        let previous_selected = self.selected_session;
+        let previous_selected_item = self.selected_workspace_item;
+
+        self.next_session_id = sessions
+            .iter()
+            .map(|session| session.id.0)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        self.next_event_sequence = sessions
+            .iter()
+            .flat_map(|session| session.events.iter().map(|event| event.sequence))
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        self.sessions = sessions;
+        self.groups = groups;
+        self.item_order = self.valid_item_order(items);
+
+        self.session_order = self
+            .item_order
+            .iter()
+            .filter_map(|item| match item {
+                WorkspaceItem::Session(session_id) => Some(*session_id),
+                WorkspaceItem::Group(_) => None,
+            })
+            .collect();
+        for session in &self.sessions {
+            if !self.session_order.contains(&session.id) {
+                self.session_order.push(session.id);
             }
-            _ => PresentationMode::Battlefield,
-        };
+        }
+
+        self.selected_session = previous_selected
+            .filter(|session_id| self.session_exists(*session_id))
+            .or_else(|| self.session_order.first().copied());
+        self.selected_workspace_item = previous_selected_item
+            .filter(|item| self.item_exists(*item))
+            .or_else(|| self.ordered_visible_items().first().copied())
+            .or_else(|| self.selected_session.map(WorkspaceItem::Session));
     }
 
     pub fn add_session(&mut self, launch: SessionLaunch) -> SessionId {
@@ -91,8 +128,11 @@ impl WorkspaceViewState {
             events: Vec::new(),
         });
         self.session_order.push(id);
+        self.item_order.push(WorkspaceItem::Session(id));
 
         self.selected_session.get_or_insert(id);
+        self.selected_workspace_item
+            .get_or_insert(WorkspaceItem::Session(id));
         self.push_event(id, "Session added to workspace");
         id
     }
@@ -100,14 +140,17 @@ impl WorkspaceViewState {
     pub fn remove_session(&mut self, session_id: SessionId) {
         self.sessions.retain(|s| s.id != session_id);
         self.session_order.retain(|id| *id != session_id);
+        self.item_order
+            .retain(|item| *item != WorkspaceItem::Session(session_id));
         if self.selected_session == Some(session_id) {
             self.selected_session = self.sessions.first().map(|s| s.id);
         }
-        if self.focused_terminal == Some(session_id) {
-            self.focused_terminal = None;
-        }
-        if self.presentation_mode == PresentationMode::Focused(session_id) {
-            self.presentation_mode = PresentationMode::Battlefield;
+        if self.selected_workspace_item == Some(WorkspaceItem::Session(session_id)) {
+            self.selected_workspace_item = self
+                .ordered_visible_items()
+                .first()
+                .copied()
+                .or_else(|| self.selected_session.map(WorkspaceItem::Session));
         }
     }
 
@@ -115,9 +158,17 @@ impl WorkspaceViewState {
         &self.sessions
     }
 
+    pub fn groups(&self) -> &[SupervisedGroupRecord] {
+        &self.groups
+    }
+
     /// Sessions in user-arranged display order.
     pub fn ordered_session_ids(&self) -> &[SessionId] {
         &self.session_order
+    }
+
+    pub fn ordered_visible_items(&self) -> &[WorkspaceItem] {
+        &self.item_order
     }
 
     /// Move `session_id` to `target_index` in the display order.
@@ -127,23 +178,33 @@ impl WorkspaceViewState {
             let to = target_index.min(self.session_order.len());
             self.session_order.insert(to, id);
         }
+        if let Some(from) = self
+            .item_order
+            .iter()
+            .position(|item| *item == WorkspaceItem::Session(session_id))
+        {
+            let item = self.item_order.remove(from);
+            let to = target_index.min(self.item_order.len());
+            self.item_order.insert(to, item);
+        }
     }
 
     pub fn selected_session(&self) -> Option<SessionId> {
         self.selected_session
     }
 
-    pub fn focused_session(&self) -> Option<SessionId> {
-        match self.presentation_mode {
-            PresentationMode::Battlefield => None,
-            PresentationMode::Focused(session_id) => Some(session_id),
-        }
+    pub fn selected_workspace_item(&self) -> Option<WorkspaceItem> {
+        self.selected_workspace_item
     }
 
     pub fn session(&self, session_id: SessionId) -> Option<&SessionRecord> {
         self.sessions
             .iter()
             .find(|session| session.id == session_id)
+    }
+
+    pub fn group(&self, group_id: GroupId) -> Option<&SupervisedGroupRecord> {
+        self.groups.iter().find(|group| group.id == group_id)
     }
 
     pub fn set_display_name(&mut self, session_id: SessionId, display_name: Option<String>) {
@@ -164,29 +225,17 @@ impl WorkspaceViewState {
     pub fn select_session(&mut self, session_id: SessionId) {
         if self.sessions.iter().any(|session| session.id == session_id) {
             self.selected_session = Some(session_id);
+            self.selected_workspace_item = Some(WorkspaceItem::Session(session_id));
         }
     }
 
-    pub fn set_terminal_focus(&mut self, session_id: Option<SessionId>) {
-        self.focused_terminal =
-            session_id.filter(|id| self.sessions.iter().any(|session| session.id == *id));
-    }
-
-    pub fn enter_focus_mode(&mut self, session_id: SessionId) {
-        if self.sessions.iter().any(|session| session.id == session_id) {
-            self.selected_session = Some(session_id);
-            self.focused_terminal = Some(session_id);
-            self.presentation_mode = PresentationMode::Focused(session_id);
-            self.push_event(session_id, "Entered focused terminal view");
+    pub fn select_workspace_item(&mut self, item: WorkspaceItem) {
+        if self.item_exists(item) {
+            self.selected_workspace_item = Some(item);
+            if let WorkspaceItem::Session(session_id) = item {
+                self.selected_session = Some(session_id);
+            }
         }
-    }
-
-    pub fn return_to_battlefield(&mut self) {
-        if let Some(session_id) = self.focused_session() {
-            self.push_event(session_id, "Returned to battlefield view");
-        }
-        self.presentation_mode = PresentationMode::Battlefield;
-        self.focused_terminal = None;
     }
 
     pub fn mark_spawned(&mut self, session_id: SessionId, pid: u32) {
@@ -213,9 +262,6 @@ impl WorkspaceViewState {
                 SessionStatus::Failed(exit_code)
             };
             session.pid = None;
-            if self.focused_terminal == Some(session_id) {
-                self.focused_terminal = None;
-            }
         }
         self.push_event(
             session_id,
@@ -248,37 +294,40 @@ impl WorkspaceViewState {
             session.events.drain(0..extra);
         }
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::WorkspaceViewState;
-    use exaterm_core::model::shell_launch;
+    fn valid_item_order(&self, items: Vec<WorkspaceItem>) -> Vec<WorkspaceItem> {
+        let has_explicit_order = !items.is_empty();
+        let mut order = Vec::new();
+        for item in items {
+            if self.item_exists(item) && !order.contains(&item) {
+                order.push(item);
+            }
+        }
 
-    #[test]
-    fn focus_mode_preserves_selection_when_returning_to_battlefield() {
-        let mut state = WorkspaceViewState::new();
-        let first = state.add_session(shell_launch("One", "shell", "banner"));
-        let second = state.add_session(shell_launch("Two", "shell", "banner"));
+        if !has_explicit_order || order.is_empty() {
+            order.extend(
+                self.sessions
+                    .iter()
+                    .map(|session| WorkspaceItem::Session(session.id)),
+            );
+            order.extend(
+                self.groups
+                    .iter()
+                    .map(|group| WorkspaceItem::Group(group.id)),
+            );
+        }
 
-        state.enter_focus_mode(second);
-        state.return_to_battlefield();
-
-        assert_eq!(state.focused_session(), None);
-        assert_eq!(state.selected_session(), Some(second));
-        assert_ne!(state.selected_session(), Some(first));
+        order
     }
 
-    #[test]
-    fn replacing_sessions_keeps_focus_when_session_survives() {
-        let mut state = WorkspaceViewState::new();
-        let session_id = state.add_session(shell_launch("One", "shell", "banner"));
-        state.enter_focus_mode(session_id);
-        let sessions = state.sessions().to_vec();
+    fn item_exists(&self, item: WorkspaceItem) -> bool {
+        match item {
+            WorkspaceItem::Session(session_id) => self.session_exists(session_id),
+            WorkspaceItem::Group(group_id) => self.group(group_id).is_some(),
+        }
+    }
 
-        state.replace_sessions(sessions);
-
-        assert_eq!(state.focused_session(), Some(session_id));
-        assert_eq!(state.selected_session(), Some(session_id));
+    fn session_exists(&self, session_id: SessionId) -> bool {
+        self.sessions.iter().any(|session| session.id == session_id)
     }
 }

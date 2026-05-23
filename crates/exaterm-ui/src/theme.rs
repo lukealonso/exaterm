@@ -1,4 +1,4 @@
-use crate::supervision::BattleCardStatus;
+use crate::supervision::SessionTileStatus;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Color {
@@ -73,9 +73,9 @@ fn make_card(top: Color, bottom: Color, border: Color) -> CardTheme {
     }
 }
 
-pub fn card_theme(status: BattleCardStatus) -> CardTheme {
+pub fn card_theme(status: SessionTileStatus) -> CardTheme {
     match status {
-        BattleCardStatus::Idle => make_card(
+        SessionTileStatus::Idle => make_card(
             Color {
                 r: 21,
                 g: 24,
@@ -95,7 +95,7 @@ pub fn card_theme(status: BattleCardStatus) -> CardTheme {
                 a: 0.96,
             },
         ),
-        BattleCardStatus::Stopped => make_card(
+        SessionTileStatus::Stopped => make_card(
             Color {
                 r: 54,
                 g: 43,
@@ -115,7 +115,7 @@ pub fn card_theme(status: BattleCardStatus) -> CardTheme {
                 a: 0.96,
             },
         ),
-        BattleCardStatus::Active => make_card(
+        SessionTileStatus::Active => make_card(
             Color {
                 r: 14,
                 g: 33,
@@ -135,7 +135,7 @@ pub fn card_theme(status: BattleCardStatus) -> CardTheme {
                 a: 0.96,
             },
         ),
-        BattleCardStatus::Thinking | BattleCardStatus::Working => make_card(
+        SessionTileStatus::Thinking | SessionTileStatus::Working => make_card(
             Color {
                 r: 9,
                 g: 44,
@@ -155,7 +155,7 @@ pub fn card_theme(status: BattleCardStatus) -> CardTheme {
                 a: 0.96,
             },
         ),
-        BattleCardStatus::Blocked | BattleCardStatus::Failed => make_card(
+        SessionTileStatus::Blocked | SessionTileStatus::Failed => make_card(
             Color {
                 r: 55,
                 g: 18,
@@ -175,7 +175,7 @@ pub fn card_theme(status: BattleCardStatus) -> CardTheme {
                 a: 0.96,
             },
         ),
-        BattleCardStatus::Complete => make_card(
+        SessionTileStatus::Complete => make_card(
             Color {
                 r: 11,
                 g: 40,
@@ -195,7 +195,7 @@ pub fn card_theme(status: BattleCardStatus) -> CardTheme {
                 a: 0.96,
             },
         ),
-        BattleCardStatus::Detached => make_card(
+        SessionTileStatus::Detached => make_card(
             Color {
                 r: 36,
                 g: 18,
@@ -218,9 +218,9 @@ pub fn card_theme(status: BattleCardStatus) -> CardTheme {
     }
 }
 
-pub fn status_chip_theme(status: BattleCardStatus) -> StatusChipTheme {
+pub fn status_chip_theme(status: SessionTileStatus) -> StatusChipTheme {
     match status {
-        BattleCardStatus::Idle => StatusChipTheme {
+        SessionTileStatus::Idle => StatusChipTheme {
             text_color: Color {
                 r: 203,
                 g: 213,
@@ -240,7 +240,7 @@ pub fn status_chip_theme(status: BattleCardStatus) -> StatusChipTheme {
                 a: 0.22,
             },
         },
-        BattleCardStatus::Stopped => StatusChipTheme {
+        SessionTileStatus::Stopped => StatusChipTheme {
             text_color: Color {
                 r: 253,
                 g: 230,
@@ -260,7 +260,7 @@ pub fn status_chip_theme(status: BattleCardStatus) -> StatusChipTheme {
                 a: 0.28,
             },
         },
-        BattleCardStatus::Active => StatusChipTheme {
+        SessionTileStatus::Active => StatusChipTheme {
             text_color: Color {
                 r: 147,
                 g: 197,
@@ -280,7 +280,7 @@ pub fn status_chip_theme(status: BattleCardStatus) -> StatusChipTheme {
                 a: 0.26,
             },
         },
-        BattleCardStatus::Thinking | BattleCardStatus::Working => StatusChipTheme {
+        SessionTileStatus::Thinking | SessionTileStatus::Working => StatusChipTheme {
             text_color: Color {
                 r: 134,
                 g: 239,
@@ -300,7 +300,7 @@ pub fn status_chip_theme(status: BattleCardStatus) -> StatusChipTheme {
                 a: 0.24,
             },
         },
-        BattleCardStatus::Blocked | BattleCardStatus::Failed => StatusChipTheme {
+        SessionTileStatus::Blocked | SessionTileStatus::Failed => StatusChipTheme {
             text_color: Color {
                 r: 252,
                 g: 165,
@@ -320,7 +320,7 @@ pub fn status_chip_theme(status: BattleCardStatus) -> StatusChipTheme {
                 a: 0.24,
             },
         },
-        BattleCardStatus::Complete => StatusChipTheme {
+        SessionTileStatus::Complete => StatusChipTheme {
             text_color: Color {
                 r: 153,
                 g: 246,
@@ -340,7 +340,7 @@ pub fn status_chip_theme(status: BattleCardStatus) -> StatusChipTheme {
                 a: 0.24,
             },
         },
-        BattleCardStatus::Detached => StatusChipTheme {
+        SessionTileStatus::Detached => StatusChipTheme {
             text_color: Color {
                 r: 233,
                 g: 213,
@@ -533,18 +533,18 @@ pub fn terminal_cursor_color() -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::supervision::BattleCardStatus;
+    use crate::supervision::SessionTileStatus;
 
-    const ALL_STATUSES: &[BattleCardStatus] = &[
-        BattleCardStatus::Idle,
-        BattleCardStatus::Stopped,
-        BattleCardStatus::Active,
-        BattleCardStatus::Thinking,
-        BattleCardStatus::Working,
-        BattleCardStatus::Blocked,
-        BattleCardStatus::Failed,
-        BattleCardStatus::Complete,
-        BattleCardStatus::Detached,
+    const ALL_STATUSES: &[SessionTileStatus] = &[
+        SessionTileStatus::Idle,
+        SessionTileStatus::Stopped,
+        SessionTileStatus::Active,
+        SessionTileStatus::Thinking,
+        SessionTileStatus::Working,
+        SessionTileStatus::Blocked,
+        SessionTileStatus::Failed,
+        SessionTileStatus::Complete,
+        SessionTileStatus::Detached,
     ];
 
     #[test]
@@ -572,7 +572,7 @@ mod tests {
     #[test]
     fn card_active_gradient_matches_css() {
         // CSS: .card-active background: linear-gradient(180deg, rgba(14, 33, 52, 0.98) 0%, rgba(9, 18, 31, 0.97) 100%)
-        let theme = card_theme(BattleCardStatus::Active);
+        let theme = card_theme(SessionTileStatus::Active);
         assert_eq!(
             theme.background.top,
             Color {
@@ -594,9 +594,9 @@ mod tests {
     }
 
     #[test]
-    fn battle_active_chip_matches_css() {
-        // CSS: .battle-active { color: #93c5fd; background: rgba(33, 82, 145, 0.22); border-color: rgba(96, 165, 250, 0.26); }
-        let chip = status_chip_theme(BattleCardStatus::Active);
+    fn active_status_chip_matches_css() {
+        // CSS: active status chip uses #93c5fd text, rgba(33, 82, 145, 0.22) background, and rgba(96, 165, 250, 0.26) border.
+        let chip = status_chip_theme(SessionTileStatus::Active);
         assert_eq!(
             chip.text_color,
             Color {

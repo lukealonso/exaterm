@@ -103,23 +103,9 @@ pub fn decode_chunk(
                                 }
                             }
                         }
-                        b']' => {
+                        b']' | b'P' | b'_' => {
                             index += 1;
-                            while index < chunk.len() {
-                                match chunk[index] {
-                                    0x07 => {
-                                        index += 1;
-                                        break;
-                                    }
-                                    0x1b if index + 1 < chunk.len()
-                                        && chunk[index + 1] == b'\\' =>
-                                    {
-                                        index += 2;
-                                        break;
-                                    }
-                                    _ => index += 1,
-                                }
-                            }
+                            index = skip_string_control(chunk, index);
                         }
                         _ => {}
                     }
@@ -185,6 +171,17 @@ pub fn csi_implies_rewrite(sequence: &[u8]) -> bool {
     matches!(final_byte, b'G' | b'H' | b'f' | b'K' | b'P' | b'X')
 }
 
+fn skip_string_control(chunk: &[u8], mut index: usize) -> usize {
+    while index < chunk.len() {
+        match chunk[index] {
+            0x07 => return index + 1,
+            0x1b if index + 1 < chunk.len() && chunk[index + 1] == b'\\' => return index + 2,
+            _ => index += 1,
+        }
+    }
+    index
+}
+
 impl PaintedLineTracker {
     pub fn ingest(&mut self, chunk: &[u8]) -> Option<String> {
         let mut index = 0usize;
@@ -224,23 +221,9 @@ impl PaintedLineTracker {
                                     }
                                 }
                             }
-                            b']' => {
+                            b']' | b'P' | b'_' => {
                                 index += 1;
-                                while index < chunk.len() {
-                                    match chunk[index] {
-                                        0x07 => {
-                                            index += 1;
-                                            break;
-                                        }
-                                        0x1b if index + 1 < chunk.len()
-                                            && chunk[index + 1] == b'\\' =>
-                                        {
-                                            index += 2;
-                                            break;
-                                        }
-                                        _ => index += 1,
-                                    }
-                                }
+                                index = skip_string_control(chunk, index);
                             }
                             _ => {}
                         }
@@ -380,8 +363,8 @@ fn looks_consolidated_worthy(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        DecodedLine, PaintConsolidator, PaintedLineTracker, csi_implies_rewrite, decode_chunk,
-        merge_paint_lines,
+        csi_implies_rewrite, decode_chunk, merge_paint_lines, DecodedLine, PaintConsolidator,
+        PaintedLineTracker,
     };
     use std::time::{Duration, Instant};
 
@@ -441,6 +424,25 @@ mod tests {
             vec![DecodedLine {
                 text: "beta".to_string(),
                 overwrite_count: 1,
+            }]
+        );
+    }
+
+    #[test]
+    fn image_control_sequences_do_not_pollute_lines() {
+        let mut carry = String::new();
+        let mut overwrite_count = 0usize;
+        let lines = decode_chunk(
+            b"before \x1b_Ga=T,f=100;AAAA\x1b\\ after\n",
+            &mut carry,
+            &mut overwrite_count,
+        );
+
+        assert_eq!(
+            lines,
+            vec![DecodedLine {
+                text: "before  after".to_string(),
+                overwrite_count: 0,
             }]
         );
     }

@@ -47,66 +47,70 @@ export interface ObservationSnapshot {
   last_change_age_secs: number;
   recent_lines: string[];
   painted_line: string | null;
-  shell_child_command: string | null;
-  active_command: string | null;
-  dominant_process: string | null;
-  process_tree_excerpt: string | null;
-  recent_files: string[];
-  work_output_excerpt: string | null;
-}
-
-// snake_case via #[serde(rename_all = "snake_case")]
-export type TacticalState =
-  | "idle"
-  | "stopped"
-  | "thinking"
-  | "working"
-  | "blocked"
-  | "failed"
-  | "complete"
-  | "detached";
-
-// snake_case via #[serde(rename_all = "snake_case")]
-export type AttentionLevel =
-  | "autopilot"
-  | "monitor"
-  | "guide"
-  | "intervene"
-  | "takeover";
-
-export interface TacticalSynthesis {
-  tactical_state: TacticalState;
-  tactical_state_brief: string | null;
-  attention_level: AttentionLevel;
-  attention_brief: string | null;
-  headline: string | null;
 }
 
 export interface SessionSnapshot {
   record: SessionRecord;
   observation: ObservationSnapshot;
-  summary: TacticalSynthesis | null;
   raw_stream_socket_name: string | null;
-  auto_nudge_enabled: boolean;
-  last_nudge: string | null;
-  last_sent_age_secs: number | null;
 }
 
+export interface SupervisorActionRecord {
+  sequence: number;
+  summary: string;
+  age_secs: number;
+}
+
+export type SupervisorProvider = "codex" | "claude" | "other";
+
+export interface SupervisedGroupRecord {
+  id: number;
+  name: string;
+  member_session_ids: SessionId[];
+  supervisor_session_id: SessionId | null;
+  provider: SupervisorProvider | null;
+  goal: string | null;
+  summary_markdown: string;
+  supervisor_visible: boolean;
+  summary_age_secs: number | null;
+  latest_action_age_secs: number | null;
+  actions: SupervisorActionRecord[];
+}
+
+export type WorkspaceItem =
+  | { Session: SessionId }
+  | { Group: number };
+
 export interface WorkspaceSnapshot {
+  items: WorkspaceItem[];
   sessions: SessionSnapshot[];
+  groups: SupervisedGroupRecord[];
+}
+
+export interface TerminalDisplayCapabilities {
+  kitty_graphics: boolean;
+  sixel: boolean;
+  vte_version: string | null;
 }
 
 export type ServerMessage =
   | { type: "workspace_snapshot"; snapshot: WorkspaceSnapshot }
+  | { type: "terminal_assist_completed"; request_id: number; session_id: SessionId; inserted: boolean; error: string | null }
   | { type: "error"; message: string };
 
 export type ClientMessage =
   | { type: "attach_client" }
+  | { type: "set_terminal_display_capabilities"; capabilities: TerminalDisplayCapabilities }
   | { type: "create_or_resume_default_workspace" }
   | { type: "add_terminals"; source_session: SessionId }
   | { type: "add_terminals_to"; source_session: SessionId; target_total: number }
   | { type: "add_one_terminal"; source_session: SessionId }
   | { type: "resize_terminal"; session_id: SessionId; rows: number; cols: number }
-  | { type: "toggle_auto_nudge"; session_id: SessionId; enabled: boolean }
+  | { type: "close_session"; session_id: SessionId }
+  | { type: "create_supervised_group"; name: string; session_ids: SessionId[]; goal: string | null }
+  | { type: "set_group_supervisor_visible"; group_id: number; visible: boolean }
+  | { type: "send_message_to_agent"; group_id: number; session_id: SessionId; message: string }
+  | { type: "update_group_summary"; group_id: number; markdown: string }
+  | { type: "request_terminal_assist"; request_id: number; session_id: SessionId; prompt: string }
   | { type: "detach_client"; keep_alive: boolean }
   | { type: "terminate_workspace" };

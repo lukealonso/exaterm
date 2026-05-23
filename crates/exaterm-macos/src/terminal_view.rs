@@ -7,8 +7,7 @@ use crate::style::{self, NormalizedColor};
 use objc2::rc::Retained;
 use objc2_app_kit::{NSColor, NSFont};
 
-use exaterm_ui::presentation::NudgeStateTone;
-use exaterm_ui::supervision::BattleCardStatus;
+use exaterm_ui::supervision::SessionTileStatus;
 use exaterm_ui::theme::{self as theme, Color};
 
 fn ns_color(c: &NormalizedColor) -> Retained<NSColor> {
@@ -16,16 +15,16 @@ fn ns_color(c: &NormalizedColor) -> Retained<NSColor> {
 }
 
 /// All statuses we iterate over to build per-status caches.
-const ALL_STATUSES: &[BattleCardStatus] = &[
-    BattleCardStatus::Idle,
-    BattleCardStatus::Stopped,
-    BattleCardStatus::Active,
-    BattleCardStatus::Thinking,
-    BattleCardStatus::Working,
-    BattleCardStatus::Blocked,
-    BattleCardStatus::Failed,
-    BattleCardStatus::Complete,
-    BattleCardStatus::Detached,
+const ALL_STATUSES: &[SessionTileStatus] = &[
+    SessionTileStatus::Idle,
+    SessionTileStatus::Stopped,
+    SessionTileStatus::Active,
+    SessionTileStatus::Thinking,
+    SessionTileStatus::Working,
+    SessionTileStatus::Blocked,
+    SessionTileStatus::Failed,
+    SessionTileStatus::Complete,
+    SessionTileStatus::Detached,
 ];
 
 /// Convenience: create cached NSColor/NSFont objects from the theme.
@@ -62,21 +61,20 @@ pub struct TerminalRenderState {
     // Per-status card background: discriminant -> card background top color.
     pub card_bg_colors: BTreeMap<u8, Retained<NSColor>>,
     pub attention_bg_colors: BTreeMap<usize, Retained<NSColor>>,
-    pub nudge_colors: BTreeMap<u8, (Retained<NSColor>, Retained<NSColor>)>,
 }
 
-/// Return a `u8` discriminant for a `BattleCardStatus` variant (used as map key).
-fn status_discriminant(s: BattleCardStatus) -> u8 {
+/// Return a `u8` discriminant for a `SessionTileStatus` variant (used as map key).
+fn status_discriminant(s: SessionTileStatus) -> u8 {
     match s {
-        BattleCardStatus::Idle => 0,
-        BattleCardStatus::Stopped => 1,
-        BattleCardStatus::Active => 2,
-        BattleCardStatus::Thinking => 3,
-        BattleCardStatus::Working => 4,
-        BattleCardStatus::Blocked => 5,
-        BattleCardStatus::Failed => 6,
-        BattleCardStatus::Complete => 7,
-        BattleCardStatus::Detached => 8,
+        SessionTileStatus::Idle => 0,
+        SessionTileStatus::Stopped => 1,
+        SessionTileStatus::Active => 2,
+        SessionTileStatus::Thinking => 3,
+        SessionTileStatus::Working => 4,
+        SessionTileStatus::Blocked => 5,
+        SessionTileStatus::Failed => 6,
+        SessionTileStatus::Complete => 7,
+        SessionTileStatus::Detached => 8,
     }
 }
 
@@ -170,7 +168,6 @@ impl TerminalRenderState {
         let mut status_chip_colors = BTreeMap::new();
         let mut card_bg_colors = BTreeMap::new();
         let mut attention_bg_colors = BTreeMap::new();
-        let mut nudge_colors = BTreeMap::new();
         for &status in ALL_STATUSES {
             let disc = status_discriminant(status);
             let chip = theme::status_chip_theme(status);
@@ -229,58 +226,6 @@ impl TerminalRenderState {
                 a: 0.32,
             }),
         );
-        nudge_colors.insert(
-            0,
-            (
-                style::color_to_nscolor(&Color {
-                    r: 214,
-                    g: 222,
-                    b: 230,
-                    a: 0.84,
-                }),
-                style::color_to_nscolor(&Color {
-                    r: 84,
-                    g: 97,
-                    b: 112,
-                    a: 0.18,
-                }),
-            ),
-        );
-        nudge_colors.insert(
-            1,
-            (
-                style::color_to_nscolor(&Color {
-                    r: 253,
-                    g: 230,
-                    b: 138,
-                    a: 1.0,
-                }),
-                style::color_to_nscolor(&Color {
-                    r: 120,
-                    g: 87,
-                    b: 10,
-                    a: 0.22,
-                }),
-            ),
-        );
-        nudge_colors.insert(
-            2,
-            (
-                style::color_to_nscolor(&Color {
-                    r: 147,
-                    g: 197,
-                    b: 253,
-                    a: 1.0,
-                }),
-                style::color_to_nscolor(&Color {
-                    r: 33,
-                    g: 82,
-                    b: 145,
-                    a: 0.22,
-                }),
-            ),
-        );
-
         Self {
             title_font,
             status_font,
@@ -305,22 +250,21 @@ impl TerminalRenderState {
             status_chip_colors,
             card_bg_colors,
             attention_bg_colors,
-            nudge_colors,
         }
     }
 
     /// Look up the cached chip text color for a given status.
-    pub fn chip_text_color(&self, status: BattleCardStatus) -> &Retained<NSColor> {
+    pub fn chip_text_color(&self, status: SessionTileStatus) -> &Retained<NSColor> {
         &self.status_chip_colors[&status_discriminant(status)].0
     }
 
     /// Look up the cached chip background color for a given status.
-    pub fn chip_bg_color(&self, status: BattleCardStatus) -> &Retained<NSColor> {
+    pub fn chip_bg_color(&self, status: SessionTileStatus) -> &Retained<NSColor> {
         &self.status_chip_colors[&status_discriminant(status)].1
     }
 
     /// Look up the cached card background (top gradient) color for a given status.
-    pub fn card_bg(&self, status: BattleCardStatus) -> &Retained<NSColor> {
+    pub fn card_bg(&self, status: SessionTileStatus) -> &Retained<NSColor> {
         &self.card_bg_colors[&status_discriminant(status)]
     }
 
@@ -328,23 +272,7 @@ impl TerminalRenderState {
         &self.attention_bg_colors[&fill.clamp(1, 5)]
     }
 
-    pub fn nudge_text_color(&self, tone: NudgeStateTone) -> &Retained<NSColor> {
-        &self.nudge_colors[&nudge_discriminant(tone)].0
-    }
-
-    pub fn nudge_bg_color(&self, tone: NudgeStateTone) -> &Retained<NSColor> {
-        &self.nudge_colors[&nudge_discriminant(tone)].1
-    }
-
     pub fn attention_bar_fill(&self, fill: usize) -> &Retained<NSColor> {
         self.attention_chip_bg(fill)
-    }
-}
-
-fn nudge_discriminant(tone: NudgeStateTone) -> u8 {
-    match tone {
-        NudgeStateTone::Off => 0,
-        NudgeStateTone::Armed => 1,
-        NudgeStateTone::Cooldown => 2,
     }
 }

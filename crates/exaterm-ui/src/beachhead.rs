@@ -1,7 +1,9 @@
+use exaterm_core::config::{apply_app_config_environment, load_app_config, AppConfig};
 use exaterm_core::daemon::{connect_session_stream_socket, LocalBeachheadClient};
 use exaterm_types::model::SessionId;
 use exaterm_types::proto::{ClientMessage, ServerMessage};
 use std::collections::BTreeMap;
+use std::env;
 use std::ffi::OsString;
 use std::fs;
 use std::os::unix::net::UnixStream;
@@ -15,6 +17,19 @@ const REMOTE_STATE_SUBDIR: &str = ".local/state/exaterm";
 const REMOTE_RUNTIME_SUBDIR: &str = ".local/state/exaterm/runtime";
 const REMOTE_BIN_SUBDIR: &str = ".local/state/exaterm/bin";
 const CONTROL_SOCKET_NAME: &str = "beachhead-control.sock";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LiveWorkspace {
+    pub id: Option<String>,
+    pub label: String,
+}
+
+impl LiveWorkspace {
+    fn new(id: Option<String>) -> Self {
+        let label = id.clone().unwrap_or_else(|| "Default".into());
+        Self { id, label }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RunMode {
@@ -81,23 +96,21 @@ pub fn parse_run_mode(args: impl IntoIterator<Item = String>) -> Result<ParsedAr
     while i < args.len() {
         match args[i].as_str() {
             "--ssh" => {
-                let target = args.get(i + 1).ok_or("--ssh requires a target like user@host")?;
+                let target = args
+                    .get(i + 1)
+                    .ok_or("--ssh requires a target like user@host")?;
                 mode = RunMode::Ssh {
                     target: target.clone(),
                 };
                 i += 2;
             }
             "--new" => {
-                let id = args
-                    .get(i + 1)
-                    .ok_or("--new requires a workspace id")?;
+                let id = args.get(i + 1).ok_or("--new requires a workspace id")?;
                 workspace = Some(WorkspaceArg::New(id.clone()));
                 i += 2;
             }
             "--resume" => {
-                let id = args
-                    .get(i + 1)
-                    .ok_or("--resume requires a workspace id")?;
+                let id = args.get(i + 1).ok_or("--resume requires a workspace id")?;
                 workspace = Some(WorkspaceArg::Resume(id.clone()));
                 i += 2;
             }
@@ -106,6 +119,96 @@ pub fn parse_run_mode(args: impl IntoIterator<Item = String>) -> Result<ParsedAr
     }
 
     Ok(ParsedArgs { mode, workspace })
+}
+
+pub fn list_local_live_workspaces() -> Vec<LiveWorkspace> {
+    let base = local_daemon_socket_base_dir();
+    let mut workspaces = Vec::new();
+    if base.join(CONTROL_SOCKET_NAME).exists() {
+        workspaces.push(LiveWorkspace::new(None));
+    }
+
+    let Ok(entries) = fs::read_dir(&base) else {
+        return workspaces;
+    };
+    let mut named = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let file_type = entry.file_type().ok()?;
+            if !file_type.is_dir() {
+                return None;
+            }
+            let id = entry.file_name().to_string_lossy().trim().to_string();
+            if id.is_empty() {
+                return None;
+            }
+            entry
+                .path()
+                .join(CONTROL_SOCKET_NAME)
+                .exists()
+                .then(|| LiveWorkspace::new(Some(id)))
+        })
+        .collect::<Vec<_>>();
+    named.sort_by(|a, b| a.label.cmp(&b.label));
+    workspaces.extend(named);
+    workspaces
+}
+
+pub fn list_remote_live_workspaces(target: &str) -> Result<Vec<LiveWorkspace>, String> {
+    let script = r#"
+set -eu
+base="$HOME/.local/state/exaterm/runtime/exaterm"
+if [ -S "$base/beachhead-control.sock" ]; then
+  printf '%s\t%s\n' '' 'Default'
+fi
+if [ -d "$base" ]; then
+  for dir in "$base"/*; do
+    [ -d "$dir" ] || continue
+    [ -S "$dir/beachhead-control.sock" ] || continue
+    id=$(basename "$dir")
+    [ -n "$id" ] || continue
+    printf '%s\t%s\n' "$id" "$id"
+  done
+fi
+"#;
+    let output = run_remote_shell(target, script)?;
+    if !output.status.success() {
+        return Err(format!(
+            "remote workspace scan failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let mut workspaces = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let (id, label) = line.split_once('\t')?;
+            let id = (!id.is_empty()).then(|| id.to_string());
+            let label = if label.trim().is_empty() {
+                id.clone().unwrap_or_else(|| "Default".into())
+            } else {
+                label.trim().to_string()
+            };
+            Some(LiveWorkspace { id, label })
+        })
+        .collect::<Vec<_>>();
+    workspaces.sort_by(|a, b| match (&a.id, &b.id) {
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (Some(_), None) => std::cmp::Ordering::Greater,
+        _ => a.label.cmp(&b.label),
+    });
+    Ok(workspaces)
+}
+
+fn local_daemon_socket_base_dir() -> PathBuf {
+    let base = env::var_os("EXATERM_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from))
+        .unwrap_or_else(|| {
+            env::var_os("UID")
+                .map(|uid| PathBuf::from(format!("/tmp/exaterm-{}", uid.to_string_lossy())))
+                .unwrap_or_else(|| env::temp_dir().join("exaterm"))
+        });
+    base.join("exaterm")
 }
 
 #[derive(Clone)]
@@ -137,21 +240,26 @@ pub struct BeachheadConnection {
 
 impl BeachheadConnection {
     pub fn connect(target: &BeachheadTarget) -> Result<Self, String> {
-        match target {
-            BeachheadTarget::Local => Ok(Self {
+        let app_config = load_app_config();
+        apply_app_config_environment(&app_config);
+
+        let connection = match target {
+            BeachheadTarget::Local => Self {
                 client: LocalBeachheadClient::connect_or_spawn()?,
                 raw_sessions: RawSessionConnector::Local,
                 _remote_bridge: None,
-            }),
+            },
             BeachheadTarget::Ssh(target) => {
                 let (client, bridge) = connect_remote(target)?;
-                Ok(Self {
+                Self {
                     client,
                     raw_sessions: RawSessionConnector::Remote(bridge.raw_connector()),
                     _remote_bridge: Some(bridge),
-                })
+                }
             }
-        }
+        };
+        configure_terminal_assist(&connection.client, &app_config);
+        Ok(connection)
     }
 
     pub fn commands(&self) -> &mpsc::Sender<ClientMessage> {
@@ -173,6 +281,19 @@ impl BeachheadConnection {
     pub fn raw_session_connector(&self) -> RawSessionConnector {
         self.raw_sessions.clone()
     }
+}
+
+fn configure_terminal_assist(client: &LocalBeachheadClient, config: &AppConfig) {
+    let terminal_assist = config.clone().normalized().terminal_assist;
+    let openai_api_key =
+        (!terminal_assist.openai_api_key.is_empty()).then_some(terminal_assist.openai_api_key);
+    let _ = client
+        .commands
+        .send(ClientMessage::ConfigureTerminalAssist {
+            openai_api_key,
+            openai_base_url: terminal_assist.openai_base_url,
+            model: terminal_assist.model,
+        });
 }
 
 pub struct RemoteBeachheadBridge {
@@ -214,7 +335,7 @@ pub fn connect_remote(
     let info = probe_remote_host(target)?;
     ensure_supported_remote(&info)?;
 
-    let local_exatermd = local_exatermd_path()?;
+    let local_exatermd = local_exatermd_path(&info.arch)?;
     let remote_root = format!("{}/{}", info.home, REMOTE_STATE_SUBDIR);
     let remote_bin_dir = format!("{}/{}", info.home, REMOTE_BIN_SUBDIR);
     let remote_runtime_dir = format!("{}/{}", info.home, REMOTE_RUNTIME_SUBDIR);
@@ -420,30 +541,66 @@ fn probe_remote_host(target: &str) -> Result<RemoteHostInfo, String> {
 fn ensure_supported_remote(info: &RemoteHostInfo) -> Result<(), String> {
     if info.os != "Linux" {
         return Err(format!(
-            "remote beachhead currently supports Linux only, got {}",
+            "remote hosts currently support Linux only, got {}",
             info.os
-        ));
-    }
-    let local_arch = std::env::consts::ARCH;
-    if info.arch != local_arch {
-        return Err(format!(
-            "remote architecture {} does not match local exatermd build architecture {}",
-            info.arch, local_arch
         ));
     }
     Ok(())
 }
 
-fn local_exatermd_path() -> Result<PathBuf, String> {
+/// Map a `uname -m` value to a Rust target triple for Linux.
+fn remote_target_triple(uname_arch: &str) -> Result<&'static str, String> {
+    match uname_arch {
+        "x86_64" => Ok("x86_64-unknown-linux-gnu"),
+        "aarch64" => Ok("aarch64-unknown-linux-gnu"),
+        other => Err(format!("unsupported remote architecture: {other}")),
+    }
+}
+
+fn local_exatermd_path(remote_arch: &str) -> Result<PathBuf, String> {
     let current_exe = std::env::current_exe()
         .map_err(|error| format!("failed to resolve current executable: {error}"))?;
-    let candidate = current_exe.with_file_name("exatermd");
-    if candidate.exists() {
-        return Ok(candidate);
+    let exe_dir = current_exe
+        .parent()
+        .ok_or("could not determine executable directory")?;
+
+    // If local and remote arch match, prefer the plain sibling binary.
+    let local_arch = std::env::consts::ARCH;
+    if remote_arch == local_arch {
+        let candidate = exe_dir.join("exatermd");
+        if candidate.exists() {
+            return Ok(candidate);
+        }
     }
+
+    // Look for an arch-specific binary: exatermd-{target_triple}.
+    let triple = remote_target_triple(remote_arch)?;
+    let arch_candidate = exe_dir.join(format!("exatermd-{triple}"));
+    if arch_candidate.exists() {
+        return Ok(arch_candidate);
+    }
+
+    // Also check target/{triple}/release/ relative to the workspace for dev builds.
+    if let Some(workspace_root) = exe_dir.parent().and_then(|p| p.parent()) {
+        let dev_candidate = workspace_root
+            .join("target")
+            .join(triple)
+            .join("release")
+            .join("exatermd");
+        if dev_candidate.exists() {
+            return Ok(dev_candidate);
+        }
+    }
+
+    // Fallback: plain sibling even on mismatch (user may have placed it manually).
+    let fallback = exe_dir.join("exatermd");
+    if fallback.exists() {
+        return Ok(fallback);
+    }
+
     Err(format!(
-        "missing sibling exatermd at {}; build it first with `make`",
-        candidate.display()
+        "no exatermd binary found for remote arch {remote_arch} ({triple}); \
+         build with `cargo build --release --target {triple} -p exatermd`"
     ))
 }
 
@@ -506,9 +663,7 @@ fn launch_remote_daemon(
         "OPENAI_API_KEY",
         "EXATERM_OPENAI_BASE_URL",
         "OPENAI_BASE_URL",
-        "EXATERM_SUMMARY_MODEL",
-        "EXATERM_NAMING_MODEL",
-        "EXATERM_NUDGE_MODEL",
+        "EXATERM_TERMINAL_ASSIST_MODEL",
         "EXATERM_WORKSPACE",
     ] {
         if let Some(value) = std::env::var_os(key) {
@@ -522,7 +677,7 @@ fn launch_remote_daemon(
            if [ -S {control} ]; then exit 0; fi; \
            i=$((i+1)); sleep 0.1; \
         done; \
-         echo 'remote beachhead control socket did not appear' >&2; exit 1",
+         echo 'remote host session service did not start' >&2; exit 1",
         bin = shell_quote(remote_bin),
         exports = exports.join("; "),
         log_redirection = ">/dev/null 2>&1",
@@ -579,7 +734,7 @@ fn wait_for_forwarded_control_socket(
             Err(error) if start.elapsed() >= Duration::from_secs(5) => {
                 let _ = process.try_wait();
                 return Err(format!(
-                    "timed out waiting for forwarded remote beachhead control socket: {error}"
+                    "timed out waiting for forwarded remote host connection: {error}"
                 ));
             }
             Err(_) => {

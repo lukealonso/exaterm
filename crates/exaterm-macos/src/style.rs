@@ -1,6 +1,6 @@
 // Theme-to-AppKit translation — intermediate representations for testability.
 
-use exaterm_ui::supervision::BattleCardStatus;
+use exaterm_ui::supervision::SessionTileStatus;
 use exaterm_ui::theme::{self, Color, FontSpec};
 
 /// RGBA components normalized to 0.0-1.0 for NSColor.
@@ -30,8 +30,8 @@ pub fn normalize_color(color: &Color) -> NormalizedColor {
     }
 }
 
-/// Build a `LayerStyle` for the given battle-card status by reading `theme::card_theme`.
-pub fn card_layer_style(status: BattleCardStatus) -> LayerStyle {
+/// Build a `LayerStyle` for the given session-tile status by reading `theme::card_theme`.
+pub fn card_layer_style(status: SessionTileStatus) -> LayerStyle {
     let ct = theme::card_theme(status);
     LayerStyle {
         corner_radius: f64::from(ct.border_radius),
@@ -96,19 +96,19 @@ pub fn color_to_nscolor(c: &Color) -> Retained<NSColor> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use exaterm_ui::supervision::BattleCardStatus;
+    use exaterm_ui::supervision::SessionTileStatus;
     use exaterm_ui::theme::{Color, FontSpec};
 
-    const ALL_STATUSES: &[BattleCardStatus] = &[
-        BattleCardStatus::Idle,
-        BattleCardStatus::Stopped,
-        BattleCardStatus::Active,
-        BattleCardStatus::Thinking,
-        BattleCardStatus::Working,
-        BattleCardStatus::Blocked,
-        BattleCardStatus::Failed,
-        BattleCardStatus::Complete,
-        BattleCardStatus::Detached,
+    const ALL_STATUSES: &[SessionTileStatus] = &[
+        SessionTileStatus::Idle,
+        SessionTileStatus::Stopped,
+        SessionTileStatus::Active,
+        SessionTileStatus::Thinking,
+        SessionTileStatus::Working,
+        SessionTileStatus::Blocked,
+        SessionTileStatus::Failed,
+        SessionTileStatus::Complete,
+        SessionTileStatus::Detached,
     ];
 
     // ---- normalize_color ----
@@ -193,13 +193,13 @@ mod tests {
 
     #[test]
     fn card_layer_style_active_corner_radius() {
-        let style = card_layer_style(BattleCardStatus::Active);
+        let style = card_layer_style(SessionTileStatus::Active);
         assert!((style.corner_radius - 24.0).abs() < f64::EPSILON);
     }
 
     #[test]
     fn card_layer_style_active_gradient_matches_theme() {
-        let style = card_layer_style(BattleCardStatus::Active);
+        let style = card_layer_style(SessionTileStatus::Active);
         // Active top: Color { r: 14, g: 33, b: 52, a: 0.98 }
         let expected_top = normalize_color(&Color {
             r: 14,

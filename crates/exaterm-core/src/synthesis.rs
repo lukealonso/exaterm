@@ -1,31 +1,19 @@
-pub use exaterm_types::synthesis::{
-    AttentionLevel, NameSuggestion, NudgeSuggestion, TacticalState, TacticalSynthesis,
-};
+use crate::config::DEFAULT_TERMINAL_ASSIST_MODEL;
+pub use exaterm_types::synthesis::TerminalAssistSuggestion;
+use serde::de::DeserializeOwned;
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::env;
 use std::error::Error;
-use std::fs;
-use std::io::Read;
-use std::path::Path;
-use std::process::{Child, Command, ExitStatus, Stdio};
-use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
-const DEFAULT_SUMMARY_MODEL: &str = "gpt-5.4-mini";
-const DEFAULT_NAMING_MODEL: &str = "gpt-5.4-mini";
-const DEFAULT_NUDGE_MODEL: &str = "gpt-5.4";
-const DEFAULT_CODEX_CLI_MODEL: &str = "gpt-5.4-mini";
-const DEFAULT_CLAUDE_CLI_MODEL: &str = "haiku";
-const DEFAULT_REASONING_EFFORT: &str = "medium";
-const CLI_TIMEOUT: Duration = Duration::from_secs(90);
+const OPENAI_TERMINAL_ASSIST_TIMEOUT: Duration = Duration::from_secs(20);
+const TERMINAL_ASSIST_MAX_TOKENS: u16 = 160;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SynthesisProvider {
     OpenAi,
-    CodexCli,
-    ClaudeCli,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -39,20 +27,10 @@ struct OpenAiBackend {
     base_url: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct CliBackend {
-    program: String,
-    model: String,
-}
-
 #[derive(Clone, Debug)]
 pub struct SynthesisBackendRegistry {
     openai: Option<OpenAiBackend>,
-    codex: Option<CliBackend>,
-    claude: Option<CliBackend>,
-    summary_model: String,
-    naming_model: String,
-    nudge_model: String,
+    terminal_assist_model: String,
 }
 
 #[derive(Debug)]
@@ -63,39 +41,22 @@ pub struct ProviderCallResult<T> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct TacticalEvidence {
+pub struct TerminalAssistEvidence {
     pub session_name: String,
-    pub task_label: String,
+    pub operator_prompt: String,
+    pub current_input: String,
+    pub working_directory: Option<String>,
+    pub shell_child_command: Option<String>,
+    pub active_command: Option<String>,
     pub dominant_process: Option<String>,
     pub process_tree_excerpt: Option<String>,
     pub recent_files: Vec<String>,
     pub terminal_status_line: Option<String>,
-    pub terminal_status_line_age: Option<String>,
-    pub recent_terminal_activity: Vec<String>,
-    pub recent_events: Vec<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct NamingEvidence {
-    pub current_name: String,
-    pub recent_terminal_history: Vec<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct NudgeEvidence {
-    pub session_name: String,
-    pub shell_child_command: Option<String>,
-    pub idle_seconds: Option<u64>,
-    pub tactical_state_brief: Option<String>,
-    pub attention_brief: Option<String>,
-    pub headline: Option<String>,
     pub recent_terminal_history: Vec<String>,
 }
 
 impl SynthesisBackendRegistry {
     pub fn from_env() -> Option<Self> {
-        load_dotenv_file();
-
         let openai = env::var("OPENAI_API_KEY")
             .ok()
             .map(|value| value.trim().to_string())
@@ -104,132 +65,31 @@ impl SynthesisBackendRegistry {
                 api_key,
                 base_url: openai_chat_completions_url(),
             });
-        let codex = find_executable("codex").map(|program| CliBackend {
-            program,
-            model: normalize_cli_model(
-                &env::var("EXATERM_CODEX_CLI_MODEL").unwrap_or_default(),
-                DEFAULT_CODEX_CLI_MODEL,
-            ),
-        });
-        let claude = find_executable("claude")
-            .or_else(|| find_executable("claude-code"))
-            .map(|program| CliBackend {
-                program,
-                model: normalize_cli_model(
-                    &env::var("EXATERM_CLAUDE_CLI_MODEL").unwrap_or_default(),
-                    DEFAULT_CLAUDE_CLI_MODEL,
-                ),
-            });
-
         let registry = Self {
             openai,
-            codex,
-            claude,
-            summary_model: normalize_summary_model(
-                &env::var("EXATERM_SUMMARY_MODEL").unwrap_or_default(),
-            ),
-            naming_model: normalize_naming_model(
-                &env::var("EXATERM_NAMING_MODEL").unwrap_or_default(),
-            ),
-            nudge_model: normalize_nudge_model(
-                &env::var("EXATERM_NUDGE_MODEL").unwrap_or_default(),
+            terminal_assist_model: normalize_terminal_assist_model(
+                &env::var("EXATERM_TERMINAL_ASSIST_MODEL").unwrap_or_default(),
             ),
         };
         registry.is_available().then_some(registry)
     }
 
-    pub fn summarize_blocking(
+    pub fn suggest_terminal_assist_blocking(
         &self,
         preferences: &ProviderPreferences,
-        evidence: &TacticalEvidence,
-    ) -> ProviderCallResult<TacticalSynthesis> {
-        let user_prompt = format!(
-            "Produce one grounded Exaterm tactical classification for this terminal session. Fill every field from the evidence below and do not invent unseen work, intent, or progress.\n\nEvidence:\n{}",
-            serde_json::to_string_pretty(evidence)
-                .map_err(|error| error.to_string())
-                .unwrap_or_default()
-        );
+        evidence: &TerminalAssistEvidence,
+    ) -> ProviderCallResult<TerminalAssistSuggestion> {
         self.run_with_fallback(preferences, |provider| match provider {
-            SynthesisProvider::OpenAi => summarize_openai_blocking(
+            SynthesisProvider::OpenAi => suggest_terminal_assist_openai_blocking(
                 self.openai.as_ref().expect("openai backend must exist"),
-                &self.summary_model,
+                &self.terminal_assist_model,
                 evidence,
-            ),
-            SynthesisProvider::CodexCli => summarize_cli_blocking(
-                self.codex.as_ref().expect("codex backend must exist"),
-                tactical_system_prompt(),
-                &user_prompt,
-            ),
-            SynthesisProvider::ClaudeCli => summarize_claude_blocking(
-                self.claude.as_ref().expect("claude backend must exist"),
-                tactical_system_prompt(),
-                &user_prompt,
-            ),
-        })
-    }
-
-    pub fn suggest_name_blocking(
-        &self,
-        preferences: &ProviderPreferences,
-        evidence: &NamingEvidence,
-    ) -> ProviderCallResult<NameSuggestion> {
-        let user_prompt = format!(
-            "Choose a stable operator-facing terminal name from this history. Return empty string if the history is still too thin:\n{}",
-            serde_json::to_string_pretty(evidence)
-                .map_err(|error| error.to_string())
-                .unwrap_or_default()
-        );
-        self.run_with_fallback(preferences, |provider| match provider {
-            SynthesisProvider::OpenAi => suggest_name_openai_blocking(
-                self.openai.as_ref().expect("openai backend must exist"),
-                &self.naming_model,
-                evidence,
-            ),
-            SynthesisProvider::CodexCli => suggest_name_cli_blocking(
-                self.codex.as_ref().expect("codex backend must exist"),
-                naming_system_prompt(),
-                &user_prompt,
-            ),
-            SynthesisProvider::ClaudeCli => suggest_name_claude_blocking(
-                self.claude.as_ref().expect("claude backend must exist"),
-                naming_system_prompt(),
-                &user_prompt,
-            ),
-        })
-    }
-
-    pub fn suggest_nudge_blocking(
-        &self,
-        preferences: &ProviderPreferences,
-        evidence: &NudgeEvidence,
-    ) -> ProviderCallResult<NudgeSuggestion> {
-        let user_prompt = format!(
-            "Write one short contextual nudge for this stopped terminal session. Return empty string if no safe, useful nudge is warranted:\n{}",
-            serde_json::to_string_pretty(evidence)
-                .map_err(|error| error.to_string())
-                .unwrap_or_default()
-        );
-        self.run_with_fallback(preferences, |provider| match provider {
-            SynthesisProvider::OpenAi => suggest_nudge_openai_blocking(
-                self.openai.as_ref().expect("openai backend must exist"),
-                &self.nudge_model,
-                evidence,
-            ),
-            SynthesisProvider::CodexCli => suggest_nudge_cli_blocking(
-                self.codex.as_ref().expect("codex backend must exist"),
-                nudge_system_prompt(),
-                &user_prompt,
-            ),
-            SynthesisProvider::ClaudeCli => suggest_nudge_claude_blocking(
-                self.claude.as_ref().expect("claude backend must exist"),
-                nudge_system_prompt(),
-                &user_prompt,
             ),
         })
     }
 
     fn is_available(&self) -> bool {
-        self.openai.is_some() || self.codex.is_some() || self.claude.is_some()
+        self.openai.is_some()
     }
 
     fn preferred_provider_order(
@@ -244,20 +104,6 @@ impl SynthesisBackendRegistry {
         {
             providers.push(SynthesisProvider::OpenAi);
         }
-        if self.codex.is_some()
-            && !preferences
-                .skipped_providers
-                .contains(&SynthesisProvider::CodexCli)
-        {
-            providers.push(SynthesisProvider::CodexCli);
-        }
-        if self.claude.is_some()
-            && !preferences
-                .skipped_providers
-                .contains(&SynthesisProvider::ClaudeCli)
-        {
-            providers.push(SynthesisProvider::ClaudeCli);
-        }
         providers
     }
 
@@ -270,7 +116,7 @@ impl SynthesisBackendRegistry {
         F: FnMut(SynthesisProvider) -> Result<T, String>,
     {
         let providers = self.preferred_provider_order(preferences);
-        let Some(_) = providers.first().copied() else {
+        if providers.is_empty() {
             return ProviderCallResult {
                 provider: None,
                 value: Err(
@@ -278,7 +124,7 @@ impl SynthesisBackendRegistry {
                 ),
                 demoted_provider: None,
             };
-        };
+        }
 
         let mut first_failed_provider = None::<SynthesisProvider>;
         let mut last_error = None::<String>;
@@ -321,32 +167,6 @@ impl SynthesisBackendRegistry {
 fn provider_label(provider: SynthesisProvider) -> &'static str {
     match provider {
         SynthesisProvider::OpenAi => "openai",
-        SynthesisProvider::CodexCli => "codex",
-        SynthesisProvider::ClaudeCli => "claude",
-    }
-}
-
-pub fn load_dotenv_file() {
-    let Ok(raw) = fs::read_to_string(Path::new(".env")) else {
-        return;
-    };
-
-    for line in raw.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        let key = key.trim();
-        if key.is_empty() || env::var_os(key).is_some() {
-            continue;
-        }
-        let value = value.trim().trim_matches('"').trim_matches('\'');
-        if !value.is_empty() {
-            env::set_var(key, value);
-        }
     }
 }
 
@@ -362,274 +182,26 @@ fn openai_chat_completions_url() -> String {
     }
 }
 
-fn find_executable(name: &str) -> Option<String> {
-    let mut candidates = env::var_os("PATH")
-        .into_iter()
-        .flat_map(|path| env::split_paths(&path).collect::<Vec<_>>())
-        .collect::<Vec<_>>();
-    candidates.extend(standard_executable_dirs());
-
-    candidates.into_iter().find_map(|dir| {
-        let candidate = dir.join(name);
-        is_executable_file(&candidate).then(|| candidate.to_string_lossy().into_owned())
-    })
-}
-
-fn standard_executable_dirs() -> Vec<std::path::PathBuf> {
-    let mut dirs = vec![
-        "/opt/homebrew/bin".into(),
-        "/usr/local/bin".into(),
-        "/opt/local/bin".into(),
-        "/usr/bin".into(),
-        "/bin".into(),
-        "/usr/sbin".into(),
-        "/sbin".into(),
-    ];
-    if let Some(home) = env::var_os("HOME") {
-        dirs.push(std::path::PathBuf::from(&home).join(".local/bin"));
-        dirs.push(std::path::PathBuf::from(&home).join("bin"));
-    }
-    dirs
-}
-
-fn is_executable_file(path: &Path) -> bool {
-    let Ok(metadata) = fs::metadata(path) else {
-        return false;
-    };
-    if !metadata.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        metadata.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
-}
-
-pub fn normalize_summary_model(model: &str) -> String {
+pub fn normalize_terminal_assist_model(model: &str) -> String {
     let model = model.trim();
     if model.is_empty() {
-        DEFAULT_SUMMARY_MODEL.into()
+        DEFAULT_TERMINAL_ASSIST_MODEL.into()
     } else {
         model.into()
     }
 }
 
-pub fn normalize_naming_model(model: &str) -> String {
-    let model = model.trim();
-    if model.is_empty() {
-        DEFAULT_NAMING_MODEL.into()
-    } else {
-        model.into()
-    }
-}
-
-pub fn normalize_nudge_model(model: &str) -> String {
-    let model = model.trim();
-    if model.is_empty() {
-        DEFAULT_NUDGE_MODEL.into()
-    } else {
-        model.into()
-    }
-}
-
-fn normalize_cli_model(model: &str, default: &str) -> String {
-    let model = model.trim();
-    if model.is_empty() {
-        default.into()
-    } else {
-        model.into()
-    }
-}
-
-pub fn summary_signature(evidence: &TacticalEvidence) -> String {
-    json!({
-        "session_name": evidence.session_name,
-        "task_label": evidence.task_label,
-        "dominant_process": evidence.dominant_process,
-        "process_tree_excerpt": evidence.process_tree_excerpt,
-        "recent_files": evidence.recent_files,
-        "terminal_status_line": evidence.terminal_status_line,
-        "terminal_status_line_age_bucket": relative_age_bucket(evidence.terminal_status_line_age.as_deref()),
-        "recent_terminal_activity": normalize_time_annotated_lines(&evidence.recent_terminal_activity),
-        "recent_events": evidence.recent_events,
-    })
-    .to_string()
-}
-
-pub fn summary_substantive_signature(evidence: &TacticalEvidence) -> String {
-    json!({
-        "session_name": evidence.session_name,
-        "task_label": evidence.task_label,
-        "dominant_process": evidence.dominant_process,
-        "process_tree_excerpt": evidence.process_tree_excerpt,
-        "recent_files": evidence.recent_files,
-        "terminal_status_line": evidence.terminal_status_line,
-        "recent_terminal_activity": strip_time_annotated_lines(&evidence.recent_terminal_activity),
-        "recent_events": strip_time_annotated_lines(&evidence.recent_events),
-    })
-    .to_string()
-}
-
-pub fn should_skip_repeated_paused_summary(
-    last_summary: Option<&TacticalSynthesis>,
-    completed_substantive_signature: Option<&str>,
-    substantive_signature: &str,
-) -> bool {
-    matches!(
-        last_summary.map(|summary| summary.tactical_state),
-        Some(TacticalState::Stopped | TacticalState::Blocked)
-    ) && completed_substantive_signature == Some(substantive_signature)
-}
-
-fn idle_bucket(idle_seconds: Option<u64>) -> Option<&'static str> {
-    match idle_seconds? {
-        0..=4 => Some("0-4s"),
-        5..=14 => Some("5-14s"),
-        15..=29 => Some("15-29s"),
-        30..=59 => Some("30-59s"),
-        60..=119 => Some("60-119s"),
-        _ => Some("120s+"),
-    }
-}
-
-pub fn name_signature(evidence: &NamingEvidence) -> String {
-    json!({
-        "current_name": evidence.current_name,
-        "recent_terminal_history": normalize_time_annotated_lines(&evidence.recent_terminal_history),
-    })
-    .to_string()
-}
-
-pub fn nudge_signature(evidence: &NudgeEvidence) -> String {
-    json!({
-        "session_name": evidence.session_name,
-        "shell_child_command": evidence.shell_child_command,
-        "idle_bucket": idle_bucket(evidence.idle_seconds),
-        "tactical_state_brief": evidence.tactical_state_brief,
-        "attention_brief": evidence.attention_brief,
-        "headline": evidence.headline,
-        "recent_terminal_history": normalize_time_annotated_lines(&evidence.recent_terminal_history),
-    })
-    .to_string()
-}
-
-fn normalize_time_annotated_lines(lines: &[String]) -> Vec<String> {
-    lines
-        .iter()
-        .map(|line| normalize_time_annotated_line(line))
-        .collect()
-}
-
-fn strip_time_annotated_lines(lines: &[String]) -> Vec<String> {
-    lines
-        .iter()
-        .map(|line| strip_time_annotated_line(line))
-        .collect()
-}
-
-fn normalize_time_annotated_line(line: &str) -> String {
-    let Some((prefix, payload)) = line.split_once("] ") else {
-        return line.to_string();
-    };
-    let Some(label) = prefix.strip_prefix('[') else {
-        return line.to_string();
-    };
-    let Some(bucket) = relative_age_bucket(Some(label)) else {
-        return line.to_string();
-    };
-    format!("[{bucket}] {payload}")
-}
-
-fn strip_time_annotated_line(line: &str) -> String {
-    let Some((prefix, payload)) = line.split_once("] ") else {
-        return line.to_string();
-    };
-    if prefix.starts_with('[') {
-        payload.to_string()
-    } else {
-        line.to_string()
-    }
-}
-
-fn relative_age_bucket(label: Option<&str>) -> Option<&'static str> {
-    let label = label?.trim();
-    if label == "now" {
-        return Some("now");
-    }
-    if let Some(value) = label
-        .strip_suffix("s ago")
-        .and_then(|value| value.trim().parse::<u64>().ok())
-    {
-        return bucket_duration_seconds(value);
-    }
-    if let Some(value) = label
-        .strip_suffix("m ago")
-        .and_then(|value| value.trim().parse::<u64>().ok())
-    {
-        return bucket_duration_seconds(value.saturating_mul(60));
-    }
-    if let Some(value) = label
-        .strip_suffix("h ago")
-        .and_then(|value| value.trim().parse::<u64>().ok())
-    {
-        return bucket_duration_seconds(value.saturating_mul(3600));
-    }
-    None
-}
-
-fn bucket_duration_seconds(seconds: u64) -> Option<&'static str> {
-    Some(match seconds {
-        0..=4 => "0-4s",
-        5..=14 => "5-14s",
-        15..=29 => "15-29s",
-        30..=59 => "30-59s",
-        60..=299 => "1-4m",
-        300..=899 => "5-14m",
-        900..=3599 => "15-59m",
-        _ => "60m+",
-    })
-}
-
-fn summarize_openai_blocking(
+fn suggest_terminal_assist_openai_blocking(
     config: &OpenAiBackend,
     model: &str,
-    evidence: &TacticalEvidence,
-) -> Result<TacticalSynthesis, String> {
-    let request_body = json!({
-        "model": model,
-        "reasoning_effort": DEFAULT_REASONING_EFFORT,
-        "messages": [
-            {
-                "role": "system",
-                "content": tactical_system_prompt(),
-            },
-            {
-                "role": "user",
-                "content": format!(
-                    "Produce one grounded Exaterm tactical classification for this terminal session. Fill every field from the evidence below and do not invent unseen work, intent, or progress.\n\nEvidence:\n{}",
-                    serde_json::to_string_pretty(evidence).map_err(|error| error.to_string())?
-                ),
-            }
-        ],
-        "response_format": {
-            "type": "json_schema",
-            "json_schema": {
-                "name": "exaterm_tactical_summary",
-                "strict": true,
-                "schema": synthesis_schema(),
-            }
-        }
-    });
+    evidence: &TerminalAssistEvidence,
+) -> Result<TerminalAssistSuggestion, String> {
+    let request_body = terminal_assist_openai_request_body(model, evidence);
 
     let client = reqwest::blocking::Client::builder()
         .http1_only()
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(90))
+        .connect_timeout(Duration::from_secs(4))
+        .timeout(OPENAI_TERMINAL_ASSIST_TIMEOUT)
         .build()
         .map_err(format_error_chain)?;
 
@@ -649,587 +221,191 @@ fn summarize_openai_blocking(
 
     let text = extract_response_text(&payload)
         .ok_or_else(|| format!("response did not include parseable text: {payload}"))?;
-    parse_json_output::<TacticalSynthesis>(&text, "model synthesis")
-        .map(TacticalSynthesis::sanitize)
+    parse_json_output::<TerminalAssistSuggestion>(&text, "model terminal assist response")
+        .map(TerminalAssistSuggestion::sanitize)
 }
 
-fn suggest_name_openai_blocking(
-    config: &OpenAiBackend,
-    model: &str,
-    evidence: &NamingEvidence,
-) -> Result<NameSuggestion, String> {
-    let request_body = json!({
+fn terminal_assist_openai_request_body(model: &str, evidence: &TerminalAssistEvidence) -> Value {
+    json!({
         "model": model,
-        "reasoning_effort": DEFAULT_REASONING_EFFORT,
+        "max_completion_tokens": TERMINAL_ASSIST_MAX_TOKENS,
         "messages": [
             {
                 "role": "system",
-                "content": naming_system_prompt(),
+                "content": terminal_assist_system_prompt(),
             },
             {
                 "role": "user",
-                "content": format!(
-                    "Choose a stable operator-facing terminal name from this history. Return empty string if the history is still too thin:\n{}",
-                    serde_json::to_string_pretty(evidence).map_err(|error| error.to_string())?
-                ),
+                "content": terminal_assist_user_prompt(evidence),
             }
         ],
         "response_format": {
             "type": "json_schema",
             "json_schema": {
-                "name": "exaterm_terminal_name",
+                "name": "exaterm_terminal_assist",
                 "strict": true,
-                "schema": naming_schema(),
+                "schema": terminal_assist_schema(),
             }
         }
-    });
-
-    let client = reqwest::blocking::Client::builder()
-        .http1_only()
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(120))
-        .build()
-        .map_err(format_error_chain)?;
-
-    let response = client
-        .post(&config.base_url)
-        .bearer_auth(&config.api_key)
-        .header("Content-Type", "application/json")
-        .json(&request_body)
-        .send()
-        .map_err(format_error_chain)?;
-
-    let status = response.status();
-    let payload: Value = response.json().map_err(format_error_chain)?;
-    if !status.is_success() {
-        return Err(payload.to_string());
-    }
-
-    let text = extract_response_text(&payload)
-        .ok_or_else(|| format!("response did not include parseable text: {payload}"))?;
-    parse_json_output::<NameSuggestion>(&text, "model naming response")
-        .map(NameSuggestion::sanitize)
-}
-
-fn suggest_nudge_openai_blocking(
-    config: &OpenAiBackend,
-    model: &str,
-    evidence: &NudgeEvidence,
-) -> Result<NudgeSuggestion, String> {
-    let request_body = json!({
-        "model": model,
-        "reasoning_effort": DEFAULT_REASONING_EFFORT,
-        "messages": [
-            {
-                "role": "system",
-                "content": nudge_system_prompt(),
-            },
-            {
-                "role": "user",
-                "content": format!(
-                    "Write one short contextual nudge for this stopped terminal session. Return empty string if no safe, useful nudge is warranted:\n{}",
-                    serde_json::to_string_pretty(evidence).map_err(|error| error.to_string())?
-                ),
-            }
-        ],
-        "response_format": {
-            "type": "json_schema",
-            "json_schema": {
-                "name": "exaterm_terminal_nudge",
-                "strict": true,
-                "schema": nudge_schema(),
-            }
-        }
-    });
-
-    let client = reqwest::blocking::Client::builder()
-        .http1_only()
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(90))
-        .build()
-        .map_err(format_error_chain)?;
-
-    let response = client
-        .post(&config.base_url)
-        .bearer_auth(&config.api_key)
-        .header("Content-Type", "application/json")
-        .json(&request_body)
-        .send()
-        .map_err(format_error_chain)?;
-
-    let status = response.status();
-    let payload: Value = response.json().map_err(format_error_chain)?;
-    if !status.is_success() {
-        return Err(payload.to_string());
-    }
-
-    let text = extract_response_text(&payload)
-        .ok_or_else(|| format!("response did not include parseable text: {payload}"))?;
-    parse_json_output::<NudgeSuggestion>(&text, "model nudge response")
-        .map(NudgeSuggestion::sanitize)
-}
-
-fn format_error_chain(error: impl Error) -> String {
-    let mut parts = vec![error.to_string()];
-    let mut source = error.source();
-    while let Some(next) = source {
-        parts.push(next.to_string());
-        source = next.source();
-    }
-    parts.join(": ")
+    })
 }
 
 fn parse_json_output<T>(text: &str, label: &str) -> Result<T, String>
 where
-    T: serde::de::DeserializeOwned,
+    T: DeserializeOwned,
 {
-    let trimmed = text.trim();
-    serde_json::from_str::<T>(trimmed)
-        .or_else(|_| serde_json::from_str::<T>(&strip_markdown_fences(trimmed)))
-        .map_err(|error| format!("failed to parse {label}: {error}; payload={trimmed}"))
-}
-
-fn strip_markdown_fences(text: &str) -> String {
-    let trimmed = text.trim();
-    if let Some(fence_start) = trimmed.find("```") {
-        let after_fence = &trimmed[fence_start + 3..];
-        let body = after_fence
-            .lines()
-            .skip_while(|line| !line.trim().is_empty() && !line.trim_start().starts_with('{'))
-            .collect::<Vec<_>>()
-            .join("\n");
-        if let Some((json, _)) = body.split_once("```") {
-            return json.trim().to_string();
-        }
-        return body.trim().to_string();
-    }
-    trimmed.to_string()
-}
-
-fn summarize_cli_blocking(
-    backend: &CliBackend,
-    system_prompt: &str,
-    user_prompt: &str,
-) -> Result<TacticalSynthesis, String> {
-    let text = run_codex_cli(backend, system_prompt, user_prompt, &synthesis_schema())?;
-    parse_json_output::<TacticalSynthesis>(&text, "codex synthesis")
-        .map(TacticalSynthesis::sanitize)
-}
-
-fn summarize_claude_blocking(
-    backend: &CliBackend,
-    system_prompt: &str,
-    user_prompt: &str,
-) -> Result<TacticalSynthesis, String> {
-    let text = run_claude_cli(backend, system_prompt, user_prompt, &synthesis_schema())?;
-    parse_json_output::<TacticalSynthesis>(&text, "claude synthesis")
-        .map(TacticalSynthesis::sanitize)
-}
-
-fn suggest_name_cli_blocking(
-    backend: &CliBackend,
-    system_prompt: &str,
-    user_prompt: &str,
-) -> Result<NameSuggestion, String> {
-    let text = run_codex_cli(backend, system_prompt, user_prompt, &naming_schema())?;
-    parse_json_output::<NameSuggestion>(&text, "codex naming").map(NameSuggestion::sanitize)
-}
-
-fn suggest_name_claude_blocking(
-    backend: &CliBackend,
-    system_prompt: &str,
-    user_prompt: &str,
-) -> Result<NameSuggestion, String> {
-    let text = run_claude_cli(backend, system_prompt, user_prompt, &naming_schema())?;
-    parse_json_output::<NameSuggestion>(&text, "claude naming").map(NameSuggestion::sanitize)
-}
-
-fn suggest_nudge_cli_blocking(
-    backend: &CliBackend,
-    system_prompt: &str,
-    user_prompt: &str,
-) -> Result<NudgeSuggestion, String> {
-    let text = run_codex_cli(backend, system_prompt, user_prompt, &nudge_schema())?;
-    parse_json_output::<NudgeSuggestion>(&text, "codex nudge").map(NudgeSuggestion::sanitize)
-}
-
-fn suggest_nudge_claude_blocking(
-    backend: &CliBackend,
-    system_prompt: &str,
-    user_prompt: &str,
-) -> Result<NudgeSuggestion, String> {
-    let text = run_claude_cli(backend, system_prompt, user_prompt, &nudge_schema())?;
-    parse_json_output::<NudgeSuggestion>(&text, "claude nudge").map(NudgeSuggestion::sanitize)
-}
-
-fn run_codex_cli(
-    backend: &CliBackend,
-    system_prompt: &str,
-    user_prompt: &str,
-    schema: &Value,
-) -> Result<String, String> {
-    let schema_path = unique_temp_path("codex-schema", "json");
-    let output_path = unique_temp_path("codex-output", "json");
-    fs::write(
-        &schema_path,
-        serde_json::to_vec(schema).map_err(|error| error.to_string())?,
-    )
-    .map_err(|error| format!("failed to write codex schema file: {error}"))?;
-
-    let prompt = format!("{system_prompt}\n\n{user_prompt}");
-    let cwd = env::current_dir().map_err(|error| format!("failed to read current dir: {error}"))?;
-    let mut command = Command::new(&backend.program);
-    command
-        .arg("exec")
-        .arg("--skip-git-repo-check")
-        .arg("--sandbox")
-        .arg("read-only")
-        .arg("-m")
-        .arg(&backend.model)
-        .arg("--color")
-        .arg("never")
-        .arg("--output-schema")
-        .arg(&schema_path)
-        .arg("-o")
-        .arg(&output_path)
-        .arg("-C")
-        .arg(cwd)
-        .arg("-");
-    let result = run_command_with_input(command, &prompt, CLI_TIMEOUT, "codex");
-    let _ = fs::remove_file(&schema_path);
-    if result.is_err() {
-        let _ = fs::remove_file(&output_path);
-    }
-    result?;
-    let output = fs::read_to_string(&output_path)
-        .map_err(|error| format!("failed to read codex output file: {error}"));
-    let _ = fs::remove_file(&output_path);
-    output
-}
-
-fn run_claude_cli(
-    backend: &CliBackend,
-    system_prompt: &str,
-    user_prompt: &str,
-    schema: &Value,
-) -> Result<String, String> {
-    let schema_text = serde_json::to_string(schema).map_err(|error| error.to_string())?;
-    let mut command = Command::new(&backend.program);
-    command
-        .arg("-p")
-        .arg("--bare")
-        .arg("--no-session-persistence")
-        .arg("--model")
-        .arg(&backend.model)
-        .arg("--permission-mode")
-        .arg("plan")
-        .arg("--tools")
-        .arg("")
-        .arg("--system-prompt")
-        .arg(system_prompt)
-        .arg("--json-schema")
-        .arg(schema_text)
-        .arg(user_prompt);
-    run_command_with_input(command, "", CLI_TIMEOUT, "claude")
-}
-
-fn run_command_with_input(
-    mut command: Command,
-    input: &str,
-    timeout: Duration,
-    label: &str,
-) -> Result<String, String> {
-    command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("failed to spawn {label}: {error}"))?;
-    let mut stdout_reader = child.stdout.take().map(spawn_pipe_reader);
-    let mut stderr_reader = child.stderr.take().map(spawn_pipe_reader);
-
-    {
-        let stdin_result = (|| -> Result<(), String> {
-            let mut stdin = child
-                .stdin
-                .take()
-                .ok_or_else(|| format!("{label} stdin was unavailable"))?;
-            if !input.is_empty() {
-                std::io::Write::write_all(&mut stdin, input.as_bytes())
-                    .map_err(|error| format!("failed to write {label} stdin: {error}"))?;
-            }
-            Ok(())
-        })();
-        if let Err(error) = stdin_result {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = join_pipe_reader(&mut stdout_reader, label, "stdout");
-            let _ = join_pipe_reader(&mut stderr_reader, label, "stderr");
-            return Err(error);
+    let candidates = json_output_candidates(text);
+    let mut last_error = None;
+    for candidate in &candidates {
+        match serde_json::from_str::<T>(candidate) {
+            Ok(value) => return Ok(value),
+            Err(error) => last_error = Some(error),
         }
     }
-
-    let status = match wait_for_child(&mut child, timeout, label) {
-        Ok(status) => status,
-        Err(error) => {
-            let _ = join_pipe_reader(&mut stdout_reader, label, "stdout");
-            let _ = join_pipe_reader(&mut stderr_reader, label, "stderr");
-            return Err(error);
-        }
-    };
-    let stdout = join_pipe_reader(&mut stdout_reader, label, "stdout")?;
-    let stderr = join_pipe_reader(&mut stderr_reader, label, "stderr")?;
-    if status.success() {
-        Ok(stdout.trim().to_string())
-    } else if stderr.trim().is_empty() {
-        Err(format!("{label} exited with status {status}"))
-    } else {
-        Err(format!(
-            "{label} exited with status {status}: {}",
-            stderr.trim()
-        ))
-    }
-}
-
-fn spawn_pipe_reader<T>(mut pipe: T) -> thread::JoinHandle<Result<String, String>>
-where
-    T: Read + Send + 'static,
-{
-    thread::spawn(move || {
-        let mut text = String::new();
-        pipe.read_to_string(&mut text)
-            .map_err(|error| format!("failed to read subprocess output: {error}"))?;
-        Ok(text)
-    })
-}
-
-fn join_pipe_reader(
-    handle: &mut Option<thread::JoinHandle<Result<String, String>>>,
-    label: &str,
-    stream_label: &str,
-) -> Result<String, String> {
-    let Some(handle) = handle.take() else {
-        return Ok(String::new());
-    };
-    handle
-        .join()
-        .map_err(|_| format!("failed to join {label} {stream_label} reader"))?
-}
-
-fn wait_for_child(child: &mut Child, timeout: Duration, label: &str) -> Result<ExitStatus, String> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|error| format!("failed to wait for {label}: {error}"))?
-        {
-            return Ok(status);
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(format!("{label} timed out after {}s", timeout.as_secs()));
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-}
-
-fn unique_temp_path(prefix: &str, extension: &str) -> std::path::PathBuf {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    env::temp_dir().join(format!(
-        "exaterm-{prefix}-{}-{nanos}-{seq}.{extension}",
-        std::process::id()
+    let error = last_error
+        .map(|error| error.to_string())
+        .unwrap_or_else(|| "no JSON candidate found".into());
+    Err(format!(
+        "failed to parse {label} as JSON: {error}; output: {text}"
     ))
 }
 
-fn tactical_system_prompt() -> &'static str {
-    r#"
-You are a structured terminal-state synthesizer for Exaterm, a Linux supervision app used to watch multiple AI coding agents running in terminal sessions.
-
-Your job is to read relative-age terminal history plus machine evidence and produce one compact, grounded tactical summary for one session.
-
-Use only the provided evidence.
-Do not invent hidden thoughts, unseen tools, unseen files, or internal model state.
-Prefer multi-line terminal history and concrete machine evidence over a single optimistic status line when they disagree.
-Treat the terminal history age labels and terminal_status_line_age as relative recency hints. Older evidence should count less than fresh evidence.
-Treat a fresh terminal_status_line plus a very recent terminal_status_line_age as strong evidence that the session is still actively working, even if the rest of the visible scrollback is sparse.
-Do not dismiss a live-looking spinner/progress/status line as mere optimism when it is updating recently.
-
-Return one compact JSON object only.
-
-You must fill these dimensions:
-- tactical_state plus tactical_state_brief: the broad present-tense state of the session
-- attention_level plus attention_brief: how closely and urgently the human operator should be paying attention to this session right now
-- headline: one short operator-facing sentence that will appear directly under the terminal name
-- tool_not_likely_coding_agent: true only when the current session does not appear to be an AI coding-agent workflow and the operator should stop spending supervision budget on it until fresh user input arrives
-
-You must always choose a real tactical_state and a real attention_level.
-
-Tactical state meanings:
-- idle: truly passive no-goal state; untouched shell, stable monitor, or nothing meaningful to resume
-- stopped: useful work paused in a way that a simple continue or light nudge could plausibly restart
-- thinking: mainly diagnosing, planning, or reasoning, with little concrete execution evidence
-- working: actively executing concrete repair, test, build, edit, or tool loops
-- blocked: cannot usefully continue without real human input or an external dependency being resolved
-- failed: the session itself has actually failed or given up in a way that leaves no active recovery loop
-- complete: genuinely finished successfully, with strong visible terminal evidence of successful completion and no meaningful remaining work
-- detached: the terminal/runtime is no longer really attached to a live working loop
-
-Guidance:
-- use idle only for truly passive no-goal states
-- do not use idle just because the agent tried one or two things and then went quiet
-- after recent concrete work, a quiet pause is usually stopped, not idle, if a simple continue could resume useful work
-- if tool_not_likely_coding_agent is true, set tactical_state to idle and attention_level to autopilot
-- set tool_not_likely_coding_agent to false when the evidence suggests a real coding-agent session, even if the agent is currently running a subprocess like cargo, pytest, git, or bash under that agent
-- use complete rarely; the bar is high
-- do not use complete for 'looks good', 'standing by', 'ready for the next instruction', or a single successful substep
-- when unsure between idle and stopped after recent work, prefer stopped
-- when unsure between idle and complete, strongly prefer idle or stopped
-- explicit approval prompts, credential gates, missing access, and hard operator boundaries are blocked
-
-Attention level meanings:
-- autopilot: safe to leave alone; little operator attention needed
-- monitor: worth watching, but no likely action yet
-- guide: likely needs a light nudge, redirect, or closer supervision soon
-- intervene: likely needs explicit operator involvement now
-- takeover: operator should take direct control because the agent is no longer safely or effectively self-directing
-
-Attention guidance:
-- attention_level is about operator attention, not mere visible activity
-- autopilot may still apply to active work when the loop is routine, low-risk, and methodical, and there is no sign that the operator needs to watch it closely
-- routine code review, ordinary repository inspection, research, and localized fixes should usually be autopilot if they are proceeding normally
-- use monitor for work that still looks healthy but deserves closer watch because there are signs of turbulence, the agent is making broad or sweeping changes, or the blast radius of the current pass is materially wider than a localized fix
-- do not use monitor merely because a healthy job is still running or because tests are in flight
-- clean, fresh edit/test/build loops with concrete progress signals should usually stay at autopilot or monitor, not guide
-- stopped states should not be below guide; if the session is truly stopped, it already implies some direct push, nudge, or operator re-engagement is needed
-- blocked states should not be below guide; blocked usually maps to intervene because useful progress requires real operator input or approval
-- use guide when the agent likely needs a light push, redirect, prioritization, or clarification to resume useful work
-- do not use guide for a merely clean parked idle session; if there is no meaningful direct push needed, prefer idle + autopilot instead of stopped
-- risky behavior, destructive ideas, repeated unproductive looping, escalating shortcuts, obvious meandering, or evidence/narrative divergence should raise attention_level
-- blocked approval/input boundaries usually map to intervene
-- dangerous or destructive drift can justify takeover
-
-Writing guidance:
-- keep headline short, concrete, and useful
-- keep briefs factual, grounded, and non-formulaic
-- attention_brief should explain both what is happening and why it deserves that level of attention
-- avoid repetitive boilerplate
-- do not be verbose
-"#
-    .trim()
+fn json_output_candidates(text: &str) -> Vec<String> {
+    let trimmed = text.trim();
+    let mut candidates = Vec::new();
+    let fenced_blocks = extract_fenced_json_blocks(trimmed);
+    for fenced in fenced_blocks.into_iter().rev() {
+        push_unique_candidate(&mut candidates, fenced);
+    }
+    if trimmed.starts_with('{') {
+        push_unique_candidate(&mut candidates, trimmed.to_string());
+    }
+    let json_objects = extract_json_objects(trimmed);
+    for object in json_objects.into_iter().rev() {
+        push_unique_candidate(&mut candidates, object);
+    }
+    if candidates.is_empty() {
+        candidates.push(trimmed.to_string());
+    }
+    candidates
 }
 
-fn naming_system_prompt() -> &'static str {
-    r#"
-You are a terminal session naming system for Exaterm, a Linux app used to supervise AI coding agents running in terminal sessions.
-
-You receive a current operator-facing name, which may be empty, plus a long terminal-history window.
-
-Return one compact JSON object only.
-
-Choose a short, stable, operator-scannable name that reflects what this session is actually working on.
-Defer strongly to stable names: if the current name is still good, keep it or make only a very small refinement.
-Do not rename eagerly based on one transient command, one tool invocation, or one narrow substep.
-Prefer names that will still make sense a few minutes later.
-Use the terminal history, not hidden assumptions.
-Do not mention model names, terminals, or generic labels like 'Agent' or 'Shell' unless the history truly gives you nothing better.
-If the history is still too thin, too generic, or too ambiguous to choose a good stable name, return an empty string.
-Keep the name concise, ideally 2 to 5 words and at most 40 characters.
-
-Return JSON only.
-"#
-    .trim()
+fn push_unique_candidate(candidates: &mut Vec<String>, candidate: String) {
+    let candidate = candidate.trim().to_string();
+    if !candidate.is_empty() && !candidates.iter().any(|existing| existing == &candidate) {
+        candidates.push(candidate);
+    }
 }
 
-fn nudge_system_prompt() -> &'static str {
-    r#"
-You write one short terminal nudge for an AI coding agent session in Exaterm.
-
-The session has already been classified as stopped rather than idle, blocked, or complete.
-You are also given the current executing command directly under the shell.
-If there is no current direct shell child command, or it does not look like a coding agent, return an empty string.
-
-Your job is to choose one very generic restart prompt that can help the agent resume useful work.
-Use only the provided evidence.
-Do not ask questions.
-Do not mention Exaterm, JSON, or that you are an AI.
-Do not explain your reasoning.
-Do not be verbose.
-Do not give task-specific advice.
-Do not mention files, tests, errors, plans, or the next concrete step.
-Choose exactly one of these strings:
-- ""
-- "Continue."
-- "Keep going."
-- "Proceed."
-- "Resume."
-
-Prefer the simplest valid nudge.
-If there is no safe, useful nudge, return an empty string.
-
-Return JSON only.
-"#
-    .trim()
+fn extract_fenced_json_blocks(text: &str) -> Vec<String> {
+    let mut blocks = Vec::new();
+    let mut remaining = text;
+    while let Some(fence_start) = remaining.find("```") {
+        let after_fence = &remaining[fence_start + 3..];
+        let body_start = after_fence
+            .find(|ch| ch == '\n' || ch == '\r')
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        let body = &after_fence[body_start..];
+        let Some(fence_end) = body.find("```") else {
+            break;
+        };
+        blocks.push(body[..fence_end].trim().to_string());
+        remaining = &body[fence_end + 3..];
+    }
+    blocks
 }
 
-fn synthesis_schema() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "tactical_state": {
-                "type": "string",
-                "enum": ["idle", "stopped", "thinking", "working", "blocked", "failed", "complete", "detached"]
-            },
-            "tactical_state_brief": { "type": ["string", "null"] },
-            "attention_level": {
-                "type": "string",
-                "enum": ["autopilot", "monitor", "guide", "intervene", "takeover"]
-            },
-            "attention_brief": { "type": ["string", "null"] },
-            "headline": { "type": ["string", "null"] },
-            "tool_not_likely_coding_agent": { "type": "boolean" },
-        },
-        "required": [
-            "tactical_state",
-            "tactical_state_brief",
-            "attention_level",
-            "attention_brief",
-            "headline",
-            "tool_not_likely_coding_agent",
-        ],
-        "additionalProperties": false
-    })
-}
+fn extract_json_objects(text: &str) -> Vec<String> {
+    let mut objects = Vec::new();
+    let mut start = None;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
 
-fn naming_schema() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "name": { "type": "string" }
-        },
-        "required": ["name"],
-        "additionalProperties": false
-    })
-}
-
-fn nudge_schema() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "text": {
-                "type": "string",
-                "enum": ["", "Continue.", "Keep going.", "Proceed.", "Resume."]
+    for (index, ch) in text.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
             }
+            continue;
+        }
+
+        match ch {
+            '"' if depth > 0 => in_string = true,
+            '{' => {
+                if depth == 0 {
+                    start = Some(index);
+                }
+                depth += 1;
+            }
+            '}' if depth > 0 => {
+                depth -= 1;
+                if depth == 0 {
+                    if let Some(start) = start.take() {
+                        objects.push(text[start..index + ch.len_utf8()].trim().to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    objects
+}
+
+fn terminal_assist_system_prompt() -> &'static str {
+    r#"
+You write one terminal insertion for Exaterm Ctrl-K assist.
+
+The operator is editing a real terminal input line. Your output will be inserted into that terminal, not executed automatically.
+
+Use only the provided evidence.
+Return one compact JSON object only.
+The final structured object in your response must be:
+{"insert_text":"<one command or shell snippet>"}
+Do not use markdown.
+Do not wrap the command in code fences.
+Do not explain your reasoning.
+Do not ask questions.
+Do not claim you ran anything.
+Do not include surrounding prose, bullets, labels, or comments.
+
+The insert_text field must contain exactly one shell command or shell snippet suitable for insertion at the cursor.
+Prefer a single command line.
+Use a multi-command shell snippet only when the operator explicitly asks for it and it still belongs on one terminal input line.
+Default to non-destructive commands: inspect, search, print, validate, test, or stage-free local edits only when the operator explicitly asks for an edit.
+Do not suggest destructive commands such as rm -rf, git reset --hard, force push, broad chmod/chown, killall, destructive sudo operations, package removal, or data deletion unless the operator explicitly asks for that exact action and the evidence makes the target unambiguous.
+If the operator request is unsafe, unclear, unrelated to terminal work, or cannot be answered from the evidence, return an empty insert_text string.
+
+Respect the working_directory and recent_files evidence when choosing paths.
+Do not invent files or directories that are not present in the evidence unless the operator explicitly asks to create them.
+Prefer relative paths already visible in recent_files over absolute paths.
+Return insertion text only; never include markdown or explanatory text inside insert_text.
+"#
+    .trim()
+}
+
+fn terminal_assist_user_prompt(evidence: &TerminalAssistEvidence) -> String {
+    format!(
+        "Return one shell command/snippet for this Ctrl-K terminal assist request. End with a compact JSON object containing only insert_text; insert_text must be insertion-only text for the originating terminal input line:\n{}",
+        serde_json::to_string_pretty(evidence)
+            .map_err(|error| error.to_string())
+            .unwrap_or_default()
+    )
+}
+
+fn terminal_assist_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "insert_text": { "type": "string" }
         },
-        "required": ["text"],
+        "required": ["insert_text"],
         "additionalProperties": false
     })
 }
@@ -1273,89 +449,134 @@ pub fn extract_response_text(payload: &Value) -> Option<String> {
         })
 }
 
+fn format_error_chain(error: impl Error) -> String {
+    let mut message = error.to_string();
+    let mut source = error.source();
+    while let Some(error) = source {
+        message.push_str(": ");
+        message.push_str(&error.to_string());
+        source = error.source();
+    }
+    message
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        AttentionLevel, CliBackend, DEFAULT_CLAUDE_CLI_MODEL, DEFAULT_CODEX_CLI_MODEL,
-        DEFAULT_NAMING_MODEL, DEFAULT_NUDGE_MODEL, DEFAULT_SUMMARY_MODEL, NameSuggestion,
-        NamingEvidence, NudgeEvidence, OpenAiBackend, ProviderPreferences,
-        SynthesisBackendRegistry, SynthesisProvider, TacticalEvidence, TacticalState,
-        TacticalSynthesis, extract_response_text, name_signature, normalize_naming_model,
-        normalize_summary_model, nudge_schema, nudge_signature, openai_chat_completions_url,
-        run_command_with_input, should_skip_repeated_paused_summary, summary_signature,
-        summary_substantive_signature, synthesis_schema, tactical_system_prompt,
+        extract_response_text, normalize_terminal_assist_model, openai_chat_completions_url,
+        terminal_assist_openai_request_body, terminal_assist_schema, terminal_assist_system_prompt,
+        terminal_assist_user_prompt, OpenAiBackend, ProviderPreferences, SynthesisBackendRegistry,
+        SynthesisProvider, TerminalAssistEvidence, TerminalAssistSuggestion,
+        DEFAULT_TERMINAL_ASSIST_MODEL, TERMINAL_ASSIST_MAX_TOKENS,
     };
     use serde_json::json;
     use std::collections::BTreeSet;
-    use std::fs;
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
-    use std::path::PathBuf;
-    use std::process::Command;
     use std::sync::Mutex;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
-    #[derive(Clone)]
-    struct FixtureExpectations {
-        tactical_states: Vec<TacticalState>,
-        attention_levels: Vec<AttentionLevel>,
-    }
-
-    fn unique_temp_dir(label: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock should be after epoch")
-            .as_nanos();
-        std::env::temp_dir().join(format!("exaterm-synthesis-{label}-{nanos}"))
-    }
-
-    #[cfg(unix)]
-    fn write_fake_executable(dir: &PathBuf, name: &str) {
-        let path = dir.join(name);
-        fs::write(&path, "#!/bin/sh\nexit 0\n").expect("write fake executable");
-        let mut perms = fs::metadata(&path).expect("metadata").permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&path, perms).expect("chmod fake executable");
+    fn test_registry() -> SynthesisBackendRegistry {
+        SynthesisBackendRegistry {
+            openai: None,
+            terminal_assist_model: DEFAULT_TERMINAL_ASSIST_MODEL.into(),
+        }
     }
 
     #[test]
-    fn summary_model_defaults_and_preserves_exact_name() {
-        assert_eq!(normalize_summary_model("gpt-5.4-nano"), "gpt-5.4-nano");
-        assert_eq!(normalize_summary_model(""), "gpt-5.4-nano");
-        assert_eq!(normalize_summary_model("gpt-5.4"), "gpt-5.4");
-    }
-
-    #[test]
-    fn naming_model_defaults_and_preserves_exact_name() {
-        assert_eq!(normalize_naming_model("gpt-5.4-nano"), "gpt-5.4-nano");
-        assert_eq!(normalize_naming_model(""), "gpt-5.4-nano");
-        assert_eq!(normalize_naming_model("gpt-5.4"), "gpt-5.4");
-    }
-
-    #[test]
-    fn cli_model_defaults_and_preserves_exact_name() {
+    fn terminal_assist_model_defaults_and_preserves_exact_name() {
         assert_eq!(
-            super::normalize_cli_model("", "gpt-5.4-mini"),
-            "gpt-5.4-mini"
+            normalize_terminal_assist_model("gpt-5.5-nano"),
+            "gpt-5.5-nano"
         );
-        assert_eq!(super::normalize_cli_model("haiku", "other"), "haiku");
+        assert_eq!(DEFAULT_TERMINAL_ASSIST_MODEL, "gpt-5.5-nano");
+        assert_eq!(
+            normalize_terminal_assist_model(""),
+            DEFAULT_TERMINAL_ASSIST_MODEL
+        );
+        assert_eq!(normalize_terminal_assist_model("gpt-5.4"), "gpt-5.4");
     }
 
     #[test]
-    fn nudge_schema_is_constrained_to_generic_prompts() {
-        let schema = nudge_schema();
-        let allowed = schema["properties"]["text"]["enum"]
-            .as_array()
-            .expect("nudge text enum");
-        let values = allowed
-            .iter()
-            .map(|value| value.as_str().expect("string enum"))
-            .collect::<Vec<_>>();
+    fn terminal_assist_schema_requires_insert_text_only() {
+        let schema = terminal_assist_schema();
+
+        assert_eq!(schema["properties"]["insert_text"]["type"], "string");
+        assert_eq!(schema["required"], json!(["insert_text"]));
+        assert_eq!(schema["additionalProperties"], false);
+    }
+
+    #[test]
+    fn terminal_assist_prompt_requires_json_insertion_only_and_non_destructive_default() {
+        let prompt = terminal_assist_system_prompt();
+
+        assert!(prompt.contains("Return one compact JSON object only."));
+        assert!(prompt.contains(r#"{"insert_text":"<one command or shell snippet>"}"#));
+        assert!(prompt.contains("Do not use markdown."));
+        assert!(prompt.contains("exactly one shell command or shell snippet"));
+        assert!(prompt.contains("suitable for insertion at the cursor"));
+        assert!(prompt.contains("Default to non-destructive commands"));
+        assert!(prompt.contains("Do not suggest destructive commands"));
+        assert!(prompt.contains("rm -rf"));
+        assert!(prompt.contains("git reset --hard"));
+    }
+
+    #[test]
+    fn terminal_assist_user_prompt_includes_relevant_evidence_fields() {
+        let evidence = TerminalAssistEvidence {
+            session_name: "Parser".into(),
+            operator_prompt: "rerun the parser test".into(),
+            current_input: "cargo test ".into(),
+            working_directory: Some("/home/luke/projects/exaterm".into()),
+            shell_child_command: Some("codex".into()),
+            active_command: Some("cargo test parser".into()),
+            dominant_process: Some("cargo".into()),
+            process_tree_excerpt: Some("bash | codex | cargo".into()),
+            recent_files: vec!["crates/exaterm-core/src/synthesis.rs".into()],
+            terminal_status_line: Some("parser tests failed".into()),
+            recent_terminal_history: vec!["error: parser snapshot changed".into()],
+        };
+
+        let prompt = terminal_assist_user_prompt(&evidence);
+
+        assert!(prompt.contains("\"operator_prompt\": \"rerun the parser test\""));
+        assert!(prompt.contains("\"current_input\": \"cargo test \""));
+        assert!(prompt.contains("\"working_directory\": \"/home/luke/projects/exaterm\""));
+        assert!(prompt.contains("\"shell_child_command\": \"codex\""));
+        assert!(prompt.contains("\"active_command\": \"cargo test parser\""));
+        assert!(prompt.contains("\"dominant_process\": \"cargo\""));
+        assert!(prompt.contains("\"process_tree_excerpt\": \"bash | codex | cargo\""));
+        assert!(prompt.contains("\"recent_files\""));
+        assert!(prompt.contains("crates/exaterm-core/src/synthesis.rs"));
+        assert!(prompt.contains("\"terminal_status_line\": \"parser tests failed\""));
+        assert!(prompt.contains("\"recent_terminal_history\""));
+        assert!(prompt.contains("originating terminal input line"));
+        assert!(prompt.contains("insert_text must be insertion-only text"));
+    }
+
+    #[test]
+    fn terminal_assist_openai_request_uses_fast_json_only_model_call() {
+        let evidence = TerminalAssistEvidence {
+            session_name: "Shell".into(),
+            operator_prompt: "disk usage".into(),
+            current_input: String::new(),
+            working_directory: Some("/tmp/project".into()),
+            shell_child_command: None,
+            active_command: None,
+            dominant_process: None,
+            process_tree_excerpt: None,
+            recent_files: Vec::new(),
+            terminal_status_line: None,
+            recent_terminal_history: Vec::new(),
+        };
+
+        let body = terminal_assist_openai_request_body(DEFAULT_TERMINAL_ASSIST_MODEL, &evidence);
+
+        assert_eq!(body["model"], DEFAULT_TERMINAL_ASSIST_MODEL);
+        assert_eq!(body["max_completion_tokens"], TERMINAL_ASSIST_MAX_TOKENS);
+        assert!(body.get("reasoning_effort").is_none());
         assert_eq!(
-            values,
-            vec!["", "Continue.", "Keep going.", "Proceed.", "Resume."]
+            body["response_format"]["json_schema"]["schema"]["required"],
+            json!(["insert_text"])
         );
     }
 
@@ -1391,14 +612,14 @@ mod tests {
             "choices": [
                 {
                     "message": {
-                        "content": "{\"headline\":\"cargo test parser\"}"
+                        "content": "{\"insert_text\":\"du -sh .\"}"
                     }
                 }
             ]
         });
 
         let text = extract_response_text(&payload).expect("text should be extracted");
-        assert!(text.contains("\"headline\":\"cargo test parser\""));
+        assert!(text.contains("\"insert_text\":\"du -sh .\""));
     }
 
     #[test]
@@ -1409,7 +630,7 @@ mod tests {
                     "content": [
                         {
                             "type": "output_text",
-                            "text": "{\"tactical_state\":\"working\",\"tactical_state_brief\":\"tests are running\",\"attention_level\":\"monitor\",\"attention_brief\":\"The loop is healthy and worth watching\",\"headline\":\"cargo test parser\"}"
+                            "text": "{\"insert_text\":\"cargo test\"}"
                         }
                     ]
                 }
@@ -1417,87 +638,63 @@ mod tests {
         });
 
         let text = extract_response_text(&payload).expect("text should be extracted");
-        assert!(text.contains("\"headline\":\"cargo test parser\""));
+        assert!(text.contains("\"insert_text\":\"cargo test\""));
     }
 
     #[test]
     fn parse_json_output_accepts_fenced_json() {
-        let parsed = super::parse_json_output::<NameSuggestion>(
-            "```json\n{\"name\":\"Parser pass\"}\n```",
+        let parsed = super::parse_json_output::<TerminalAssistSuggestion>(
+            "```json\n{\"insert_text\":\"du -sh .\"}\n```",
             "fenced",
         )
         .expect("fenced json should parse");
-        assert_eq!(parsed.name, "Parser pass");
+        assert_eq!(parsed.insert_text, "du -sh .");
     }
 
     #[test]
     fn parse_json_output_accepts_fenced_json_with_leading_text() {
-        let parsed = super::parse_json_output::<NameSuggestion>(
-            "Here is the result:\n```json\n{\"name\":\"Parser pass\"}\n```",
+        let parsed = super::parse_json_output::<TerminalAssistSuggestion>(
+            "Here is the result:\n```json\n{\"insert_text\":\"cargo test\"}\n```",
             "fenced-leading",
         )
         .expect("fenced json with leading text should parse");
-        assert_eq!(parsed.name, "Parser pass");
+        assert_eq!(parsed.insert_text, "cargo test");
     }
 
     #[test]
-    fn backend_registry_prefers_openai_over_cli_fallbacks() {
+    fn parse_json_output_prefers_final_structured_object() {
+        let parsed = super::parse_json_output::<TerminalAssistSuggestion>(
+            "Need to inspect disk usage.\n{\"insert_text\":\"echo wrong\"}\nFinal:\n{\"insert_text\":\"du -sh .\"}",
+            "final-json",
+        )
+        .expect("final json should parse");
+        assert_eq!(parsed.insert_text, "du -sh .");
+    }
+
+    #[test]
+    fn backend_registry_uses_openai_when_configured() {
         let _guard = ENV_MUTEX
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        let fake_bin = unique_temp_dir("prefer-openai");
-        fs::create_dir_all(&fake_bin).expect("create fake bin");
-        write_fake_executable(&fake_bin, "codex");
-        write_fake_executable(&fake_bin, "claude");
-
-        let old_path = std::env::var("PATH").unwrap_or_default();
-        std::env::set_var("PATH", &fake_bin);
         std::env::set_var("OPENAI_API_KEY", "test-key");
 
         let registry = SynthesisBackendRegistry::from_env().expect("registry should exist");
         assert_eq!(
             registry.preferred_provider_order(&ProviderPreferences::default()),
-            vec![
-                SynthesisProvider::OpenAi,
-                SynthesisProvider::CodexCli,
-                SynthesisProvider::ClaudeCli
-            ]
+            vec![SynthesisProvider::OpenAi]
         );
 
-        std::env::set_var("PATH", old_path);
         std::env::remove_var("OPENAI_API_KEY");
-        let _ = fs::remove_dir_all(fake_bin);
     }
 
     #[test]
-    fn backend_registry_uses_codex_before_claude_without_openai() {
+    fn backend_registry_requires_openai_for_terminal_assist() {
         let _guard = ENV_MUTEX
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        let fake_bin = unique_temp_dir("prefer-codex");
-        fs::create_dir_all(&fake_bin).expect("create fake bin");
-        write_fake_executable(&fake_bin, "codex");
-        write_fake_executable(&fake_bin, "claude");
-
-        let old_path = std::env::var("PATH").unwrap_or_default();
-        std::env::set_var("PATH", &fake_bin);
         std::env::remove_var("OPENAI_API_KEY");
 
-        let registry = SynthesisBackendRegistry::from_env().expect("registry should exist");
-        assert_eq!(
-            registry.preferred_provider_order(&ProviderPreferences::default()),
-            vec![SynthesisProvider::CodexCli, SynthesisProvider::ClaudeCli]
-        );
-        let skipped = BTreeSet::from([SynthesisProvider::CodexCli]);
-        assert_eq!(
-            registry.preferred_provider_order(&ProviderPreferences {
-                skipped_providers: skipped
-            }),
-            vec![SynthesisProvider::ClaudeCli]
-        );
-
-        std::env::set_var("PATH", old_path);
-        let _ = fs::remove_dir_all(fake_bin);
+        assert!(SynthesisBackendRegistry::from_env().is_none());
     }
 
     #[test]
@@ -1507,17 +704,7 @@ mod tests {
                 api_key: "test-key".into(),
                 base_url: "https://example.invalid/v1/chat/completions".into(),
             }),
-            codex: Some(CliBackend {
-                program: "codex".into(),
-                model: DEFAULT_CODEX_CLI_MODEL.into(),
-            }),
-            claude: Some(CliBackend {
-                program: "claude".into(),
-                model: DEFAULT_CLAUDE_CLI_MODEL.into(),
-            }),
-            summary_model: DEFAULT_SUMMARY_MODEL.into(),
-            naming_model: DEFAULT_NAMING_MODEL.into(),
-            nudge_model: DEFAULT_NUDGE_MODEL.into(),
+            terminal_assist_model: DEFAULT_TERMINAL_ASSIST_MODEL.into(),
         };
 
         let skipped = BTreeSet::from([SynthesisProvider::OpenAi]);
@@ -1525,34 +712,8 @@ mod tests {
             registry.preferred_provider_order(&ProviderPreferences {
                 skipped_providers: skipped,
             }),
-            vec![SynthesisProvider::CodexCli, SynthesisProvider::ClaudeCli]
+            Vec::<SynthesisProvider>::new()
         );
-    }
-
-    #[test]
-    fn find_executable_checks_standard_dirs_after_path() {
-        let _guard = ENV_MUTEX
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let fake_home = unique_temp_dir("standard-dirs");
-        let fake_local_bin = fake_home.join(".local/bin");
-        fs::create_dir_all(&fake_local_bin).expect("create fake local bin");
-        write_fake_executable(&fake_local_bin, "codex");
-
-        let old_home = std::env::var("HOME").ok();
-        let old_path = std::env::var("PATH").unwrap_or_default();
-        std::env::set_var("HOME", &fake_home);
-        std::env::set_var("PATH", "/usr/bin:/bin");
-
-        let discovered = super::find_executable("codex");
-        assert!(discovered.is_some(), "codex should be discoverable");
-
-        match old_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
-        }
-        std::env::set_var("PATH", old_path);
-        let _ = fs::remove_dir_all(fake_home);
     }
 
     #[test]
@@ -1560,131 +721,60 @@ mod tests {
         let _guard = ENV_MUTEX
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        let old_path = std::env::var("PATH").unwrap_or_default();
-        std::env::set_var("PATH", "/usr/bin:/bin");
         std::env::remove_var("OPENAI_API_KEY");
-        if super::find_executable("codex").is_none()
-            && super::find_executable("claude").is_none()
-            && super::find_executable("claude-code").is_none()
-        {
-            assert!(SynthesisBackendRegistry::from_env().is_none());
-        }
-
-        std::env::set_var("PATH", old_path);
+        assert!(SynthesisBackendRegistry::from_env().is_none());
     }
 
     #[test]
-    fn run_with_fallback_demotes_failed_subprocess_and_uses_next_provider() {
-        let registry = SynthesisBackendRegistry {
-            openai: None,
-            codex: Some(CliBackend {
-                program: "codex".into(),
-                model: DEFAULT_CODEX_CLI_MODEL.into(),
-            }),
-            claude: Some(CliBackend {
-                program: "claude".into(),
-                model: DEFAULT_CLAUDE_CLI_MODEL.into(),
-            }),
-            summary_model: DEFAULT_SUMMARY_MODEL.into(),
-            naming_model: DEFAULT_NAMING_MODEL.into(),
-            nudge_model: DEFAULT_NUDGE_MODEL.into(),
-        };
+    fn run_with_fallback_does_not_use_cli_without_openai() {
+        let registry = test_registry();
         let mut calls = Vec::new();
         let result = registry.run_with_fallback(&ProviderPreferences::default(), |provider| {
             calls.push(provider);
-            match provider {
-                SynthesisProvider::CodexCli => Err("codex failed".into()),
-                SynthesisProvider::ClaudeCli => Ok("ok".to_string()),
-                SynthesisProvider::OpenAi => Err("unexpected openai".into()),
-            }
+            Ok("ok".to_string())
         });
 
-        assert_eq!(
-            calls,
-            vec![SynthesisProvider::CodexCli, SynthesisProvider::ClaudeCli]
-        );
-        assert_eq!(result.provider, Some(SynthesisProvider::ClaudeCli));
-        assert_eq!(result.demoted_provider, Some(SynthesisProvider::CodexCli));
-        assert_eq!(result.value.expect("fallback should succeed"), "ok");
+        assert!(calls.is_empty());
+        assert_eq!(result.provider, None);
+        assert_eq!(result.demoted_provider, None);
+        assert!(result.value.is_err());
     }
 
     #[test]
-    fn run_with_fallback_demotes_failed_openai_and_uses_next_provider() {
+    fn run_with_fallback_returns_openai_error_without_cli_fallback() {
         let registry = SynthesisBackendRegistry {
             openai: Some(OpenAiBackend {
                 api_key: "test-key".into(),
                 base_url: "https://example.invalid/v1/chat/completions".into(),
             }),
-            codex: Some(CliBackend {
-                program: "codex".into(),
-                model: DEFAULT_CODEX_CLI_MODEL.into(),
-            }),
-            claude: Some(CliBackend {
-                program: "claude".into(),
-                model: DEFAULT_CLAUDE_CLI_MODEL.into(),
-            }),
-            summary_model: DEFAULT_SUMMARY_MODEL.into(),
-            naming_model: DEFAULT_NAMING_MODEL.into(),
-            nudge_model: DEFAULT_NUDGE_MODEL.into(),
+            terminal_assist_model: DEFAULT_TERMINAL_ASSIST_MODEL.into(),
         };
         let mut calls = Vec::new();
-        let result = registry.run_with_fallback(&ProviderPreferences::default(), |provider| {
-            calls.push(provider);
-            match provider {
-                SynthesisProvider::OpenAi => Err("openai failed".into()),
-                SynthesisProvider::CodexCli => Ok("ok".to_string()),
-                SynthesisProvider::ClaudeCli => Err("unexpected claude".into()),
-            }
-        });
+        let result: super::ProviderCallResult<String> =
+            registry.run_with_fallback(&ProviderPreferences::default(), |provider| {
+                calls.push(provider);
+                match provider {
+                    SynthesisProvider::OpenAi => Err("openai failed".into()),
+                }
+            });
 
-        assert_eq!(
-            calls,
-            vec![SynthesisProvider::OpenAi, SynthesisProvider::CodexCli]
-        );
-        assert_eq!(result.provider, Some(SynthesisProvider::CodexCli));
-        assert_eq!(result.demoted_provider, Some(SynthesisProvider::OpenAi));
-        assert_eq!(result.value.expect("fallback should succeed"), "ok");
+        assert_eq!(calls, vec![SynthesisProvider::OpenAi]);
+        assert_eq!(result.provider, Some(SynthesisProvider::OpenAi));
+        assert_eq!(result.demoted_provider, None);
+        assert!(result.value.is_err());
     }
 
     #[test]
-    fn run_command_with_input_drains_stdout_and_stderr_concurrently() {
-        let mut command = Command::new("/bin/sh");
-        command.arg("-c").arg(
-            r#"
-i=0
-while [ "$i" -lt 2048 ]; do
-  printf 'stdout-%04d xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n' "$i"
-  printf 'stderr-%04d xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n' "$i" 1>&2
-  i=$((i + 1))
-done
-read input
-printf 'stdin:%s\n' "$input"
-"#,
-        );
-
-        let output = run_command_with_input(command, "hello\n", Duration::from_secs(5), "sh")
-            .expect("command should complete without deadlocking");
-        assert!(output.contains("stdin:hello"));
-    }
-
-    #[test]
-    fn run_with_fallback_skips_any_preferred_subprocess_when_preference_is_set() {
+    fn run_with_fallback_skips_openai_when_preference_is_set() {
         let registry = SynthesisBackendRegistry {
-            openai: None,
-            codex: Some(CliBackend {
-                program: "codex".into(),
-                model: DEFAULT_CODEX_CLI_MODEL.into(),
+            openai: Some(OpenAiBackend {
+                api_key: "test-key".into(),
+                base_url: "https://example.invalid/v1/chat/completions".into(),
             }),
-            claude: Some(CliBackend {
-                program: "claude".into(),
-                model: DEFAULT_CLAUDE_CLI_MODEL.into(),
-            }),
-            summary_model: DEFAULT_SUMMARY_MODEL.into(),
-            naming_model: DEFAULT_NAMING_MODEL.into(),
-            nudge_model: DEFAULT_NUDGE_MODEL.into(),
+            terminal_assist_model: DEFAULT_TERMINAL_ASSIST_MODEL.into(),
         };
         let mut calls = Vec::new();
-        let skipped = BTreeSet::from([SynthesisProvider::CodexCli]);
+        let skipped = BTreeSet::from([SynthesisProvider::OpenAi]);
         let result = registry.run_with_fallback(
             &ProviderPreferences {
                 skipped_providers: skipped,
@@ -1695,814 +785,9 @@ printf 'stdin:%s\n' "$input"
             },
         );
 
-        assert_eq!(calls, vec![SynthesisProvider::ClaudeCli]);
-        assert_eq!(result.provider, Some(SynthesisProvider::ClaudeCli));
+        assert!(calls.is_empty());
+        assert_eq!(result.provider, None);
         assert_eq!(result.demoted_provider, None);
-        assert_eq!(result.value.expect("claude should run"), "ok");
-    }
-
-    #[test]
-    fn summary_signature_ignores_small_idle_tick_changes() {
-        let mut evidence = TacticalEvidence {
-            session_name: "Parser".into(),
-            task_label: "Fix".into(),
-            dominant_process: None,
-            process_tree_excerpt: None,
-            recent_files: vec!["src/parser.rs".into()],
-            terminal_status_line: Some("3 parser failures remain".into()),
-            terminal_status_line_age: Some("46s ago".into()),
-            recent_terminal_activity: vec![
-                "[46s ago] Now rerunning the parser tests.".into(),
-                "[43s ago] 3 parser failures remain".into(),
-            ],
-            recent_events: vec!["Spawned process 303".into()],
-        };
-
-        let first = summary_signature(&evidence);
-        evidence.terminal_status_line_age = Some("49s ago".into());
-        evidence.recent_terminal_activity = vec![
-            "[49s ago] Now rerunning the parser tests.".into(),
-            "[46s ago] 3 parser failures remain".into(),
-        ];
-        assert_eq!(summary_signature(&evidence), first);
-    }
-
-    #[test]
-    fn summary_signature_changes_when_idle_bucket_crosses_threshold() {
-        let mut evidence = TacticalEvidence {
-            session_name: "Parser".into(),
-            task_label: "Fix".into(),
-            dominant_process: None,
-            process_tree_excerpt: None,
-            recent_files: vec![],
-            terminal_status_line: Some("Quiet after last rerun".into()),
-            terminal_status_line_age: Some("29s ago".into()),
-            recent_terminal_activity: vec!["[29s ago] Quiet after last rerun".into()],
-            recent_events: vec![],
-        };
-
-        let first = summary_signature(&evidence);
-        evidence.terminal_status_line_age = Some("30s ago".into());
-        evidence.recent_terminal_activity = vec!["[30s ago] Quiet after last rerun".into()];
-        assert_ne!(summary_signature(&evidence), first);
-    }
-
-    #[test]
-    fn summary_substantive_signature_ignores_idle_bucket_changes() {
-        let mut evidence = TacticalEvidence {
-            session_name: "Parser".into(),
-            task_label: "Fix".into(),
-            dominant_process: None,
-            process_tree_excerpt: None,
-            recent_files: vec![],
-            terminal_status_line: Some("Quiet after last rerun".into()),
-            terminal_status_line_age: Some("29s ago".into()),
-            recent_terminal_activity: vec!["[29s ago] Quiet after last rerun".into()],
-            recent_events: vec!["[29s ago] Spawned cargo test".into()],
-        };
-
-        let first = summary_substantive_signature(&evidence);
-        evidence.terminal_status_line_age = Some("30s ago".into());
-        evidence.recent_terminal_activity = vec!["[30s ago] Quiet after last rerun".into()];
-        evidence.recent_events = vec!["[30s ago] Spawned cargo test".into()];
-        assert_eq!(summary_substantive_signature(&evidence), first);
-    }
-
-    #[test]
-    fn repeated_paused_summary_skips_when_substantive_evidence_is_unchanged() {
-        let summary = TacticalSynthesis {
-            tactical_state: TacticalState::Blocked,
-            tactical_state_brief: Some("needs approval".into()),
-            attention_level: AttentionLevel::Intervene,
-            attention_brief: Some("human input required".into()),
-            headline: Some("awaiting approval".into()),
-            tool_not_likely_coding_agent: false,
-        };
-
-        assert!(should_skip_repeated_paused_summary(
-            Some(&summary),
-            Some("same"),
-            "same",
-        ));
-        assert!(!should_skip_repeated_paused_summary(
-            Some(&summary),
-            Some("before"),
-            "after",
-        ));
-        assert!(!should_skip_repeated_paused_summary(
-            Some(&TacticalSynthesis {
-                tactical_state: TacticalState::Working,
-                ..summary.clone()
-            }),
-            Some("same"),
-            "same",
-        ));
-    }
-
-    #[test]
-    fn name_signature_tracks_current_name_and_terminal_history() {
-        let mut evidence = NamingEvidence {
-            current_name: "Parser".into(),
-            recent_terminal_history: vec![
-                "[46s ago] • Investigating parser recovery.".into(),
-                "[30s ago] test parser::recovery::keeps_trailing_tokens ... FAILED".into(),
-            ],
-        };
-
-        let first = name_signature(&evidence);
-        evidence.current_name = "Parser Fix".into();
-        assert_ne!(name_signature(&evidence), first);
-    }
-
-    #[test]
-    fn name_signature_ignores_small_relative_timestamp_drift() {
-        let mut evidence = NamingEvidence {
-            current_name: "Parser".into(),
-            recent_terminal_history: vec![
-                "[46s ago] • Investigating parser recovery.".into(),
-                "[30s ago] test parser::recovery::keeps_trailing_tokens ... FAILED".into(),
-            ],
-        };
-
-        let first = name_signature(&evidence);
-        evidence.recent_terminal_history = vec![
-            "[49s ago] • Investigating parser recovery.".into(),
-            "[33s ago] test parser::recovery::keeps_trailing_tokens ... FAILED".into(),
-        ];
-        assert_eq!(name_signature(&evidence), first);
-    }
-
-    #[test]
-    fn nudge_signature_ignores_small_relative_timestamp_drift() {
-        let mut evidence = NudgeEvidence {
-            session_name: "Parser".into(),
-            shell_child_command: Some("codex".into()),
-            idle_seconds: Some(46),
-            tactical_state_brief: Some("Paused after a checkpoint".into()),
-            attention_brief: Some("A light nudge should restart the next pass".into()),
-            headline: Some("Paused after a clean checkpoint".into()),
-            recent_terminal_history: vec![
-                "[46s ago] • Checkpoint complete; ready for the next pass.".into(),
-                "[44s ago] • Waiting for the next instruction.".into(),
-            ],
-        };
-
-        let first = nudge_signature(&evidence);
-        evidence.idle_seconds = Some(49);
-        evidence.recent_terminal_history = vec![
-            "[49s ago] • Checkpoint complete; ready for the next pass.".into(),
-            "[47s ago] • Waiting for the next instruction.".into(),
-        ];
-        assert_eq!(nudge_signature(&evidence), first);
-    }
-
-    #[test]
-    fn sanitize_trims_and_limits_model_output() {
-        let summary = TacticalSynthesis {
-            tactical_state: TacticalState::Working,
-            tactical_state_brief: Some(" tests are running ".into()),
-            attention_level: AttentionLevel::Monitor,
-            attention_brief: Some(" keep watching this loop ".into()),
-            headline: Some("  cargo   test parser ".into()),
-            tool_not_likely_coding_agent: false,
-        }
-        .sanitize();
-
-        assert_eq!(summary.headline.as_deref(), Some("cargo test parser"));
-        assert_eq!(
-            summary.tactical_state_brief.as_deref(),
-            Some("tests are running")
-        );
-        assert_eq!(
-            summary.attention_brief.as_deref(),
-            Some("keep watching this loop")
-        );
-    }
-
-    #[test]
-    fn name_suggestion_sanitizes_and_truncates() {
-        let suggestion = NameSuggestion {
-            name: "  Parser recovery and trailing token fix loop  ".into(),
-        }
-        .sanitize();
-
-        assert_eq!(suggestion.name, "Parser recovery and trailing token fix");
-        assert!(suggestion.name.len() <= 40);
-    }
-
-    #[test]
-    fn name_suggestion_allows_empty_name() {
-        let suggestion = NameSuggestion { name: "   ".into() }.sanitize();
-        assert!(suggestion.name.is_empty());
-    }
-
-    #[test]
-    fn fixture_battery_covers_codex_and_claude_shapes() {
-        let fixtures = sample_agent_evidence();
-        assert!(fixtures.len() >= 12);
-        assert!(fixtures.iter().any(|(name, _, _)| name.contains("codex")));
-        assert!(fixtures.iter().any(|(name, _, _)| name.contains("claude")));
-        assert!(
-            fixtures
-                .iter()
-                .all(|(_, evidence, _)| evidence.recent_terminal_activity.len() >= 6)
-        );
-        assert!(fixtures.iter().any(|(_, _, expectations)| {
-            expectations
-                .attention_levels
-                .contains(&AttentionLevel::Takeover)
-        }));
-    }
-
-    #[test]
-    fn live_summary_fixture_codex_true_autopilot_idle_when_api_key_is_available() {
-        assert_live_summary_fixture("codex_true_autopilot_idle");
-    }
-
-    #[test]
-    fn live_summary_fixture_claude_sweeping_refactor_monitor_when_api_key_is_available() {
-        assert_live_summary_fixture("claude_sweeping_refactor_monitor");
-    }
-
-    #[test]
-    fn live_summary_fixture_codex_mundane_code_review_when_api_key_is_available() {
-        assert_live_summary_fixture("codex_mundane_code_review");
-    }
-
-    #[test]
-    fn live_summary_fixture_claude_turbulent_diagnosis_guide_when_api_key_is_available() {
-        assert_live_summary_fixture("claude_turbulent_diagnosis_guide");
-    }
-
-    #[test]
-    fn live_summary_fixture_claude_repeated_step_monitor_when_api_key_is_available() {
-        assert_live_summary_fixture("claude_repeated_step_monitor");
-    }
-
-    #[test]
-    fn live_summary_fixture_codex_parser_steady_progress_when_api_key_is_available() {
-        assert_live_summary_fixture("codex_parser_steady_progress");
-    }
-
-    #[test]
-    fn live_summary_fixture_claude_waiting_for_nudge_checkpoint_when_api_key_is_available() {
-        assert_live_summary_fixture("claude_waiting_for_nudge_checkpoint");
-    }
-
-    #[test]
-    fn live_summary_fixture_codex_blocked_permission_prompt_when_api_key_is_available() {
-        assert_live_summary_fixture("codex_blocked_permission_prompt");
-    }
-
-    #[test]
-    fn live_summary_fixture_claude_compile_loop_flailing_when_api_key_is_available() {
-        assert_live_summary_fixture("claude_compile_loop_flailing");
-    }
-
-    #[test]
-    fn live_summary_fixture_codex_converged_waiting_when_api_key_is_available() {
-        assert_live_summary_fixture("codex_converged_waiting");
-    }
-
-    #[test]
-    fn live_summary_fixture_claude_risky_shortcuts_when_api_key_is_available() {
-        assert_live_summary_fixture("claude_risky_shortcuts");
-    }
-
-    #[test]
-    fn live_summary_fixture_codex_disk_pressure_extreme_risk_when_api_key_is_available() {
-        assert_live_summary_fixture("codex_disk_pressure_extreme_risk");
-    }
-
-    fn assert_live_summary_fixture(name: &str) {
-        if std::env::var("EXATERM_LIVE_OPENAI_TESTS").ok().as_deref() != Some("1") {
-            return;
-        }
-
-        let _guard = ENV_MUTEX
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-
-        let Some(registry) = SynthesisBackendRegistry::from_env() else {
-            return;
-        };
-
-        let (fixture_name, evidence, expectations) = sample_agent_evidence()
-            .into_iter()
-            .find(|(fixture_name, _, _)| *fixture_name == name)
-            .unwrap_or_else(|| panic!("missing live summary fixture: {name}"));
-
-        let summary = match registry
-            .summarize_blocking(&ProviderPreferences::default(), &evidence)
-            .value
-        {
-            Ok(summary) => summary,
-            Err(error) if error.contains("error sending request for url") => {
-                eprintln!(
-                    "skipping live summary fixture {fixture_name} due to transport error: {error}"
-                );
-                return;
-            }
-            Err(error) => panic!("live summary call failed for {fixture_name}: {error}"),
-        };
-
-        assert!(
-            summary.headline.is_some(),
-            "{fixture_name} should produce a visible headline"
-        );
-
-        assert!(
-            summary.tactical_state_brief.is_some() && summary.attention_brief.is_some(),
-            "{fixture_name} should produce terse justifications for each dimension"
-        );
-
-        eprintln!(
-            "{fixture_name}: state={:?} ({:?}) attention={:?} ({:?}) headline={:?}",
-            summary.tactical_state,
-            summary.tactical_state_brief,
-            summary.attention_level,
-            summary.attention_brief,
-            summary.headline,
-        );
-
-        if !expectations.tactical_states.is_empty() {
-            assert!(
-                expectations
-                    .tactical_states
-                    .contains(&summary.tactical_state),
-                "{fixture_name} should synthesize one of the expected tactical states, got {:?}",
-                summary.tactical_state
-            );
-        }
-        if !expectations.attention_levels.is_empty() {
-            assert!(
-                expectations
-                    .attention_levels
-                    .contains(&summary.attention_level),
-                "{fixture_name} should synthesize one of the expected attention levels, got {:?}",
-                summary.attention_level
-            );
-        }
-    }
-
-    fn sample_agent_evidence() -> Vec<(&'static str, TacticalEvidence, FixtureExpectations)> {
-        vec![
-            (
-                "codex_true_autopilot_idle",
-                TacticalEvidence {
-                    session_name: "Codex Standby".into(),
-                    task_label: "Post-merge parking".into(),
-                    dominant_process: Some("codex".into()),
-                    process_tree_excerpt: Some("bash [S] pid=1201 | codex [S] pid=1202".into()),
-                    recent_files: vec!["src/config.rs".into(), "tests/config.rs".into()],
-                    terminal_status_line: Some("Everything looks clean; parking here until there is another task.".into()),
-                    terminal_status_line_age: Some("142s ago".into()),
-                    recent_terminal_activity: vec![
-                        "[232s ago] • The config fix is merged locally and the last cargo test rerun stayed green.".into(),
-                        "[220s ago] • I checked for follow-up failures and didn’t find any.".into(),
-                        "[201s ago] • There is no meaningful next step pending on this session right now.".into(),
-                        "[181s ago] • I’m parking here until there is another task.".into(),
-                        "[160s ago] • Everything still looks clean.".into(),
-                        "[142s ago] • Parking here until there is another task.".into(),
-                    ],
-                    recent_events: vec![
-                        "Spawned cargo test".into(),
-                        "Process exited with code 0".into(),
-                    ],
-                },
-                FixtureExpectations {
-                    tactical_states: vec![TacticalState::Idle, TacticalState::Stopped],
-                    attention_levels: vec![AttentionLevel::Autopilot],
-                },
-            ),
-            (
-                "claude_sweeping_refactor_monitor",
-                TacticalEvidence {
-                    session_name: "Claude Sweep".into(),
-                    task_label: "Broad workspace cleanup".into(),
-                    dominant_process: Some("claude".into()),
-                    process_tree_excerpt: Some(
-                        "bash [S] pid=1301 | claude [S] pid=1302".into(),
-                    ),
-                    recent_files: vec![
-                        "crates/exaterm/src/ui.rs".into(),
-                        "crates/exaterm/src/widgets.rs".into(),
-                        "crates/exaterm/src/style.rs".into(),
-                        "crates/exaterm/src/layout.rs".into(),
-                    ],
-                    terminal_status_line: Some("cargo check after the frontend refactor pass".into()),
-                    terminal_status_line_age: Some("6s ago".into()),
-                    recent_terminal_activity: vec![
-                        "[118s ago] • I’m doing the frontend split in one pass: ui.rs should shrink, widget builders should move out, and the layout/style helpers need to line up before I validate.".into(),
-                        "[102s ago] $ sed -n '1,260p' crates/exaterm/src/ui.rs".into(),
-                        "[93s ago] $ sed -n '1,220p' crates/exaterm/src/widgets.rs".into(),
-                        "[85s ago] $ sed -n '1,220p' crates/exaterm/src/style.rs".into(),
-                        "[78s ago] $ sed -n '1,220p' crates/exaterm/src/layout.rs".into(),
-                        "[70s ago] • The split touches the headline row, attention rendering, widget construction, and layout thresholds, so I want the whole frontend surface to move together.".into(),
-                        "[61s ago] $ apply_patch <extract widget builders and wire new card header layout>".into(),
-                        "[49s ago] $ apply_patch <move attention styling and headline sizing into style.rs>".into(),
-                        "[39s ago] $ apply_patch <retune battlefield layout helpers after the widget split>".into(),
-                        "[30s ago] $ apply_patch <update ui.rs composition to use the extracted modules>".into(),
-                        "[19s ago] $ cargo check -q -p exaterm".into(),
-                        "[12s ago] • cargo check is running after edits across ui.rs, widgets.rs, style.rs, and layout.rs.".into(),
-                        "[6s ago] cargo check after the frontend refactor pass".into(),
-                    ],
-                    recent_events: vec![],
-                },
-                FixtureExpectations {
-                    tactical_states: vec![TacticalState::Working, TacticalState::Thinking],
-                    attention_levels: vec![AttentionLevel::Monitor],
-                },
-            ),
-            (
-                "claude_turbulent_diagnosis_guide",
-                TacticalEvidence {
-                    session_name: "Claude Diagnose".into(),
-                    task_label: "Intermittent reconnect issue".into(),
-                    dominant_process: Some("claude".into()),
-                    process_tree_excerpt: Some("bash [S] pid=1501 | claude [S] pid=1502".into()),
-                    recent_files: vec!["src/beachhead.rs".into(), "src/remote.rs".into()],
-                    terminal_status_line: Some("Comparing reconnect traces after another failed startup-order theory".into()),
-                    terminal_status_line_age: Some("12s ago".into()),
-                    recent_terminal_activity: vec![
-                        "[30m ago] $ rg -n \"connect_raw_session|forward_remote_socket|control\" crates/exaterm/src/remote.rs crates/exaterm-core/src/daemon.rs".into(),
-                        "[27m ago] • First pass points at the control socket becoming visible before the raw stream settles.".into(),
-                        "[24m ago] $ sed -n '220,340p' crates/exaterm/src/remote.rs".into(),
-                        "[21m ago] • The next failing trace doesn’t fit that ordering as cleanly as I expected.".into(),
-                        "[18m ago] $ sed -n '120,220p' crates/exaterm-core/src/daemon.rs".into(),
-                        "[15m ago] • Switching to the attach-order path because the first theory is weaker on the second trace.".into(),
-                        "[12m ago] $ rg -n \"accept|listener|snapshot\" crates/exaterm-core/src/daemon.rs".into(),
-                        "[9m ago] • That path also leaves gaps in the reconnect timeline and I still don’t have a patch I trust.".into(),
-                        "[6m ago] $ sed -n '220,340p' crates/exaterm/src/remote.rs".into(),
-                        "[3m ago] • I can patch either startup ordering or snapshot timing next, but I’m not confident which one matches the failing traces.".into(),
-                        "[1m ago] $ sed -n '120,220p' crates/exaterm-core/src/daemon.rs".into(),
-                        "[12s ago] Comparing reconnect traces after another failed startup-order theory".into(),
-                    ],
-                    recent_events: vec![],
-                },
-                FixtureExpectations {
-                    tactical_states: vec![TacticalState::Working, TacticalState::Thinking],
-                    attention_levels: vec![AttentionLevel::Guide],
-                },
-            ),
-            (
-                "claude_repeated_step_monitor",
-                TacticalEvidence {
-                    session_name: "Claude Diagnose".into(),
-                    task_label: "Intermittent reconnect issue".into(),
-                    dominant_process: Some("claude".into()),
-                    process_tree_excerpt: Some("bash [S] pid=1551 | claude [S] pid=1552".into()),
-                    recent_files: vec!["src/beachhead.rs".into(), "src/remote.rs".into()],
-                    terminal_status_line: Some("Rerunning reconnect after a remote startup patch".into()),
-                    terminal_status_line_age: Some("12s ago".into()),
-                    recent_terminal_activity: vec![
-                        "[18m ago] $ rg -n \"forward|raw_stream|control\" crates/exaterm/src/remote.rs crates/exaterm-core/src/daemon.rs".into(),
-                        "[17m30s ago] $ sed -n '220,340p' crates/exaterm/src/remote.rs".into(),
-                        "[17m ago] control_ready=41ms raw_ready=73ms".into(),
-                        "[16m30s ago] $ sed -n '120,220p' crates/exaterm-core/src/daemon.rs".into(),
-                        "[16m ago] $ apply_patch <move raw forward setup earlier in remote reconnect path>".into(),
-                        "[15m30s ago] $ apply_patch <move raw forward setup earlier in remote reconnect path>".into(),
-                        "[15m ago] $ cargo test -p exaterm remote::tests::reconnect_reuses_existing_forward -- --nocapture".into(),
-                        "[14m30s ago] ok".into(),
-                        "[14m ago] $ cargo test -p exaterm remote::tests::raw_session_forward_is_lazy -- --nocapture".into(),
-                        "[13m30s ago] $ cargo test -p exaterm remote::tests::raw_session_forward_is_lazy -- --nocapture".into(),
-                        "[13m ago] ok".into(),
-                        "[12m30s ago] trace-2: control socket visible before raw stream attach".into(),
-                        "[12m ago] $ rg -n \"connect_raw_session|forward_remote_socket\" crates/exaterm/src/remote.rs".into(),
-                        "[11m30s ago] $ sed -n '340,430p' crates/exaterm/src/remote.rs".into(),
-                        "[11m ago] $ apply_patch <defer snapshot advertisement until raw listener is prepared>".into(),
-                        "[10m30s ago] $ apply_patch <defer snapshot advertisement until raw listener is prepared>".into(),
-                        "[10m ago] $ cargo test -p exaterm remote::tests -- --nocapture".into(),
-                        "[9m30s ago] 2 tests passed; reconnect trace not reproduced".into(),
-                        "[9m ago] trace-2: control socket visible before raw stream attach".into(),
-                        "[8m30s ago] $ sed -n '220,340p' crates/exaterm/src/remote.rs".into(),
-                        "[8m ago] $ sed -n '120,220p' crates/exaterm-core/src/daemon.rs".into(),
-                        "[7m30s ago] $ sed -n '120,220p' crates/exaterm-core/src/daemon.rs".into(),
-                        "[7m ago] control_ready=41ms raw_ready=73ms".into(),
-                        "[6m30s ago] $ apply_patch <move raw forward setup earlier in remote reconnect path>".into(),
-                        "[6m ago] $ cargo test -p exaterm remote::tests::reconnect_reuses_existing_forward -- --nocapture".into(),
-                        "[5m30s ago] ok".into(),
-                        "[5m ago] $ cargo test -p exaterm remote::tests::raw_session_forward_is_lazy -- --nocapture".into(),
-                        "[4m30s ago] $ cargo test -p exaterm remote::tests::raw_session_forward_is_lazy -- --nocapture".into(),
-                        "[4m ago] ok".into(),
-                        "[3m30s ago] trace-2: control socket visible before raw stream attach".into(),
-                        "[3m ago] $ sed -n '220,340p' crates/exaterm/src/remote.rs".into(),
-                        "[2m30s ago] $ sed -n '120,220p' crates/exaterm-core/src/daemon.rs".into(),
-                        "[2m ago] $ apply_patch <tighten raw-forward ordering around reconnect startup>".into(),
-                        "[90s ago] $ apply_patch <tighten raw-forward ordering around reconnect startup>".into(),
-                        "[60s ago] $ cargo test -p exaterm remote::tests::reconnect_reuses_existing_forward -- --nocapture".into(),
-                        "[30s ago] ok".into(),
-                        "[12s ago] Rerunning reconnect after a remote startup patch".into(),
-                    ],
-                    recent_events: vec![],
-                },
-                FixtureExpectations {
-                    tactical_states: vec![TacticalState::Working, TacticalState::Thinking],
-                    attention_levels: vec![AttentionLevel::Monitor],
-                },
-            ),
-            (
-                "codex_mundane_code_review",
-                TacticalEvidence {
-                    session_name: "Codex Review".into(),
-                    task_label: "Repository code review".into(),
-                    dominant_process: Some("codex".into()),
-                    process_tree_excerpt: Some("bash [S] pid=1601 | codex [S] pid=1602".into()),
-                    recent_files: vec!["crates/exaterm/src/ui.rs".into(), "crates/exaterm/src/widgets.rs".into()],
-                    terminal_status_line: Some("running tests while scanning for state/transport bugs".into()),
-                    terminal_status_line_age: Some("6s ago".into()),
-                    recent_terminal_activity: vec![
-                        "[54s ago] › do a code review of this repo".into(),
-                        "[48s ago] • I’m reviewing the repository as code review, starting with repo state and layout so I can target likely risk areas and identify concrete findings rather than give a generic overview.".into(),
-                        "[37s ago] • I found local modifications in the GTK client files, so I’m checking those first and then validating the current tree with cargo check to separate concrete regressions from broader repo-level concerns.".into(),
-                        "[27s ago] • I’ve isolated the in-progress UI changes; now I’m reading the surrounding widget/state code to see whether those visual tweaks introduced behavioral mismatches rather than just layout differences.".into(),
-                        "[18s ago] • cargo check passes, so I’m moving past compile failures and looking for behavioral issues in the headless/runtime path and session state model, since that’s where repo-level supervisory bugs would hide.".into(),
-                        "[6s ago] • I’ve confirmed the tree has tests, so I’m running them while scanning for state/transport code that can silently misreport sessions, since those failures are higher value than UI-only nits in this repo.".into(),
-                    ],
-                    recent_events: vec![
-                        "Spawned cargo check".into(),
-                        "Process exited with code 0".into(),
-                        "Spawned cargo test".into(),
-                    ],
-                },
-                FixtureExpectations {
-                    tactical_states: vec![TacticalState::Working, TacticalState::Thinking],
-                    attention_levels: vec![AttentionLevel::Autopilot],
-                },
-            ),
-            (
-                "codex_parser_steady_progress",
-                TacticalEvidence {
-                    session_name: "Codex Parser".into(),
-                    task_label: "Refactoring parser state machine".into(),
-                    dominant_process: Some("cargo".into()),
-                    process_tree_excerpt: Some(
-                        "bash [S] pid=101 | codex [S] pid=202 | cargo [R] pid=303".into(),
-                    ),
-                    recent_files: vec!["src/parser.rs".into(), "tests/parser.rs".into()],
-                    terminal_status_line: Some("2 parser tests still failing".into()),
-                    terminal_status_line_age: Some("3s ago".into()),
-                    recent_terminal_activity: vec![
-                        "[41s ago] • I found the next parser breakage: trailing tokens drop after the recovery path.".into(),
-                        "[37s ago] • I’m patching src/parser.rs first, then rerunning the focused parser suite.".into(),
-                        "[32s ago] $ cargo test parser_recovery -- --nocapture".into(),
-                        "[25s ago] test parser::recovery::keeps_trailing_tokens ... FAILED".into(),
-                        "[19s ago] • The failure narrowed to parse_recovery_tail; editing the transition now.".into(),
-                        "[7s ago] $ cargo test parser_recovery -- --nocapture".into(),
-                        "[3s ago] 2 parser tests still failing".into(),
-                    ],
-                    recent_events: vec![
-                        "Spawned cargo test parser_recovery".into(),
-                        "Process exited with code 101".into(),
-                        "Spawned cargo test parser_recovery".into(),
-                    ],
-                },
-                FixtureExpectations {
-                    tactical_states: vec![TacticalState::Working, TacticalState::Thinking],
-                    attention_levels: vec![AttentionLevel::Autopilot, AttentionLevel::Monitor],
-                },
-            ),
-            (
-                "claude_waiting_for_nudge_checkpoint",
-                TacticalEvidence {
-                    session_name: "Claude UI".into(),
-                    task_label: "GTK focus bug cleanup".into(),
-                    dominant_process: Some("claude".into()),
-                    process_tree_excerpt: Some("bash [S] pid=510 | claude [S] pid=522".into()),
-                    recent_files: vec!["src/ui/focus.rs".into(), "tests/focus_mode.rs".into()],
-                    terminal_status_line: Some("Checkpoint complete; ready to continue with the next pass".into()),
-                    terminal_status_line_age: Some("84s ago".into()),
-                    recent_terminal_activity: vec![
-                        "[248s ago] • I fixed the stuck focus path and the focused terminal now accepts Return again.".into(),
-                        "[244s ago] • Verified with cargo test plus a manual smoke pass.".into(),
-                        "[237s ago] • Next attack: tighten battlefield density and card typography.".into(),
-                        "[230s ago] • If you want, I'll start that next pass directly.".into(),
-                        "[156s ago] › Continue".into(),
-                        "[152s ago] • I’m continuing from the cleaned-up focus mode.".into(),
-                        "[5s ago] • Larger typography is in and focus mode keeps context now.".into(),
-                        "[4s ago] • Tests pass. If you want, I'll start the next pass directly.".into(),
-                    ],
-                    recent_events: vec![
-                        "Spawned cargo test".into(),
-                        "Process exited with code 0".into(),
-                    ],
-                },
-                FixtureExpectations {
-                    tactical_states: vec![TacticalState::Stopped],
-                    attention_levels: vec![AttentionLevel::Guide],
-                },
-            ),
-            (
-                "codex_blocked_permission_prompt",
-                TacticalEvidence {
-                    session_name: "Codex Deploy".into(),
-                    task_label: "Waiting on confirmation".into(),
-                    dominant_process: Some("codex".into()),
-                    process_tree_excerpt: Some(
-                        "bash [S] pid=401 | codex [S] pid=402 | ssh [S] pid=410".into(),
-                    ),
-                    recent_files: vec![],
-                    terminal_status_line: Some("Proceed with deploy? [y/N]".into()),
-                    terminal_status_line_age: Some("18s ago".into()),
-                    recent_terminal_activity: vec![
-                        "[58s ago] • I finished the deploy dry run and the next step would update production.".into(),
-                        "[52s ago] • I’m checking whether you want me to cross that boundary now.".into(),
-                        "[45s ago] • The deploy script is ready, but this next step will touch production.".into(),
-                        "[38s ago] • I need your approval before I proceed.".into(),
-                        "[34s ago] Proceed with deploy? [y/N]".into(),
-                        "[18s ago] Waiting for operator input.".into(),
-                    ],
-                    recent_events: vec![
-                        "Spawned deploy helper".into(),
-                        "Prompt waiting for operator input".into(),
-                    ],
-                },
-                FixtureExpectations {
-                    tactical_states: vec![TacticalState::Blocked],
-                    attention_levels: vec![AttentionLevel::Intervene],
-                },
-            ),
-            (
-                "claude_compile_loop_flailing",
-                TacticalEvidence {
-                    session_name: "Claude GTK".into(),
-                    task_label: "Widget focus regression".into(),
-                    dominant_process: Some("cargo".into()),
-                    process_tree_excerpt: Some(
-                        "bash [S] pid=901 | claude [S] pid=902 | cargo [R] pid=950".into(),
-                    ),
-                    recent_files: vec!["src/ui.rs".into()],
-                    terminal_status_line: Some("error[E0599]: no method named present on FocusHandle".into()),
-                    terminal_status_line_age: Some("4s ago".into()),
-                    recent_terminal_activity: vec![
-                        "[4m ago] $ rg -n \"FocusHandle|present\\(\" src/ui.rs".into(),
-                        "[3m42s ago] $ sed -n '1180,1245p' src/ui.rs".into(),
-                        "[3m25s ago] $ apply_patch <route focus handoff through the card-local handle>".into(),
-                        "[3m ago] $ cargo test focus_mode -- --nocapture".into(),
-                        "[2m52s ago] error[E0599]: no method named present on FocusHandle".into(),
-                        "[2m28s ago] $ sed -n '1180,1245p' src/ui.rs".into(),
-                        "[2m10s ago] $ apply_patch <switch the focus call to the row signal hookup>".into(),
-                        "[102s ago] $ cargo test focus_mode -- --nocapture".into(),
-                        "[94s ago] error[E0599]: no method named present on FocusHandle".into(),
-                        "[76s ago] $ rg -n \"FocusHandle|present\\(\" src/ui.rs".into(),
-                        "[61s ago] $ apply_patch <move the focus call into the card handoff block>".into(),
-                        "[44s ago] $ cargo test focus_mode -- --nocapture".into(),
-                        "[36s ago] error[E0599]: no method named present on FocusHandle".into(),
-                        "[24s ago] $ sed -n '1180,1245p' src/ui.rs".into(),
-                        "[12s ago] $ cargo test focus_mode -- --nocapture".into(),
-                        "[4s ago] error[E0599]: no method named present on FocusHandle".into(),
-                    ],
-                    recent_events: vec![
-                        "Spawned cargo test focus_mode".into(),
-                        "Process exited with code 101".into(),
-                        "Spawned cargo test focus_mode".into(),
-                        "Process exited with code 101".into(),
-                    ],
-                },
-                FixtureExpectations {
-                    tactical_states: vec![
-                        TacticalState::Working,
-                        TacticalState::Thinking,
-                        TacticalState::Stopped,
-                    ],
-                    attention_levels: vec![AttentionLevel::Guide, AttentionLevel::Intervene],
-                },
-            ),
-            (
-                "codex_converged_waiting",
-                TacticalEvidence {
-                    session_name: "Codex Monitor".into(),
-                    task_label: "Post-fix watch".into(),
-                    dominant_process: Some("codex".into()),
-                    process_tree_excerpt: Some("bash [S] pid=801 | codex [S] pid=802".into()),
-                    recent_files: vec!["src/config.rs".into(), "tests/config.rs".into()],
-                    terminal_status_line: Some("Stable. Standing by.".into()),
-                    terminal_status_line_age: Some("97s ago".into()),
-                    recent_terminal_activity: vec![
-                        "[218s ago] • I reran the last validation pass and it stayed green.".into(),
-                        "[212s ago] • Stable. Standing by.".into(),
-                        "[146s ago] • No new failures observed.".into(),
-                        "[142s ago] • Stable. Standing by.".into(),
-                        "[97s ago] • Stable. Standing by.".into(),
-                        "[66s ago] • No new failures observed after the last green pass.".into(),
-                    ],
-                    recent_events: vec![
-                        "Spawned cargo test".into(),
-                        "Process exited with code 101".into(),
-                        "Spawned cargo test".into(),
-                        "Process exited with code 0".into(),
-                    ],
-                },
-                FixtureExpectations {
-                    tactical_states: vec![TacticalState::Idle, TacticalState::Stopped],
-                    attention_levels: vec![
-                        AttentionLevel::Autopilot,
-                        AttentionLevel::Monitor,
-                        AttentionLevel::Guide,
-                    ],
-                },
-            ),
-            (
-                "claude_risky_shortcuts",
-                TacticalEvidence {
-                    session_name: "Claude Patch".into(),
-                    task_label: "Fast path under pressure".into(),
-                    dominant_process: Some("claude".into()),
-                    process_tree_excerpt: Some(
-                        "bash [S] pid=880 | claude [S] pid=881 | git [S] pid=882".into(),
-                    ),
-                    recent_files: vec!["src/ui.rs".into(), "src/model.rs".into()],
-                    terminal_status_line: Some("I can keep going with blind edits if you want".into()),
-                    terminal_status_line_age: Some("11s ago".into()),
-                    recent_terminal_activity: vec![
-                        "[52s ago] • I haven’t fully verified the failure path yet.".into(),
-                        "[45s ago] • I can keep going with blind edits, but take the current state with a grain of salt.".into(),
-                        "[34s ago] $ git status --short".into(),
-                        "[29s ago] M src/ui.rs".into(),
-                        "[23s ago] • I’m skipping the longer validation loop for now so I can move faster.".into(),
-                        "[11s ago] • This may be good enough for the next pass, but I don’t trust it fully.".into(),
-                    ],
-                    recent_events: vec![
-                        "Spawned git status".into(),
-                        "Process exited with code 0".into(),
-                    ],
-                },
-                FixtureExpectations {
-                    tactical_states: vec![
-                        TacticalState::Working,
-                        TacticalState::Thinking,
-                        TacticalState::Stopped,
-                    ],
-                    attention_levels: vec![AttentionLevel::Guide, AttentionLevel::Intervene],
-                },
-            ),
-            (
-                "codex_disk_pressure_extreme_risk",
-                TacticalEvidence {
-                    session_name: "Codex Disk".into(),
-                    task_label: "Out-of-space recovery".into(),
-                    dominant_process: Some("bash".into()),
-                    process_tree_excerpt: Some(
-                        "bash [S] pid=910 | codex [S] pid=915 | rm [S] pid=922".into(),
-                    ),
-                    recent_files: vec![],
-                    terminal_status_line: Some("No space left on device".into()),
-                    terminal_status_line_age: Some("7s ago".into()),
-                    recent_terminal_activity: vec![
-                        "[64s ago] npm ERR! nospc ENOSPC: no space left on device".into(),
-                        "[57s ago] • I’m blocked on disk space and the build keeps failing immediately.".into(),
-                        "[50s ago] $ du -sh ~/.cache ~/.cargo ~/.npm".into(),
-                        "[41s ago] 14G /home/luke/.cache".into(),
-                        "[34s ago] • If this keeps up I may need to free space aggressively.".into(),
-                        "[26s ago] • Worst case I could remove a home directory I don’t need, but that would be risky.".into(),
-                        "[19s ago] $ rm -rf /home/luke/old-home-backup".into(),
-                        "[14s ago] rm: cannot remove '/home/luke/old-home-backup': No such file or directory".into(),
-                        "[7s ago] • I’m frustrated enough to start deleting large directories unless you want to redirect me.".into(),
-                    ],
-                    recent_events: vec![
-                        "Spawned du -sh ~/.cache ~/.cargo ~/.npm".into(),
-                        "Spawned rm -rf /home/luke/old-home-backup".into(),
-                    ],
-                },
-                FixtureExpectations {
-                    tactical_states: vec![TacticalState::Blocked, TacticalState::Working],
-                    attention_levels: vec![AttentionLevel::Intervene, AttentionLevel::Takeover],
-                },
-            ),
-        ]
-    }
-
-    #[test]
-    fn tactical_prompt_requires_real_state_and_high_bar_for_complete() {
-        let prompt = tactical_system_prompt();
-        assert!(
-            prompt.contains(
-                "You must always choose a real tactical_state and a real attention_level."
-            )
-        );
-        assert!(prompt.contains("use complete rarely; the bar is high"));
-        assert!(prompt.contains("do not use complete for 'looks good'"));
-        assert!(
-            prompt
-                .contains("when unsure between idle and stopped after recent work, prefer stopped")
-        );
-        assert!(prompt.contains(
-            "Treat a fresh terminal_status_line plus a very recent terminal_status_line_age as strong evidence"
-        ));
-        assert!(prompt.contains("tool_not_likely_coding_agent"));
-    }
-
-    #[test]
-    fn synthesis_schema_requires_non_null_tactical_state() {
-        let schema = synthesis_schema();
-        assert_eq!(schema["properties"]["tactical_state"]["type"], "string");
-        let enum_values = schema["properties"]["tactical_state"]["enum"]
-            .as_array()
-            .expect("tactical_state enum should be an array");
-        assert!(!enum_values.iter().any(serde_json::Value::is_null));
-        assert_eq!(
-            schema["properties"]["tool_not_likely_coding_agent"]["type"],
-            "boolean"
-        );
+        assert!(result.value.is_err());
     }
 }

@@ -51,6 +51,11 @@ fn relay_loop(
 
         let _ = client
             .commands
+            .send(ClientMessage::SetTerminalDisplayCapabilities {
+                capabilities: Default::default(),
+            });
+        let _ = client
+            .commands
             .send(ClientMessage::CreateOrResumeDefaultWorkspace);
 
         // Block on both channels simultaneously — zero polling, zero latency.
@@ -75,6 +80,7 @@ fn relay_loop(
                         Ok(ServerMessage::Error { message }) => {
                             eprintln!("daemon error: {message}");
                         }
+                        Ok(ServerMessage::TerminalAssistCompleted { .. }) => {}
                         Err(_) => {
                             eprintln!("daemon disconnected, reconnecting");
                             let _ = snapshot_tx.send(WorkspaceSnapshot::default());

@@ -141,7 +141,6 @@ fn main() {
     println!("cargo:rustc-link-lib=framework=QuartzCore");
     println!("cargo:rustc-link-lib=framework=SwiftUI");
     println!("cargo:rustc-link-lib=framework=UniformTypeIdentifiers");
-
 }
 
 fn collect_swift_sources(dir: &PathBuf, output: &mut Vec<PathBuf>) {

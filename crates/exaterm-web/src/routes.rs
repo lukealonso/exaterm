@@ -17,10 +17,7 @@ pub fn build_router(relay: Arc<DaemonRelay>, dev_assets: Option<PathBuf>) -> Rou
         .route("/", get(index))
         .route("/assets/{*path}", get(static_asset))
         .route("/ws/control", get(crate::websocket::ws_control))
-        .route(
-            "/ws/stream/{session_id}",
-            get(crate::websocket::ws_stream),
-        )
+        .route("/ws/stream/{session_id}", get(crate::websocket::ws_stream))
         .layer(middleware::from_fn(security_headers))
         .with_state(Arc::new(state))
 }
@@ -28,10 +25,7 @@ pub fn build_router(relay: Arc<DaemonRelay>, dev_assets: Option<PathBuf>) -> Rou
 async fn security_headers(request: axum::extract::Request, next: Next) -> Response {
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
-    headers.insert(
-        header::X_FRAME_OPTIONS,
-        HeaderValue::from_static("DENY"),
-    );
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
     headers.insert(
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
@@ -40,7 +34,9 @@ async fn security_headers(request: axum::extract::Request, next: Next) -> Respon
     // inline styles at runtime and the UI sets element.style properties.
     headers.insert(
         header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static("default-src 'self'; connect-src 'self'; style-src 'self' 'unsafe-inline'"),
+        HeaderValue::from_static(
+            "default-src 'self'; connect-src 'self'; style-src 'self' 'unsafe-inline'",
+        ),
     );
     response
 }

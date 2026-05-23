@@ -1,23 +1,33 @@
-use crate::file_watch::{RepoWatchHandle, spawn_repo_watch};
-use crate::model::{SessionId, SessionLaunch, WorkspaceStore, user_shell_launch};
+use crate::config::{
+    apply_app_config_environment, apply_terminal_assist_config_environment, load_app_config,
+    TerminalAssistConfig,
+};
+use crate::file_watch::{spawn_repo_watch, RepoWatchHandle};
+use crate::mcp::{
+    McpServer, ServerInfo, ToolCallError, ToolCallOutcome, ToolCallResult, ToolDefinition,
+};
+use crate::model::{
+    command_launch, user_shell_launch, SessionId, SessionKind, SessionLaunch, WorkspaceStore,
+};
 use crate::observation::{
-    SessionObservation, apply_file_activity, apply_observation_refresh, apply_stream_update,
-    build_naming_evidence, build_nudge_evidence, build_tactical_evidence, clear_file_activity,
-    compute_observation_refresh, find_git_worktree_root, is_bare_waiting_shell,
-    record_terminal_input_activity,
+    apply_file_activity, apply_observation_refresh, apply_stream_update, clear_file_activity,
+    compute_observation_refresh, find_git_worktree_root, record_terminal_input_activity,
+    terminal_assist_history, SessionObservation,
 };
 use crate::proto::{
-    ClientMessage, ObservationSnapshot, ServerMessage, SessionSnapshot, WorkspaceSnapshot,
+    ClientMessage, InputSyncScope, ObservationSnapshot, ServerMessage, SessionSnapshot,
+    TerminalDisplayCapabilities, WorkspaceSnapshot,
 };
-use crate::runtime::{RuntimeEvent, SessionRuntime, spawn_headless_runtime};
+use crate::runtime::{spawn_headless_runtime, RuntimeEvent, SessionRuntime};
 use crate::synthesis::{
-    NameSuggestion, NamingEvidence, NudgeEvidence, NudgeSuggestion, ProviderCallResult,
-    ProviderPreferences, SynthesisBackendRegistry, TacticalState, TacticalSynthesis,
-    name_signature, nudge_signature, should_skip_repeated_paused_summary, summary_signature,
-    summary_substantive_signature,
+    ProviderCallResult, ProviderPreferences, SynthesisBackendRegistry, TerminalAssistEvidence,
+};
+use exaterm_types::model::{
+    GroupId, SupervisedGroupRecord, SupervisorActionRecord, SupervisorProvider, WorkspaceItem,
 };
 use portable_pty::PtySize;
 use serde::Serialize;
+use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
@@ -32,63 +42,30 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const CONTROL_SOCKET_NAME: &str = "beachhead-control.sock";
+const MCP_SOCKET_NAME: &str = "beachhead-mcp.sock";
 const CANONICAL_TERMINAL_ROWS: u16 = 40;
 const CANONICAL_TERMINAL_COLS: u16 = 120;
 const REPLAY_BYTES_LIMIT: usize = 8 * 1024 * 1024;
 const REFRESH_INTERVAL: Duration = Duration::from_millis(300);
 const CONTROL_EVENTS_PER_TICK: usize = 128;
 const TERMINAL_RETURN_DELAY: Duration = Duration::from_millis(35);
-const MIN_IDLE_SECS_FOR_NUDGE: u64 = 20;
-const PROVIDER_DEMOTION_COOLDOWN: Duration = Duration::from_secs(300);
 
-struct SummaryWorker {
-    requests: mpsc::Sender<SummaryJob>,
-    responses: mpsc::Receiver<SummaryResult>,
+struct AssistWorker {
+    requests: mpsc::Sender<AssistJob>,
+    responses: mpsc::Receiver<AssistResult>,
 }
 
-struct SummaryJob {
-    session_id: SessionId,
-    signature: String,
-    substantive_signature: String,
-    evidence: crate::synthesis::TacticalEvidence,
+struct AssistJob {
+    request_id: u64,
+    origin_session_id: SessionId,
+    evidence: crate::synthesis::TerminalAssistEvidence,
     preferences: ProviderPreferences,
 }
 
-struct SummaryResult {
-    session_id: SessionId,
-    signature: String,
-    substantive_signature: String,
-    summary: ProviderCallResult<TacticalSynthesis>,
-}
-
-struct NamingWorker {
-    requests: mpsc::Sender<NamingJob>,
-    responses: mpsc::Receiver<NamingResult>,
-}
-
-struct NamingJob {
-    session_id: SessionId,
-    signature: String,
-    evidence: NamingEvidence,
-    preferences: ProviderPreferences,
-}
-
-struct NamingResult {
-    session_id: SessionId,
-    signature: String,
-    suggestion: ProviderCallResult<NameSuggestion>,
-}
-
-struct NudgeWorker {
-    requests: mpsc::Sender<NudgeJob>,
-    responses: mpsc::Receiver<NudgeResult>,
-}
-
-struct NudgeJob {
-    session_id: SessionId,
-    signature: String,
-    evidence: NudgeEvidence,
-    preferences: ProviderPreferences,
+struct AssistResult {
+    request_id: u64,
+    origin_session_id: SessionId,
+    suggestion: ProviderCallResult<exaterm_types::synthesis::TerminalAssistSuggestion>,
 }
 
 struct ObservationWorker {
@@ -132,62 +109,28 @@ impl ControlNotifier {
     }
 }
 
-struct NudgeResult {
-    session_id: SessionId,
-    signature: String,
-    suggestion: ProviderCallResult<NudgeSuggestion>,
+struct SupervisorActionEntry {
+    sequence: u64,
+    summary: String,
+    at: Instant,
 }
 
-struct SummaryCacheEntry {
-    first_seen: Instant,
-    completed_signature: Option<String>,
-    completed_substantive_signature: Option<String>,
-    requested_signature: Option<String>,
-    last_summary: Option<TacticalSynthesis>,
-    last_attempt: Option<Instant>,
-    suppressed_until_input: bool,
-    in_flight: bool,
-    skipped_providers: BTreeMap<crate::synthesis::SynthesisProvider, Instant>,
+struct SupervisedGroupState {
+    id: GroupId,
+    name: String,
+    member_session_ids: Vec<SessionId>,
+    supervisor_session_id: Option<SessionId>,
+    provider: Option<SupervisorProvider>,
+    goal: Option<String>,
+    summary_markdown: String,
+    supervisor_visible: bool,
+    summary_updated_at: Option<Instant>,
+    actions: Vec<SupervisorActionEntry>,
 }
 
 struct ObservationCacheEntry {
     last_attempt: Option<Instant>,
     in_flight: bool,
-}
-
-struct NamingCacheEntry {
-    completed_signature: Option<String>,
-    requested_signature: Option<String>,
-    last_attempt: Option<Instant>,
-    in_flight: bool,
-    skipped_providers: BTreeMap<crate::synthesis::SynthesisProvider, Instant>,
-}
-
-struct NudgeCacheEntry {
-    enabled: bool,
-    completed_signature: Option<String>,
-    requested_signature: Option<String>,
-    last_nudge: Option<String>,
-    last_attempt: Option<Instant>,
-    last_sent: Option<Instant>,
-    in_flight: bool,
-    skipped_providers: BTreeMap<crate::synthesis::SynthesisProvider, Instant>,
-}
-
-impl SummaryCacheEntry {
-    fn new() -> Self {
-        Self {
-            first_seen: Instant::now(),
-            completed_signature: None,
-            completed_substantive_signature: None,
-            requested_signature: None,
-            last_summary: None,
-            last_attempt: None,
-            suppressed_until_input: false,
-            in_flight: false,
-            skipped_providers: BTreeMap::new(),
-        }
-    }
 }
 
 impl ObservationCacheEntry {
@@ -199,35 +142,12 @@ impl ObservationCacheEntry {
     }
 }
 
-impl NamingCacheEntry {
-    fn new() -> Self {
-        Self {
-            completed_signature: None,
-            requested_signature: None,
-            last_attempt: None,
-            in_flight: false,
-            skipped_providers: BTreeMap::new(),
-        }
-    }
-}
-
-impl NudgeCacheEntry {
-    fn new() -> Self {
-        Self {
-            enabled: false,
-            completed_signature: None,
-            requested_signature: None,
-            last_nudge: None,
-            last_attempt: None,
-            last_sent: None,
-            in_flight: false,
-            skipped_providers: BTreeMap::new(),
-        }
-    }
-}
-
 struct DaemonState {
     workspace: WorkspaceStore,
+    workspace_items: Vec<WorkspaceItem>,
+    next_group_id: u32,
+    next_supervisor_action_sequence: u64,
+    groups: BTreeMap<GroupId, SupervisedGroupState>,
     observations: BTreeMap<SessionId, SessionObservation>,
     observation_worker: Option<ObservationWorker>,
     observation_cache: BTreeMap<SessionId, ObservationCacheEntry>,
@@ -236,13 +156,11 @@ struct DaemonState {
     session_streams: BTreeMap<SessionId, SessionStreamState>,
     repo_watches: BTreeMap<PathBuf, RepoWatchState>,
     session_repo_roots: BTreeMap<SessionId, PathBuf>,
-    summary_worker: Option<SummaryWorker>,
-    summary_cache: BTreeMap<SessionId, SummaryCacheEntry>,
-    naming_worker: Option<NamingWorker>,
-    naming_cache: BTreeMap<SessionId, NamingCacheEntry>,
-    nudge_worker: Option<NudgeWorker>,
-    nudge_cache: BTreeMap<SessionId, NudgeCacheEntry>,
+    assist_worker: Option<AssistWorker>,
     forwarded_sessions: BTreeSet<SessionId>,
+    input_sync_enabled: bool,
+    input_sync_scope: InputSyncScope,
+    terminal_display_capabilities: TerminalDisplayCapabilities,
     snapshot_dirty: bool,
 }
 
@@ -258,10 +176,53 @@ struct RepoWatchState {
     handle: RepoWatchHandle,
 }
 
+fn apply_terminal_display_env(
+    launch: &mut SessionLaunch,
+    capabilities: &TerminalDisplayCapabilities,
+) {
+    let mut protocols = Vec::new();
+
+    if capabilities.kitty_graphics {
+        upsert_launch_env(&mut launch.env, "KITTY_WINDOW_ID", "1");
+        protocols.push("kitty");
+    }
+
+    if capabilities.sixel {
+        if let Some(vte_version) = capabilities.vte_version.as_deref() {
+            upsert_launch_env(&mut launch.env, "VTE_VERSION", vte_version);
+        }
+        protocols.push("sixel");
+    }
+
+    if !protocols.is_empty() {
+        upsert_launch_env(
+            &mut launch.env,
+            "EXATERM_TERMINAL_IMAGE_PROTOCOLS",
+            &protocols.join(","),
+        );
+    }
+}
+
+fn upsert_launch_env(env: &mut Vec<(String, String)>, key: &str, value: &str) {
+    if let Some((_, existing_value)) = env
+        .iter_mut()
+        .rev()
+        .find(|(existing_key, _)| existing_key == key)
+    {
+        *existing_value = value.to_string();
+        return;
+    }
+    env.push((key.to_string(), value.to_string()));
+}
+
 impl DaemonState {
     fn new() -> Self {
         Self {
             workspace: WorkspaceStore::new(),
+            workspace_items: Vec::new(),
+            next_group_id: 1,
+            next_supervisor_action_sequence: 1,
+            groups: BTreeMap::new(),
             observations: BTreeMap::new(),
             observation_worker: spawn_observation_worker(),
             observation_cache: BTreeMap::new(),
@@ -270,13 +231,11 @@ impl DaemonState {
             session_streams: BTreeMap::new(),
             repo_watches: BTreeMap::new(),
             session_repo_roots: BTreeMap::new(),
-            summary_worker: spawn_summary_worker(),
-            summary_cache: BTreeMap::new(),
-            naming_worker: spawn_naming_worker(),
-            naming_cache: BTreeMap::new(),
-            nudge_worker: spawn_nudge_worker(),
-            nudge_cache: BTreeMap::new(),
+            assist_worker: spawn_assist_worker(),
             forwarded_sessions: BTreeSet::new(),
+            input_sync_enabled: false,
+            input_sync_scope: InputSyncScope::RootVisible,
+            terminal_display_capabilities: TerminalDisplayCapabilities::default(),
             snapshot_dirty: false,
         }
     }
@@ -294,17 +253,31 @@ impl DaemonState {
 
     fn add_shell_session_without_watch(
         &mut self,
+        launch: SessionLaunch,
+    ) -> Result<SessionId, String> {
+        self.add_shell_session_with_visibility(launch, true)
+    }
+
+    fn add_shell_session_with_visibility(
+        &mut self,
         mut launch: SessionLaunch,
+        top_level: bool,
     ) -> Result<SessionId, String> {
         let idx = self.workspace.sessions().len();
+        apply_terminal_display_env(&mut launch, &self.terminal_display_capabilities);
         launch.env.push(("EXATERM_IDX".into(), idx.to_string()));
-        launch.env.push(("EXATERM_IDX_1".into(), (idx + 1).to_string()));
+        launch
+            .env
+            .push(("EXATERM_IDX_1".into(), (idx + 1).to_string()));
         let session_id = self.workspace.add_session(launch.clone());
+        if top_level {
+            self.workspace_items
+                .push(WorkspaceItem::Session(session_id));
+        }
         self.observations
             .insert(session_id, SessionObservation::new());
         self.observation_cache
             .insert(session_id, ObservationCacheEntry::new());
-        self.nudge_cache.insert(session_id, NudgeCacheEntry::new());
         self.replay_buffers.insert(session_id, Vec::new());
         self.session_streams
             .insert(session_id, create_session_stream_state(session_id)?);
@@ -365,6 +338,7 @@ impl DaemonState {
 
     fn workspace_snapshot(&self) -> WorkspaceSnapshot {
         WorkspaceSnapshot {
+            items: self.visible_workspace_items(),
             sessions: self
                 .workspace
                 .sessions()
@@ -377,31 +351,82 @@ impl DaemonState {
                         .get(&record_id)
                         .map(observation_snapshot)
                         .unwrap_or_default();
-                    let summary = self
-                        .summary_cache
-                        .get(&record_id)
-                        .and_then(|entry| entry.last_summary.clone());
-                    let nudge = self.nudge_cache.get(&record_id);
                     SessionSnapshot {
                         record,
                         observation,
-                        summary,
                         raw_stream_socket_name: self
                             .session_streams
                             .get(&record_id)
                             .map(|stream| stream.socket_name.clone()),
-                        auto_nudge_enabled: nudge.is_some_and(|entry| entry.enabled),
-                        last_nudge: nudge.and_then(|entry| entry.last_nudge.clone()),
-                        last_sent_age_secs: nudge
-                            .and_then(|entry| entry.last_sent.map(|sent| sent.elapsed().as_secs())),
                     }
                 })
                 .collect(),
+            groups: self.group_snapshots(),
         }
+    }
+
+    fn visible_workspace_items(&self) -> Vec<WorkspaceItem> {
+        let session_ids = self
+            .workspace
+            .sessions()
+            .iter()
+            .map(|session| session.id)
+            .collect::<BTreeSet<_>>();
+        let group_ids = self.groups.keys().copied().collect::<BTreeSet<_>>();
+        self.workspace_items
+            .iter()
+            .copied()
+            .filter(|item| match item {
+                WorkspaceItem::Session(session_id) => session_ids.contains(session_id),
+                WorkspaceItem::Group(group_id) => group_ids.contains(group_id),
+            })
+            .collect()
+    }
+
+    fn group_snapshots(&self) -> Vec<SupervisedGroupRecord> {
+        self.groups
+            .values()
+            .map(|group| {
+                let latest_action_age_secs = group
+                    .actions
+                    .last()
+                    .map(|action| action.at.elapsed().as_secs());
+                SupervisedGroupRecord {
+                    id: group.id,
+                    name: group.name.clone(),
+                    member_session_ids: group.member_session_ids.clone(),
+                    supervisor_session_id: group.supervisor_session_id,
+                    provider: group.provider,
+                    goal: group.goal.clone(),
+                    summary_markdown: group.summary_markdown.clone(),
+                    supervisor_visible: group.supervisor_visible,
+                    summary_age_secs: group
+                        .summary_updated_at
+                        .map(|updated| updated.elapsed().as_secs()),
+                    latest_action_age_secs,
+                    actions: group
+                        .actions
+                        .iter()
+                        .rev()
+                        .take(8)
+                        .map(|action| SupervisorActionRecord {
+                            sequence: action.sequence,
+                            summary: action.summary.clone(),
+                            age_secs: action.at.elapsed().as_secs(),
+                        })
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect(),
+                }
+            })
+            .collect()
     }
 
     fn shutdown_workspace(&mut self) {
         self.runtimes.clear();
+        self.workspace_items.clear();
+        self.groups.clear();
         self.observations.clear();
         self.observation_cache.clear();
         self.replay_buffers.clear();
@@ -413,10 +438,9 @@ impl DaemonState {
             watch.handle.stop();
         }
         self.session_repo_roots.clear();
-        self.summary_cache.clear();
-        self.naming_cache.clear();
-        self.nudge_cache.clear();
         self.forwarded_sessions.clear();
+        self.input_sync_enabled = false;
+        self.input_sync_scope = InputSyncScope::RootVisible;
         self.workspace.replace_sessions(Vec::new());
         self.snapshot_dirty = true;
     }
@@ -424,9 +448,17 @@ impl DaemonState {
 
 enum ClientControl {
     Message(ClientMessage),
+    McpToolCall {
+        name: String,
+        arguments: Value,
+        response: mpsc::Sender<ToolCallOutcome>,
+    },
     ControlDisconnected,
     StreamDisconnected(SessionId),
-    TerminalInput(SessionId),
+    TerminalInputBytes {
+        source_session: SessionId,
+        bytes: Vec<u8>,
+    },
     FileActivity {
         repo_root: PathBuf,
         relative_path: String,
@@ -449,7 +481,7 @@ impl LocalBeachheadClient {
     pub fn connect_control(control: UnixStream) -> Result<Self, String> {
         let control_writer = control
             .try_clone()
-            .map_err(|error| format!("failed to clone beachhead socket: {error}"))?;
+            .map_err(|error| format!("failed to clone host session socket: {error}"))?;
         let control_reader = control;
         let (event_wake_reader, mut event_wake_writer) = UnixStream::pair()
             .map_err(|error| format!("failed to create event wake socket: {error}"))?;
@@ -536,6 +568,88 @@ impl LocalBeachheadClient {
     }
 }
 
+fn spawn_mcp_client(stream: UnixStream, control_tx: ControlNotifier) {
+    thread::spawn(move || {
+        let reader = match stream.try_clone() {
+            Ok(reader) => BufReader::new(reader),
+            Err(_) => return,
+        };
+        let writer = stream;
+        let dispatcher = move |name: &str, arguments: Value| -> ToolCallOutcome {
+            let (response_tx, response_rx) = mpsc::channel();
+            control_tx
+                .send(ClientControl::McpToolCall {
+                    name: name.to_string(),
+                    arguments,
+                    response: response_tx,
+                })
+                .map_err(|_| ToolCallError::new("Exaterm daemon is not accepting MCP calls"))?;
+            response_rx
+                .recv_timeout(Duration::from_secs(30))
+                .map_err(|_| ToolCallError::new("Exaterm MCP tool call timed out"))?
+        };
+        let server = McpServer::new(
+            ServerInfo::new("exaterm-persistent-sessions", env!("CARGO_PKG_VERSION")),
+            exaterm_mcp_tools(),
+            dispatcher,
+        );
+        let _ = server.serve(reader, writer);
+    });
+}
+
+fn exaterm_mcp_tools() -> Vec<ToolDefinition> {
+    vec![
+        ToolDefinition::new(
+            "exaterm_list_groups",
+            "List supervised groups and their worker sessions.",
+            json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+        ),
+        ToolDefinition::new(
+            "exaterm_get_group",
+            "Read a supervised group's summary, members, observations, and recent supervisor actions.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "group_id": { "type": "integer", "minimum": 1 }
+                },
+                "required": ["group_id"],
+                "additionalProperties": false
+            }),
+        ),
+        ToolDefinition::new(
+            "exaterm_send_message_to_agent",
+            "Send a direct message into one worker terminal in a supervised group.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "group_id": { "type": "integer", "minimum": 1 },
+                    "session_id": { "type": "integer", "minimum": 1 },
+                    "message": { "type": "string", "minLength": 1 }
+                },
+                "required": ["group_id", "session_id", "message"],
+                "additionalProperties": false
+            }),
+        ),
+        ToolDefinition::new(
+            "exaterm_update_group_summary",
+            "Replace the operator-facing Markdown summary for a supervised group. Use natural Markdown, including tables when useful.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "group_id": { "type": "integer", "minimum": 1 },
+                    "markdown": { "type": "string" }
+                },
+                "required": ["group_id", "markdown"],
+                "additionalProperties": false
+            }),
+        ),
+    ]
+}
+
 pub fn run_local_daemon() -> ExitCode {
     match run_local_daemon_inner() {
         Ok(()) => ExitCode::SUCCESS,
@@ -547,18 +661,27 @@ pub fn run_local_daemon() -> ExitCode {
 }
 
 fn run_local_daemon_inner() -> Result<(), String> {
+    apply_app_config_environment(&load_app_config());
+
     let control_socket_path = control_socket_path()?;
+    let mcp_socket_path = mcp_socket_path()?;
     if let Some(parent) = control_socket_path.parent() {
         fs::create_dir_all(parent)
             .map_err(|error| format!("failed to create daemon socket dir: {error}"))?;
     }
     clear_stale_control_socket(&control_socket_path)?;
+    clear_stale_mcp_socket(&mcp_socket_path)?;
 
     let control_listener = UnixListener::bind(&control_socket_path)
         .map_err(|error| format!("failed to bind daemon control socket: {error}"))?;
     control_listener
         .set_nonblocking(true)
         .map_err(|error| format!("failed to set daemon control socket nonblocking: {error}"))?;
+    let mcp_listener = UnixListener::bind(&mcp_socket_path)
+        .map_err(|error| format!("failed to bind daemon MCP socket: {error}"))?;
+    mcp_listener
+        .set_nonblocking(true)
+        .map_err(|error| format!("failed to set daemon MCP socket nonblocking: {error}"))?;
 
     let (control_tx, control_rx) = mpsc::channel::<ClientControl>();
     let (mut wake_reader, wake_writer) = UnixStream::pair()
@@ -580,6 +703,7 @@ fn run_local_daemon_inner() -> Result<(), String> {
 
     while !should_exit {
         let control_ready;
+        let mcp_ready;
         let wake_ready;
         let mut ready_session_ids = Vec::new();
         {
@@ -588,6 +712,11 @@ fn run_local_daemon_inner() -> Result<(), String> {
             let mut pollfds = vec![
                 libc::pollfd {
                     fd: control_listener.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: mcp_listener.as_raw_fd(),
                     events: libc::POLLIN,
                     revents: 0,
                 },
@@ -620,9 +749,10 @@ fn run_local_daemon_inner() -> Result<(), String> {
             }
 
             control_ready = pollfds[0].revents & libc::POLLIN != 0;
-            wake_ready = pollfds[1].revents & libc::POLLIN != 0;
+            mcp_ready = pollfds[1].revents & libc::POLLIN != 0;
+            wake_ready = pollfds[2].revents & libc::POLLIN != 0;
             for (index, session_id) in session_ids.into_iter().enumerate() {
-                if pollfds[index + 2].revents & libc::POLLIN != 0 {
+                if pollfds[index + 3].revents & libc::POLLIN != 0 {
                     ready_session_ids.push(session_id);
                 }
             }
@@ -653,6 +783,19 @@ fn run_local_daemon_inner() -> Result<(), String> {
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
                     Err(error) => return Err(format!("daemon control accept failed: {error}")),
+                }
+            }
+        }
+
+        if mcp_ready {
+            loop {
+                match mcp_listener.accept() {
+                    Ok((stream, _)) => {
+                        let _ = stream.set_nonblocking(false);
+                        spawn_mcp_client(stream, control_notifier.clone());
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(error) => return Err(format!("daemon MCP accept failed: {error}")),
                 }
             }
         }
@@ -723,6 +866,15 @@ fn run_local_daemon_inner() -> Result<(), String> {
                         should_exit = true;
                     }
                 }
+                ClientControl::McpToolCall {
+                    name,
+                    arguments,
+                    response,
+                } => {
+                    let result =
+                        handle_mcp_tool_call(&mut state, &control_notifier, &name, arguments);
+                    let _ = response.send(result);
+                }
                 ClientControl::ControlDisconnected => {
                     client_writer = None;
                 }
@@ -733,8 +885,12 @@ fn run_local_daemon_inner() -> Result<(), String> {
                         }
                     }
                 }
-                ClientControl::TerminalInput(session_id) => {
-                    note_terminal_input_activity(&mut state, session_id);
+                ClientControl::TerminalInputBytes {
+                    source_session,
+                    bytes,
+                } => {
+                    note_terminal_input_activity(&mut state, source_session);
+                    fanout_synced_terminal_input(&mut state, source_session, &bytes);
                 }
                 ClientControl::FileActivity {
                     repo_root,
@@ -747,7 +903,6 @@ fn run_local_daemon_inner() -> Result<(), String> {
                                 apply_file_activity(observation, relative_path.clone(), now);
                             }
                         }
-                        state.snapshot_dirty = true;
                     }
                 }
                 ClientControl::RuntimeEvent(session_id, event) => {
@@ -757,7 +912,7 @@ fn run_local_daemon_inner() -> Result<(), String> {
         }
 
         let runtime_changed = false;
-        let worker_changed = drain_worker_results(&mut state);
+        let worker_changed = drain_worker_results(&mut state, &mut client_writer);
         if runtime_changed || worker_changed {
             state.snapshot_dirty = true;
         }
@@ -777,6 +932,7 @@ fn run_local_daemon_inner() -> Result<(), String> {
     }
 
     let _ = fs::remove_file(&control_socket_path);
+    let _ = fs::remove_file(&mcp_socket_path);
     Ok(())
 }
 
@@ -792,6 +948,10 @@ fn handle_client_message(
                 let snapshot = state.workspace_snapshot();
                 let _ = write_json_line(writer, &ServerMessage::WorkspaceSnapshot { snapshot });
             }
+            Ok(false)
+        }
+        ClientMessage::SetTerminalDisplayCapabilities { capabilities } => {
+            state.terminal_display_capabilities = capabilities;
             Ok(false)
         }
         ClientMessage::CreateOrResumeDefaultWorkspace => {
@@ -817,7 +977,12 @@ fn handle_client_message(
         } => {
             let current_total = state.workspace.sessions().len();
             if target_total > current_total && supported_terminal_target(target_total) {
-                add_n_terminals(state, source_session, target_total - current_total, control_tx)?;
+                add_n_terminals(
+                    state,
+                    source_session,
+                    target_total - current_total,
+                    control_tx,
+                )?;
             }
             Ok(false)
         }
@@ -830,23 +995,36 @@ fn handle_client_message(
             state.observations.remove(&session_id);
             state.observation_cache.remove(&session_id);
             state.replay_buffers.remove(&session_id);
+            state
+                .workspace_items
+                .retain(|item| *item != WorkspaceItem::Session(session_id));
+            let mut empty_groups = Vec::new();
+            for group in state.groups.values_mut() {
+                group.member_session_ids.retain(|id| *id != session_id);
+                if group.supervisor_session_id == Some(session_id) {
+                    group.supervisor_session_id = None;
+                }
+                if group.member_session_ids.is_empty() {
+                    empty_groups.push(group.id);
+                }
+            }
+            for group_id in empty_groups {
+                state.groups.remove(&group_id);
+                state
+                    .workspace_items
+                    .retain(|item| *item != WorkspaceItem::Group(group_id));
+            }
             if let Some(stream) = state.session_streams.remove(&session_id) {
                 let _ = fs::remove_file(&stream.socket_path);
             }
             if let Some(root) = state.session_repo_roots.remove(&session_id) {
-                let still_used = state
-                    .session_repo_roots
-                    .values()
-                    .any(|r| r == &root);
+                let still_used = state.session_repo_roots.values().any(|r| r == &root);
                 if !still_used {
                     if let Some(watch) = state.repo_watches.remove(&root) {
                         watch.handle.stop();
                     }
                 }
             }
-            state.summary_cache.remove(&session_id);
-            state.naming_cache.remove(&session_id);
-            state.nudge_cache.remove(&session_id);
             state.forwarded_sessions.remove(&session_id);
             state.workspace.remove_session(session_id);
             state.snapshot_dirty = true;
@@ -873,20 +1051,74 @@ fn handle_client_message(
             }
             Ok(false)
         }
-        ClientMessage::ToggleAutoNudge {
-            session_id,
-            enabled,
+        ClientMessage::CreateSupervisedGroup {
+            name,
+            session_ids,
+            goal,
         } => {
-            let entry = state
-                .nudge_cache
-                .entry(session_id)
-                .or_insert_with(NudgeCacheEntry::new);
-            entry.enabled = enabled;
-            if !enabled {
-                entry.in_flight = false;
-                entry.requested_signature = None;
-            }
+            create_supervised_group(state, control_tx, name, session_ids, goal)?;
             state.snapshot_dirty = true;
+            Ok(false)
+        }
+        ClientMessage::SetGroupSupervisorVisible { group_id, visible } => {
+            let group = state
+                .groups
+                .get_mut(&group_id)
+                .ok_or_else(|| format!("unknown supervised group {}", group_id.0))?;
+            group.supervisor_visible = visible;
+            state.snapshot_dirty = true;
+            Ok(false)
+        }
+        ClientMessage::SetInputSync { enabled, scope } => {
+            state.input_sync_enabled = enabled;
+            state.input_sync_scope = scope;
+            Ok(false)
+        }
+        ClientMessage::SendMessageToAgent {
+            group_id,
+            session_id,
+            message,
+        } => {
+            send_group_message_to_agent(state, group_id, session_id, &message)?;
+            state.snapshot_dirty = true;
+            Ok(false)
+        }
+        ClientMessage::UpdateGroupSummary { group_id, markdown } => {
+            update_group_summary(state, group_id, &markdown)?;
+            state.snapshot_dirty = true;
+            Ok(false)
+        }
+        ClientMessage::ConfigureTerminalAssist {
+            openai_api_key,
+            openai_base_url,
+            model,
+        } => {
+            apply_terminal_assist_config_environment(&TerminalAssistConfig {
+                openai_api_key: openai_api_key.unwrap_or_default(),
+                openai_base_url,
+                model,
+            });
+            state.assist_worker = spawn_assist_worker();
+            Ok(false)
+        }
+        ClientMessage::RequestTerminalAssist {
+            request_id,
+            session_id,
+            prompt,
+        } => {
+            if let Err(error) = queue_terminal_assist(state, request_id, session_id, &prompt) {
+                if let Some(writer) = client_writer.as_mut() {
+                    let _ = write_json_line(
+                        writer,
+                        &ServerMessage::TerminalAssistCompleted {
+                            request_id,
+                            session_id,
+                            inserted: false,
+                            error: Some(error),
+                        },
+                    );
+                }
+            }
             Ok(false)
         }
         ClientMessage::DetachClient { keep_alive } => {
@@ -905,35 +1137,508 @@ fn handle_client_message(
     }
 }
 
+fn handle_mcp_tool_call(
+    state: &mut DaemonState,
+    _control_tx: &ControlNotifier,
+    name: &str,
+    arguments: Value,
+) -> ToolCallOutcome {
+    match name {
+        "exaterm_list_groups" => {
+            let groups = state.group_snapshots();
+            let structured = json!({
+                "visible_items": state.visible_workspace_items(),
+                "groups": groups,
+            });
+            let text = if state.groups.is_empty() {
+                "No supervised groups are active.".to_string()
+            } else {
+                state
+                    .groups
+                    .values()
+                    .map(|group| {
+                        format!(
+                            "Group {}: {} ({} worker terminals)",
+                            group.id.0,
+                            group.name,
+                            group.member_session_ids.len()
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            Ok(ToolCallResult::structured(structured, text))
+        }
+        "exaterm_get_group" => {
+            let group_id = GroupId(argument_u32(&arguments, "group_id")?);
+            let structured = mcp_group_detail(state, group_id)?;
+            let name = structured
+                .get("group")
+                .and_then(|group| group.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or("group")
+                .to_string();
+            Ok(ToolCallResult::structured(
+                structured,
+                format!("Snapshot for group {} ({name})", group_id.0),
+            ))
+        }
+        "exaterm_send_message_to_agent" => {
+            let group_id = GroupId(argument_u32(&arguments, "group_id")?);
+            let session_id = SessionId(argument_u32(&arguments, "session_id")?);
+            let message = argument_string(&arguments, "message")?;
+            send_group_message_to_agent(state, group_id, session_id, &message)
+                .map_err(ToolCallError::new)?;
+            state.snapshot_dirty = true;
+            Ok(ToolCallResult::structured(
+                json!({
+                    "group_id": group_id.0,
+                    "session_id": session_id.0,
+                    "sent": true
+                }),
+                format!("Sent message to session {}", session_id.0),
+            ))
+        }
+        "exaterm_update_group_summary" => {
+            let group_id = GroupId(argument_u32(&arguments, "group_id")?);
+            let markdown = argument_string(&arguments, "markdown")?;
+            update_group_summary(state, group_id, &markdown).map_err(ToolCallError::new)?;
+            state.snapshot_dirty = true;
+            Ok(ToolCallResult::structured(
+                json!({
+                    "group_id": group_id.0,
+                    "updated": true
+                }),
+                format!("Updated summary for group {}", group_id.0),
+            ))
+        }
+        _ => Err(ToolCallError::new(format!(
+            "unknown Exaterm MCP tool: {name}"
+        ))),
+    }
+}
+
+fn mcp_group_detail(state: &DaemonState, group_id: GroupId) -> Result<Value, ToolCallError> {
+    let group = state
+        .groups
+        .get(&group_id)
+        .ok_or_else(|| ToolCallError::new(format!("unknown supervised group {}", group_id.0)))?;
+    let group_record = state
+        .group_snapshots()
+        .into_iter()
+        .find(|record| record.id == group_id)
+        .ok_or_else(|| ToolCallError::new(format!("unknown supervised group {}", group_id.0)))?;
+    let sessions = group
+        .member_session_ids
+        .iter()
+        .filter_map(|session_id| {
+            let record = state.workspace.session(*session_id)?;
+            let observation = state
+                .observations
+                .get(session_id)
+                .map(observation_snapshot)
+                .unwrap_or_default();
+            Some(json!({
+                "session_id": session_id.0,
+                "name": record.launch.name.clone(),
+                "display_name": record.display_name.clone(),
+                "status": record.status,
+                "pid": record.pid,
+                "observation": observation,
+            }))
+        })
+        .collect::<Vec<_>>();
+
+    Ok(json!({
+        "group": group_record,
+        "worker_sessions": sessions,
+    }))
+}
+
+fn argument_u32(arguments: &Value, key: &str) -> Result<u32, ToolCallError> {
+    let camel = to_camel_case(key);
+    arguments
+        .get(key)
+        .or_else(|| arguments.get(camel.as_str()))
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| ToolCallError::new(format!("missing or invalid integer argument `{key}`")))
+}
+
+fn argument_string(arguments: &Value, key: &str) -> Result<String, ToolCallError> {
+    let camel = to_camel_case(key);
+    arguments
+        .get(key)
+        .or_else(|| arguments.get(camel.as_str()))
+        .and_then(Value::as_str)
+        .map(|value| value.to_string())
+        .ok_or_else(|| ToolCallError::new(format!("missing or invalid string argument `{key}`")))
+}
+
+fn to_camel_case(key: &str) -> String {
+    let mut output = String::new();
+    let mut uppercase_next = false;
+    for ch in key.chars() {
+        if ch == '_' {
+            uppercase_next = true;
+        } else if uppercase_next {
+            output.extend(ch.to_uppercase());
+            uppercase_next = false;
+        } else {
+            output.push(ch);
+        }
+    }
+    output
+}
+
+fn create_supervised_group(
+    state: &mut DaemonState,
+    control_tx: &ControlNotifier,
+    name: String,
+    session_ids: Vec<SessionId>,
+    goal: Option<String>,
+) -> Result<GroupId, String> {
+    let mut members = Vec::new();
+    for session_id in session_ids {
+        if members.contains(&session_id) {
+            continue;
+        }
+        if state.workspace.session(session_id).is_some() {
+            members.push(session_id);
+        }
+    }
+    if members.is_empty() {
+        return Err("cannot create supervised group without valid member sessions".into());
+    }
+
+    let group_id = GroupId(state.next_group_id);
+    state.next_group_id = state.next_group_id.saturating_add(1);
+    let name = sanitize_group_name(&name).unwrap_or_else(|| format!("Group {}", group_id.0));
+    let provider = detect_supervisor_provider(state, &members);
+    let supervisor_session_id = Some(spawn_supervisor_session(
+        state,
+        control_tx,
+        group_id,
+        &name,
+        provider,
+        goal.as_deref(),
+    )?);
+
+    let insert_at = state
+        .workspace_items
+        .iter()
+        .position(|item| match item {
+            WorkspaceItem::Session(session_id) => members.contains(session_id),
+            WorkspaceItem::Group(_) => false,
+        })
+        .unwrap_or(state.workspace_items.len());
+    state.workspace_items.retain(
+        |item| !matches!(item, WorkspaceItem::Session(session_id) if members.contains(session_id)),
+    );
+    state.workspace_items.insert(
+        insert_at.min(state.workspace_items.len()),
+        WorkspaceItem::Group(group_id),
+    );
+
+    state.groups.insert(
+        group_id,
+        SupervisedGroupState {
+            id: group_id,
+            name,
+            member_session_ids: members,
+            supervisor_session_id,
+            provider,
+            goal,
+            summary_markdown: "Supervisor is starting. No summary yet.".into(),
+            supervisor_visible: false,
+            summary_updated_at: None,
+            actions: Vec::new(),
+        },
+    );
+
+    Ok(group_id)
+}
+
+fn sanitize_group_name(name: &str) -> Option<String> {
+    let name = name.split_whitespace().collect::<Vec<_>>().join(" ");
+    let name = name.trim();
+    (!name.is_empty()).then(|| name.chars().take(60).collect())
+}
+
+fn detect_supervisor_provider(
+    state: &DaemonState,
+    member_session_ids: &[SessionId],
+) -> Option<SupervisorProvider> {
+    let mut codex = 0usize;
+    let mut claude = 0usize;
+    for session_id in member_session_ids {
+        let Some(observation) = state.observations.get(session_id) else {
+            continue;
+        };
+        for value in [
+            observation.shell_child_command.as_deref(),
+            observation.dominant_process.as_deref(),
+            observation.active_command.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let lower = value.to_ascii_lowercase();
+            if lower.contains("codex") {
+                codex += 1;
+            }
+            if lower.contains("claude") {
+                claude += 1;
+            }
+        }
+    }
+    if codex > 0 || claude > 0 {
+        return if codex >= claude {
+            Some(SupervisorProvider::Codex)
+        } else {
+            Some(SupervisorProvider::Claude)
+        };
+    }
+    if command_exists("codex") {
+        Some(SupervisorProvider::Codex)
+    } else if command_exists("claude") {
+        Some(SupervisorProvider::Claude)
+    } else {
+        Some(SupervisorProvider::Other)
+    }
+}
+
+fn command_exists(program: &str) -> bool {
+    Command::new("sh")
+        .arg("-lc")
+        .arg(format!("command -v {}", shell_quote(program)))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r"'\''"))
+}
+
+fn spawn_supervisor_session(
+    state: &mut DaemonState,
+    control_tx: &ControlNotifier,
+    group_id: GroupId,
+    group_name: &str,
+    provider: Option<SupervisorProvider>,
+    goal: Option<&str>,
+) -> Result<SessionId, String> {
+    let prompt = supervisor_prompt(group_id, group_name, goal);
+    let mut launch = match provider {
+        Some(SupervisorProvider::Codex) if command_exists("codex") => command_launch(
+            format!("{group_name} Supervisor"),
+            "Supervisor agent",
+            SessionKind::RunningStream,
+            "/usr/bin/env",
+            vec![
+                "codex".into(),
+                "--dangerously-bypass-approvals-and-sandbox".into(),
+                prompt,
+            ],
+        ),
+        Some(SupervisorProvider::Claude) if command_exists("claude") => command_launch(
+            format!("{group_name} Supervisor"),
+            "Supervisor agent",
+            SessionKind::RunningStream,
+            "/usr/bin/env",
+            vec![
+                "claude".into(),
+                "--dangerously-skip-permissions".into(),
+                prompt,
+            ],
+        ),
+        _ => command_launch(
+            format!("{group_name} Supervisor"),
+            "Supervisor shell",
+            SessionKind::WaitingShell,
+            "/usr/bin/env",
+            vec![
+                "bash".into(),
+                "--noprofile".into(),
+                "--norc".into(),
+                "-ic".into(),
+                format!(
+                    "printf '%s\\r\\n' {}; exec bash --noprofile --norc -i",
+                    shell_quote(&prompt)
+                ),
+            ],
+        ),
+    };
+    launch
+        .env
+        .push(("EXATERM_SUPERVISED_GROUP_ID".into(), group_id.0.to_string()));
+    launch.env.push((
+        "EXATERM_MCP_SOCKET".into(),
+        mcp_socket_path()?.to_string_lossy().into_owned(),
+    ));
+    launch
+        .env
+        .push(("EXATERM_MCP_TRANSPORT".into(), "unix-jsonrpc-lines".into()));
+    let session_id = state.add_shell_session_with_visibility(launch, false)?;
+    ensure_runtime_forwarder(state, session_id, control_tx.clone());
+    Ok(session_id)
+}
+
+fn supervisor_prompt(group_id: GroupId, group_name: &str, goal: Option<&str>) -> String {
+    let goal = goal.unwrap_or("Supervise this terminal group with a light touch.");
+    format!(
+        "You are the Exaterm supervisor for group {id} ({name}). Goal: {goal}\n\
+	Use Exaterm MCP tools as your source of truth when available. The MCP endpoint is advertised in EXATERM_MCP_SOCKET and speaks newline-delimited JSON-RPC over a Unix socket. \
+	Keep the operator-facing summary in natural Markdown, using tables when they help. \
+	Use exaterm_send_message_to_agent when a worker needs a prod, redirect, or cross-pollinated idea. Use exaterm_update_group_summary separately when the user-facing summary should change. \
+	Assess the overall group conservatively: Active means useful work is still moving; Stalling means that despite supervisor efforts forward progress is not being made; Blocked means a substantial proportion of the agents cannot proceed at all. \
+	Do not call the group Blocked for ordinary compile errors, failing tests, one worker being stuck while others can continue, or visible debugging work.",
+        id = group_id.0,
+        name = group_name
+    )
+}
+
+fn send_group_message_to_agent(
+    state: &mut DaemonState,
+    group_id: GroupId,
+    session_id: SessionId,
+    message: &str,
+) -> Result<(), String> {
+    let message = sanitize_agent_message(message)?;
+    let group = state
+        .groups
+        .get(&group_id)
+        .ok_or_else(|| format!("unknown supervised group {}", group_id.0))?;
+    if !group.member_session_ids.contains(&session_id) {
+        return Err(format!(
+            "session {} is not a worker in supervised group {}",
+            session_id.0, group_id.0
+        ));
+    }
+    send_runtime_input_line(state, session_id, &message).map_err(|error| {
+        format!(
+            "failed to send message to session {}: {error}",
+            session_id.0
+        )
+    })?;
+    record_group_action(
+        state,
+        group_id,
+        format!("Sent message to session {}: {}", session_id.0, message),
+    );
+    Ok(())
+}
+
+fn sanitize_agent_message(message: &str) -> Result<String, String> {
+    let collapsed = message.trim().replace('\r', "\n");
+    if collapsed.is_empty() {
+        return Err("message cannot be empty".into());
+    }
+    Ok(collapsed.chars().take(2000).collect())
+}
+
+fn update_group_summary(
+    state: &mut DaemonState,
+    group_id: GroupId,
+    markdown: &str,
+) -> Result<(), String> {
+    let group = state
+        .groups
+        .get_mut(&group_id)
+        .ok_or_else(|| format!("unknown supervised group {}", group_id.0))?;
+    let markdown = markdown.trim();
+    group.summary_markdown = if markdown.is_empty() {
+        "No supervisor summary yet.".into()
+    } else {
+        markdown.chars().take(50_000).collect()
+    };
+    group.summary_updated_at = Some(Instant::now());
+    Ok(())
+}
+
+fn record_group_action(state: &mut DaemonState, group_id: GroupId, summary: impl Into<String>) {
+    let Some(group) = state.groups.get_mut(&group_id) else {
+        return;
+    };
+    let sequence = state.next_supervisor_action_sequence;
+    state.next_supervisor_action_sequence = state.next_supervisor_action_sequence.saturating_add(1);
+    group.actions.push(SupervisorActionEntry {
+        sequence,
+        summary: summary.into(),
+        at: Instant::now(),
+    });
+    const MAX_ACTIONS: usize = 64;
+    if group.actions.len() > MAX_ACTIONS {
+        let extra = group.actions.len() - MAX_ACTIONS;
+        group.actions.drain(0..extra);
+    }
+}
+
+fn queue_terminal_assist(
+    state: &mut DaemonState,
+    request_id: u64,
+    session_id: SessionId,
+    prompt: &str,
+) -> Result<(), String> {
+    let Some(worker) = state.assist_worker.as_ref() else {
+        return Err("no terminal assist provider is available".into());
+    };
+    let prompt = prompt.trim();
+    if prompt.is_empty() {
+        return Err("assist prompt cannot be empty".into());
+    }
+    let evidence = build_terminal_assist_evidence(state, session_id, prompt)?;
+    let _ = worker.requests.send(AssistJob {
+        request_id,
+        origin_session_id: session_id,
+        evidence,
+        preferences: ProviderPreferences::default(),
+    });
+    Ok(())
+}
+
+fn build_terminal_assist_evidence(
+    state: &DaemonState,
+    session_id: SessionId,
+    prompt: &str,
+) -> Result<TerminalAssistEvidence, String> {
+    let session = state
+        .workspace
+        .session(session_id)
+        .ok_or_else(|| format!("unknown session {}", session_id.0))?;
+    let observation = state
+        .observations
+        .get(&session_id)
+        .ok_or_else(|| format!("missing observation for session {}", session_id.0))?;
+    Ok(TerminalAssistEvidence {
+        session_name: session
+            .display_name
+            .clone()
+            .unwrap_or_else(|| session.launch.name.clone()),
+        operator_prompt: prompt.to_string(),
+        current_input: observation.painted_line.clone().unwrap_or_default(),
+        working_directory: session
+            .launch
+            .cwd
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        shell_child_command: observation.shell_child_command.clone(),
+        active_command: observation.active_command.clone(),
+        dominant_process: observation.dominant_process.clone(),
+        process_tree_excerpt: observation.process_tree_excerpt.clone(),
+        recent_files: observation.recent_files.clone(),
+        terminal_status_line: observation.painted_line.clone(),
+        recent_terminal_history: terminal_assist_history(observation),
+    })
+}
+
 fn refresh_state(state: &mut DaemonState) {
     let sessions = state.workspace.sessions().to_vec();
     for session in &sessions {
         maybe_queue_observation_refresh(state, session);
-        let Some(observation) = state.observations.get(&session.id).cloned() else {
-            continue;
-        };
-
-        if is_bare_waiting_shell(session, &observation) {
-            continue;
-        }
-        if supervision_suppressed(state, session.id) {
-            continue;
-        }
-
-        let evidence = build_tactical_evidence(session, &observation);
-        maybe_queue_summary(state, session.id, &evidence);
-
-        let naming = build_naming_evidence(session, &observation);
-        maybe_queue_name(state, session.id, &naming);
-
-        let summary = state
-            .summary_cache
-            .get(&session.id)
-            .and_then(|entry| entry.last_summary.as_ref())
-            .cloned();
-        if let Some(summary) = summary.as_ref() {
-            maybe_queue_nudge(state, session, &observation, summary);
-        }
     }
 }
 
@@ -985,144 +1690,7 @@ fn ensure_runtime_forwarder(
     spawn_runtime_forwarder(session_id, events, raw_writer, control_tx);
 }
 
-fn maybe_queue_summary(
-    state: &mut DaemonState,
-    session_id: SessionId,
-    evidence: &crate::synthesis::TacticalEvidence,
-) {
-    let Some(worker) = state.summary_worker.as_ref() else {
-        return;
-    };
-    let signature = summary_signature(evidence);
-    let substantive_signature = summary_substantive_signature(evidence);
-    let entry = state
-        .summary_cache
-        .entry(session_id)
-        .or_insert_with(SummaryCacheEntry::new);
-    if entry.completed_signature.as_deref() == Some(signature.as_str())
-        || entry.requested_signature.as_deref() == Some(signature.as_str())
-        || entry.in_flight
-    {
-        return;
-    }
-    if should_skip_repeated_paused_summary(
-        entry.last_summary.as_ref(),
-        entry.completed_substantive_signature.as_deref(),
-        &substantive_signature,
-    ) {
-        return;
-    }
-    let refresh_interval = summary_refresh_interval(entry.first_seen.elapsed());
-    if entry
-        .last_attempt
-        .is_some_and(|attempt| attempt.elapsed() < refresh_interval)
-    {
-        return;
-    }
-    entry.in_flight = true;
-    entry.last_attempt = Some(Instant::now());
-    entry.requested_signature = Some(signature.clone());
-    let _ = worker.requests.send(SummaryJob {
-        session_id,
-        signature,
-        substantive_signature,
-        evidence: evidence.clone(),
-        preferences: active_provider_preferences(&entry.skipped_providers),
-    });
-}
-
-fn maybe_queue_name(state: &mut DaemonState, session_id: SessionId, evidence: &NamingEvidence) {
-    let Some(worker) = state.naming_worker.as_ref() else {
-        return;
-    };
-    let signature = name_signature(evidence);
-    let entry = state
-        .naming_cache
-        .entry(session_id)
-        .or_insert_with(NamingCacheEntry::new);
-    if entry.completed_signature.as_deref() == Some(signature.as_str())
-        || entry.requested_signature.as_deref() == Some(signature.as_str())
-        || entry.in_flight
-    {
-        return;
-    }
-    if entry
-        .last_attempt
-        .is_some_and(|attempt| attempt.elapsed() < Duration::from_secs(20))
-    {
-        return;
-    }
-    entry.in_flight = true;
-    entry.last_attempt = Some(Instant::now());
-    entry.requested_signature = Some(signature.clone());
-    let _ = worker.requests.send(NamingJob {
-        session_id,
-        signature,
-        evidence: evidence.clone(),
-        preferences: active_provider_preferences(&entry.skipped_providers),
-    });
-}
-
-fn maybe_queue_nudge(
-    state: &mut DaemonState,
-    session: &crate::model::SessionRecord,
-    observation: &SessionObservation,
-    summary: &TacticalSynthesis,
-) {
-    let Some(worker) = state.nudge_worker.as_ref() else {
-        return;
-    };
-    if summary.tactical_state != TacticalState::Stopped {
-        return;
-    }
-    let Some(shell_child_command) = observation.shell_child_command.as_deref() else {
-        return;
-    };
-    if !looks_like_coding_agent(shell_child_command) {
-        return;
-    }
-    if observation.last_change.elapsed().as_secs() < MIN_IDLE_SECS_FOR_NUDGE {
-        return;
-    }
-    let entry = state
-        .nudge_cache
-        .entry(session.id)
-        .or_insert_with(NudgeCacheEntry::new);
-    if !entry.enabled || entry.in_flight {
-        return;
-    }
-    if entry
-        .last_sent
-        .is_some_and(|sent| sent.elapsed() < Duration::from_secs(120))
-    {
-        return;
-    }
-    if entry
-        .last_attempt
-        .is_some_and(|attempt| attempt.elapsed() < Duration::from_secs(10))
-    {
-        return;
-    }
-
-    let evidence = build_nudge_evidence(session, observation, summary);
-    let signature = nudge_signature(&evidence);
-    if entry.requested_signature.as_deref() == Some(signature.as_str()) {
-        return;
-    }
-    entry.in_flight = true;
-    entry.last_attempt = Some(Instant::now());
-    entry.requested_signature = Some(signature.clone());
-    let _ = worker.requests.send(NudgeJob {
-        session_id: session.id,
-        signature,
-        evidence,
-        preferences: active_provider_preferences(&entry.skipped_providers),
-    });
-}
-
-fn drain_worker_results(state: &mut DaemonState) -> bool {
-    let mut changed = false;
-
+fn drain_worker_results(state: &mut DaemonState, client_writer: &mut Option<UnixStream>) -> bool {
     if let Some(worker) = state.observation_worker.as_ref() {
         while let Ok(result) = worker.responses.try_recv() {
             let entry = state
@@ -1131,76 +1699,13 @@ fn drain_worker_results(state: &mut DaemonState) -> bool {
                 .or_insert_with(ObservationCacheEntry::new);
             entry.in_flight = false;
             let observation = state.observations.entry(result.session_id).or_default();
-            let before = (
-                observation.shell_child_command.clone(),
-                observation.dominant_process.clone(),
-                observation.process_tree_excerpt.clone(),
-                observation.recent_files.clone(),
-                observation.work_output_excerpt.clone(),
-                observation.active_command.clone(),
-            );
             apply_observation_refresh(observation, &result.session, result.refresh);
-            let after = (
-                observation.shell_child_command.clone(),
-                observation.dominant_process.clone(),
-                observation.process_tree_excerpt.clone(),
-                observation.recent_files.clone(),
-                observation.work_output_excerpt.clone(),
-                observation.active_command.clone(),
-            );
-            if before != after {
-                changed = true;
-            }
-        }
-    }
-
-    if let Some(worker) = state.summary_worker.as_ref() {
-        while let Ok(result) = worker.responses.try_recv() {
-            let entry = state
-                .summary_cache
-                .entry(result.session_id)
-                .or_insert_with(SummaryCacheEntry::new);
-            entry.in_flight = false;
-            entry.requested_signature = None;
-            if let Some(provider) = result.summary.demoted_provider {
-                record_provider_demotion(&mut entry.skipped_providers, provider);
-            }
-            if let Ok(summary) = result.summary.value {
-                entry.completed_signature = Some(result.signature);
-                entry.completed_substantive_signature = Some(result.substantive_signature);
-                entry.suppressed_until_input = summary.tool_not_likely_coding_agent;
-                entry.last_summary = Some(summary);
-                changed = true;
-            }
-        }
-    }
-
-    if let Some(worker) = state.naming_worker.as_ref() {
-        while let Ok(result) = worker.responses.try_recv() {
-            let entry = state
-                .naming_cache
-                .entry(result.session_id)
-                .or_insert_with(NamingCacheEntry::new);
-            entry.in_flight = false;
-            entry.requested_signature = None;
-            if let Some(provider) = result.suggestion.demoted_provider {
-                record_provider_demotion(&mut entry.skipped_providers, provider);
-            }
-            if let Ok(suggestion) = result.suggestion.value {
-                entry.completed_signature = Some(result.signature);
-                if !suggestion.name.is_empty() {
-                    state
-                        .workspace
-                        .set_display_name(result.session_id, Some(suggestion.name));
-                    changed = true;
-                }
-            }
         }
     }
 
     loop {
         let result = {
-            let Some(worker) = state.nudge_worker.as_ref() else {
+            let Some(worker) = state.assist_worker.as_ref() else {
                 break;
             };
             worker.responses.try_recv().ok()
@@ -1209,55 +1714,34 @@ fn drain_worker_results(state: &mut DaemonState) -> bool {
             break;
         };
 
-        let mut suggestion_text = None::<String>;
-        {
-            let entry = state
-                .nudge_cache
-                .entry(result.session_id)
-                .or_insert_with(NudgeCacheEntry::new);
-            entry.in_flight = false;
-            entry.requested_signature = None;
-            if let Some(provider) = result.suggestion.demoted_provider {
-                record_provider_demotion(&mut entry.skipped_providers, provider);
-            }
-            if let Ok(suggestion) = result.suggestion.value {
-                entry.completed_signature = Some(result.signature);
-                entry.last_nudge = (!suggestion.text.is_empty()).then_some(suggestion.text.clone());
-                suggestion_text = (!suggestion.text.is_empty()).then_some(suggestion.text);
-                changed = true;
-            }
-        }
-        if let Some(text) = suggestion_text {
-            if session_still_accepts_nudge(state, result.session_id)
-                && send_runtime_input_line(state, result.session_id, &text).is_ok()
-            {
-                if let Some(entry) = state.nudge_cache.get_mut(&result.session_id) {
-                    entry.last_sent = Some(Instant::now());
+        let (inserted, error) = match result.suggestion.value {
+            Ok(suggestion) if !suggestion.insert_text.trim().is_empty() => {
+                match send_terminal_assist_insert_bytes(
+                    state,
+                    result.origin_session_id,
+                    suggestion.insert_text.as_bytes(),
+                ) {
+                    Ok(()) => (true, None),
+                    Err(error) => (false, Some(error.to_string())),
                 }
             }
+            Ok(_) => (false, Some("terminal assist returned no insertion".into())),
+            Err(error) => (false, Some(error)),
+        };
+        if let Some(writer) = client_writer.as_mut() {
+            let _ = write_json_line(
+                writer,
+                &ServerMessage::TerminalAssistCompleted {
+                    request_id: result.request_id,
+                    session_id: result.origin_session_id,
+                    inserted,
+                    error,
+                },
+            );
         }
     }
 
-    changed
-}
-
-fn active_provider_preferences(
-    skipped_providers: &BTreeMap<crate::synthesis::SynthesisProvider, Instant>,
-) -> ProviderPreferences {
-    let skipped_providers = skipped_providers
-        .iter()
-        .filter_map(|(provider, demoted_at)| {
-            (demoted_at.elapsed() < PROVIDER_DEMOTION_COOLDOWN).then_some(*provider)
-        })
-        .collect();
-    ProviderPreferences { skipped_providers }
-}
-
-fn record_provider_demotion(
-    skipped_providers: &mut BTreeMap<crate::synthesis::SynthesisProvider, Instant>,
-    provider: crate::synthesis::SynthesisProvider,
-) {
-    skipped_providers.insert(provider, Instant::now());
+    false
 }
 
 fn handle_runtime_event(
@@ -1293,15 +1777,6 @@ fn send_runtime_input_line(
     send_runtime_input_bytes(state, session_id, b"\r")
 }
 
-fn session_still_accepts_nudge(state: &DaemonState, session_id: SessionId) -> bool {
-    state
-        .observations
-        .get(&session_id)
-        .is_some_and(|observation| {
-            observation.last_change.elapsed().as_secs() >= MIN_IDLE_SECS_FOR_NUDGE
-        })
-}
-
 fn send_runtime_input_bytes(
     state: &mut DaemonState,
     session_id: SessionId,
@@ -1320,27 +1795,119 @@ fn send_runtime_input_bytes(
     Ok(())
 }
 
+fn send_terminal_assist_insert_bytes(
+    state: &mut DaemonState,
+    origin_session: SessionId,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    let targets = terminal_assist_insert_targets(state, origin_session);
+    send_runtime_input_bytes(state, origin_session, bytes)?;
+    for target_session in targets {
+        if target_session == origin_session {
+            continue;
+        }
+        let _ = send_runtime_input_bytes(state, target_session, bytes);
+    }
+    Ok(())
+}
+
+fn terminal_assist_insert_targets(
+    state: &DaemonState,
+    origin_session: SessionId,
+) -> BTreeSet<SessionId> {
+    if !state.input_sync_enabled {
+        return BTreeSet::from([origin_session]);
+    }
+
+    let targets = input_sync_targets(state);
+    if targets.contains(&origin_session) {
+        targets
+    } else {
+        BTreeSet::from([origin_session])
+    }
+}
+
+fn fanout_synced_terminal_input(state: &mut DaemonState, source_session: SessionId, bytes: &[u8]) {
+    if bytes.is_empty() || !state.input_sync_enabled {
+        return;
+    }
+    let targets = input_sync_targets(state);
+    if !targets.contains(&source_session) {
+        return;
+    }
+    for target_session in targets {
+        if target_session == source_session {
+            continue;
+        }
+        if write_runtime_input_bytes(state, target_session, bytes).is_ok() {
+            note_terminal_input_activity(state, target_session);
+        }
+    }
+}
+
+fn write_runtime_input_bytes(
+    state: &DaemonState,
+    session_id: SessionId,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    let input_writer = state
+        .runtimes
+        .get(&session_id)
+        .and_then(|runtime| runtime.input_writer.as_ref().cloned())
+        .ok_or_else(|| std::io::Error::other("runtime input writer missing"))?;
+    let mut writer = input_writer
+        .lock()
+        .map_err(|_| std::io::Error::other("runtime input writer lock poisoned"))?;
+    writer.write_all(bytes)
+}
+
+fn input_sync_targets(state: &DaemonState) -> BTreeSet<SessionId> {
+    let session_ids = state
+        .workspace
+        .sessions()
+        .iter()
+        .map(|session| session.id)
+        .collect::<BTreeSet<_>>();
+    match state.input_sync_scope {
+        InputSyncScope::RootVisible => {
+            let supervisor_ids = state
+                .groups
+                .values()
+                .filter_map(|group| group.supervisor_session_id)
+                .collect::<BTreeSet<_>>();
+            state
+                .visible_workspace_items()
+                .into_iter()
+                .filter_map(|item| match item {
+                    WorkspaceItem::Session(session_id)
+                        if session_ids.contains(&session_id)
+                            && !supervisor_ids.contains(&session_id) =>
+                    {
+                        Some(session_id)
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+        InputSyncScope::GroupMembers { group_id } => state
+            .groups
+            .get(&group_id)
+            .map(|group| {
+                group
+                    .member_session_ids
+                    .iter()
+                    .copied()
+                    .filter(|session_id| session_ids.contains(session_id))
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
+}
+
 fn note_terminal_input_activity(state: &mut DaemonState, session_id: SessionId) {
     let observation = state.observations.entry(session_id).or_default();
     record_terminal_input_activity(observation);
-    if let Some(entry) = state.summary_cache.get_mut(&session_id) {
-        entry.suppressed_until_input = false;
-    }
     state.snapshot_dirty = true;
-}
-
-fn looks_like_coding_agent(command: &str) -> bool {
-    matches!(
-        command,
-        "codex" | "claude" | "claude-code" | "aider" | "opencode" | "goose" | "gemini"
-    )
-}
-
-fn supervision_suppressed(state: &DaemonState, session_id: SessionId) -> bool {
-    state
-        .summary_cache
-        .get(&session_id)
-        .is_some_and(|entry| entry.suppressed_until_input)
 }
 
 fn observation_snapshot(observation: &SessionObservation) -> ObservationSnapshot {
@@ -1348,12 +1915,6 @@ fn observation_snapshot(observation: &SessionObservation) -> ObservationSnapshot
         last_change_age_secs: observation.last_change.elapsed().as_secs(),
         recent_lines: observation.recent_lines.clone(),
         painted_line: observation.painted_line.clone(),
-        shell_child_command: observation.shell_child_command.clone(),
-        active_command: observation.active_command.clone(),
-        dominant_process: observation.dominant_process.clone(),
-        process_tree_excerpt: observation.process_tree_excerpt.clone(),
-        recent_files: observation.recent_files.clone(),
-        work_output_excerpt: observation.work_output_excerpt.clone(),
     }
 }
 
@@ -1368,66 +1929,22 @@ fn append_replay_buffer(buffer: &mut Vec<u8>, chunk: &[u8]) {
     }
 }
 
-fn summary_refresh_interval(_session_age: Duration) -> Duration {
-    Duration::from_secs(5 * 60)
-}
-
-fn spawn_summary_worker() -> Option<SummaryWorker> {
+fn spawn_assist_worker() -> Option<AssistWorker> {
     let registry = SynthesisBackendRegistry::from_env()?;
-    let (request_tx, request_rx) = mpsc::channel::<SummaryJob>();
-    let (result_tx, result_rx) = mpsc::channel::<SummaryResult>();
+    let (request_tx, request_rx) = mpsc::channel::<AssistJob>();
+    let (result_tx, result_rx) = mpsc::channel::<AssistResult>();
     thread::spawn(move || {
         while let Ok(job) = request_rx.recv() {
-            let summary = registry.summarize_blocking(&job.preferences, &job.evidence);
-            let _ = result_tx.send(SummaryResult {
-                session_id: job.session_id,
-                signature: job.signature,
-                substantive_signature: job.substantive_signature,
-                summary,
-            });
-        }
-    });
-    Some(SummaryWorker {
-        requests: request_tx,
-        responses: result_rx,
-    })
-}
-
-fn spawn_naming_worker() -> Option<NamingWorker> {
-    let registry = SynthesisBackendRegistry::from_env()?;
-    let (request_tx, request_rx) = mpsc::channel::<NamingJob>();
-    let (result_tx, result_rx) = mpsc::channel::<NamingResult>();
-    thread::spawn(move || {
-        while let Ok(job) = request_rx.recv() {
-            let suggestion = registry.suggest_name_blocking(&job.preferences, &job.evidence);
-            let _ = result_tx.send(NamingResult {
-                session_id: job.session_id,
-                signature: job.signature,
+            let suggestion =
+                registry.suggest_terminal_assist_blocking(&job.preferences, &job.evidence);
+            let _ = result_tx.send(AssistResult {
+                request_id: job.request_id,
+                origin_session_id: job.origin_session_id,
                 suggestion,
             });
         }
     });
-    Some(NamingWorker {
-        requests: request_tx,
-        responses: result_rx,
-    })
-}
-
-fn spawn_nudge_worker() -> Option<NudgeWorker> {
-    let registry = SynthesisBackendRegistry::from_env()?;
-    let (request_tx, request_rx) = mpsc::channel::<NudgeJob>();
-    let (result_tx, result_rx) = mpsc::channel::<NudgeResult>();
-    thread::spawn(move || {
-        while let Ok(job) = request_rx.recv() {
-            let suggestion = registry.suggest_nudge_blocking(&job.preferences, &job.evidence);
-            let _ = result_tx.send(NudgeResult {
-                session_id: job.session_id,
-                signature: job.signature,
-                suggestion,
-            });
-        }
-    });
-    Some(NudgeWorker {
+    Some(AssistWorker {
         requests: request_tx,
         responses: result_rx,
     })
@@ -1526,6 +2043,7 @@ fn spawn_raw_stream_reader(
     thread::spawn(move || {
         let mut reader = stream;
         let mut buf = [0u8; 8192];
+        let mut response_filter = TerminalResponseInputFilter::default();
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => {
@@ -1533,13 +2051,24 @@ fn spawn_raw_stream_reader(
                     break;
                 }
                 Ok(n) => {
-                    let Ok(mut writer) = input_writer.lock() else {
-                        break;
+                    let bytes = {
+                        let Ok(mut writer) = input_writer.lock() else {
+                            break;
+                        };
+                        let filter_responses = terminal_echoes_canonical_input(&writer);
+                        let bytes = response_filter.filter(&buf[..n], filter_responses);
+                        if bytes.is_empty() {
+                            continue;
+                        }
+                        if writer.write_all(&bytes).is_err() {
+                            break;
+                        }
+                        bytes
                     };
-                    if writer.write_all(&buf[..n]).is_err() {
-                        break;
-                    }
-                    let _ = control_tx.send(ClientControl::TerminalInput(session_id));
+                    let _ = control_tx.send(ClientControl::TerminalInputBytes {
+                        source_session: session_id,
+                        bytes,
+                    });
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(_) => {
@@ -1549,6 +2078,133 @@ fn spawn_raw_stream_reader(
             }
         }
     });
+}
+
+fn terminal_echoes_canonical_input(pty_master: &File) -> bool {
+    let mut termios = unsafe { std::mem::zeroed::<libc::termios>() };
+    if unsafe { libc::tcgetattr(pty_master.as_raw_fd(), &mut termios) } != 0 {
+        return false;
+    }
+    let interactive_echo = libc::ECHO | libc::ICANON;
+    termios.c_lflag & interactive_echo == interactive_echo
+}
+
+#[derive(Default)]
+struct TerminalResponseInputFilter {
+    state: TerminalResponseInputState,
+}
+
+#[derive(Default)]
+enum TerminalResponseInputState {
+    #[default]
+    Ground,
+    Escape,
+    Csi(Vec<u8>),
+    Osc,
+    OscEscape,
+    Dcs,
+    DcsEscape,
+}
+
+impl TerminalResponseInputFilter {
+    fn filter(&mut self, bytes: &[u8], filter_responses: bool) -> Vec<u8> {
+        if !filter_responses && matches!(self.state, TerminalResponseInputState::Ground) {
+            return bytes.to_vec();
+        }
+
+        let mut output = Vec::with_capacity(bytes.len());
+        for &byte in bytes {
+            if filter_responses || !matches!(self.state, TerminalResponseInputState::Ground) {
+                self.filter_byte(byte, &mut output);
+            } else {
+                output.push(byte);
+            }
+        }
+        output
+    }
+
+    fn filter_byte(&mut self, byte: u8, output: &mut Vec<u8>) {
+        match &mut self.state {
+            TerminalResponseInputState::Ground => {
+                if byte == 0x1b {
+                    self.state = TerminalResponseInputState::Escape;
+                } else {
+                    output.push(byte);
+                }
+            }
+            TerminalResponseInputState::Escape => match byte {
+                b']' => self.state = TerminalResponseInputState::Osc,
+                b'P' => self.state = TerminalResponseInputState::Dcs,
+                b'[' => self.state = TerminalResponseInputState::Csi(Vec::new()),
+                _ => {
+                    output.push(0x1b);
+                    output.push(byte);
+                    self.state = TerminalResponseInputState::Ground;
+                }
+            },
+            TerminalResponseInputState::Csi(sequence) => {
+                sequence.push(byte);
+                if is_csi_final_byte(byte) {
+                    if !is_terminal_response_csi(sequence) {
+                        output.push(0x1b);
+                        output.push(b'[');
+                        output.extend_from_slice(sequence);
+                    }
+                    self.state = TerminalResponseInputState::Ground;
+                } else if sequence.len() > 128 {
+                    output.push(0x1b);
+                    output.push(b'[');
+                    output.extend_from_slice(sequence);
+                    self.state = TerminalResponseInputState::Ground;
+                }
+            }
+            TerminalResponseInputState::Osc => match byte {
+                0x07 => self.state = TerminalResponseInputState::Ground,
+                0x1b => self.state = TerminalResponseInputState::OscEscape,
+                _ => {}
+            },
+            TerminalResponseInputState::OscEscape => {
+                if byte == b'\\' {
+                    self.state = TerminalResponseInputState::Ground;
+                } else if byte != 0x1b {
+                    self.state = TerminalResponseInputState::Osc;
+                }
+            }
+            TerminalResponseInputState::Dcs => {
+                if byte == 0x1b {
+                    self.state = TerminalResponseInputState::DcsEscape;
+                }
+            }
+            TerminalResponseInputState::DcsEscape => {
+                if byte == b'\\' {
+                    self.state = TerminalResponseInputState::Ground;
+                } else if byte != 0x1b {
+                    self.state = TerminalResponseInputState::Dcs;
+                }
+            }
+        }
+    }
+}
+
+fn is_csi_final_byte(byte: u8) -> bool {
+    (0x40..=0x7e).contains(&byte)
+}
+
+fn is_terminal_response_csi(sequence: &[u8]) -> bool {
+    let Some((&final_byte, body)) = sequence.split_last() else {
+        return false;
+    };
+    match final_byte {
+        b'R' => body
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || *byte == b';'),
+        b'c' => matches!(body.first(), Some(b'?' | b'>')),
+        b'y' => body.contains(&b'$'),
+        b'n' => body
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || *byte == b';'),
+        _ => false,
+    }
 }
 
 fn write_json_line<W: Write, T: Serialize>(writer: &mut W, value: &T) -> std::io::Result<()> {
@@ -1605,7 +2261,7 @@ fn spawn_local_daemon_process(current_exe: &std::path::Path) -> Result<(), Strin
     command
         .spawn()
         .map(|_| ())
-        .map_err(|error| format!("failed to spawn local beachhead daemon: {error}"))
+        .map_err(|error| format!("failed to start local host sessions: {error}"))
 }
 
 fn exatermd_sibling_path(current_exe: &std::path::Path) -> Option<PathBuf> {
@@ -1623,11 +2279,7 @@ fn inherit_beachhead_env(command: &mut Command) {
         "OPENAI_API_KEY",
         "EXATERM_OPENAI_BASE_URL",
         "OPENAI_BASE_URL",
-        "EXATERM_SUMMARY_MODEL",
-        "EXATERM_NAMING_MODEL",
-        "EXATERM_NUDGE_MODEL",
-        "EXATERM_CODEX_CLI_MODEL",
-        "EXATERM_CLAUDE_CLI_MODEL",
+        "EXATERM_TERMINAL_ASSIST_MODEL",
         "EXATERM_WORKSPACE",
     ] {
         if let Some(value) = env::var_os(key) {
@@ -1647,10 +2299,18 @@ fn clear_stale_control_socket(control_socket_path: &PathBuf) -> Result<(), Strin
     }
 
     match UnixStream::connect(control_socket_path) {
-        Ok(_) => Err("beachhead daemon already running".into()),
+        Ok(_) => Err("host session service already running".into()),
         Err(_) => fs::remove_file(control_socket_path)
             .map_err(|error| format!("failed to remove stale daemon control socket: {error}")),
     }
+}
+
+fn clear_stale_mcp_socket(mcp_socket_path: &PathBuf) -> Result<(), String> {
+    if !mcp_socket_path.exists() {
+        return Ok(());
+    }
+    fs::remove_file(mcp_socket_path)
+        .map_err(|error| format!("failed to remove stale daemon MCP socket: {error}"))
 }
 
 pub fn connect_session_stream_socket(socket_name: &str) -> Result<UnixStream, String> {
@@ -1731,6 +2391,10 @@ pub fn control_socket_path() -> Result<PathBuf, String> {
     Ok(daemon_socket_dir().join(CONTROL_SOCKET_NAME))
 }
 
+pub fn mcp_socket_path() -> Result<PathBuf, String> {
+    Ok(daemon_socket_dir().join(MCP_SOCKET_NAME))
+}
+
 pub fn session_raw_socket_path(socket_name: &str) -> Result<PathBuf, String> {
     Ok(daemon_socket_dir().join(socket_name))
 }
@@ -1809,52 +2473,258 @@ mod tests {
     }
 
     #[test]
-    fn nudge_only_applies_if_session_is_still_idle() {
-        let mut state = DaemonState::new();
-        let session_id = SessionId(7);
+    fn terminal_display_env_only_advertises_confirmed_sixel() {
+        let mut launch = user_shell_launch("Shell", "Generic command session");
+        apply_terminal_display_env(
+            &mut launch,
+            &TerminalDisplayCapabilities {
+                kitty_graphics: false,
+                sixel: false,
+                vte_version: Some("8400".into()),
+            },
+        );
+        assert!(launch.env.iter().all(|(key, _)| key != "VTE_VERSION"));
 
-        let mut stale = SessionObservation::new();
-        stale.last_change = Instant::now() - Duration::from_secs(MIN_IDLE_SECS_FOR_NUDGE + 5);
-        state.observations.insert(session_id, stale);
-        assert!(session_still_accepts_nudge(&state, session_id));
-
-        let mut fresh = SessionObservation::new();
-        fresh.last_change = Instant::now() - Duration::from_secs(MIN_IDLE_SECS_FOR_NUDGE - 1);
-        state.observations.insert(session_id, fresh);
-        assert!(!session_still_accepts_nudge(&state, session_id));
+        apply_terminal_display_env(
+            &mut launch,
+            &TerminalDisplayCapabilities {
+                kitty_graphics: false,
+                sixel: true,
+                vte_version: Some("8400".into()),
+            },
+        );
+        assert!(launch
+            .env
+            .iter()
+            .any(|(key, value)| key == "VTE_VERSION" && value == "8400"));
+        assert!(launch
+            .env
+            .iter()
+            .any(|(key, value)| { key == "EXATERM_TERMINAL_IMAGE_PROTOCOLS" && value == "sixel" }));
     }
 
     #[test]
-    fn terminal_input_activity_blocks_a_pending_nudge() {
-        let mut state = DaemonState::new();
-        let session_id = SessionId(7);
+    fn terminal_display_env_advertises_kitty_bridge() {
+        let mut launch = user_shell_launch("Shell", "Generic command session");
+        apply_terminal_display_env(
+            &mut launch,
+            &TerminalDisplayCapabilities {
+                kitty_graphics: true,
+                sixel: false,
+                vte_version: None,
+            },
+        );
 
-        let mut stale = SessionObservation::new();
-        stale.last_change = Instant::now() - Duration::from_secs(MIN_IDLE_SECS_FOR_NUDGE + 5);
-        state.observations.insert(session_id, stale);
-        assert!(session_still_accepts_nudge(&state, session_id));
-
-        note_terminal_input_activity(&mut state, session_id);
-
-        assert!(!session_still_accepts_nudge(&state, session_id));
+        assert!(launch
+            .env
+            .iter()
+            .any(|(key, value)| key == "KITTY_WINDOW_ID" && value == "1"));
+        assert!(launch
+            .env
+            .iter()
+            .any(|(key, value)| { key == "EXATERM_TERMINAL_IMAGE_PROTOCOLS" && value == "kitty" }));
     }
 
     #[test]
-    fn terminal_input_activity_reenables_suppressed_supervision() {
-        let mut state = DaemonState::new();
-        let session_id = SessionId(7);
-        state
-            .summary_cache
-            .insert(session_id, SummaryCacheEntry::new());
-        state
-            .summary_cache
-            .get_mut(&session_id)
-            .expect("summary cache entry")
-            .suppressed_until_input = true;
+    fn terminal_response_filter_drops_osc_and_dcs_replies() {
+        let mut filter = TerminalResponseInputFilter::default();
+        let bytes = b"a\x1b]10;rgb:ffff/ffff/ffff\x07b\x1bP1+r6b75=1B4F41\x1b\\c";
 
-        assert!(supervision_suppressed(&state, session_id));
-        note_terminal_input_activity(&mut state, session_id);
-        assert!(!supervision_suppressed(&state, session_id));
+        assert_eq!(filter.filter(bytes, true), b"abc");
+    }
+
+    #[test]
+    fn terminal_response_filter_handles_split_sequences() {
+        let mut filter = TerminalResponseInputFilter::default();
+
+        assert_eq!(filter.filter(b"a\x1b]10;rgb", true), b"a");
+        assert_eq!(filter.filter(b":ffff/ffff/ffff\x07b", true), b"b");
+        assert_eq!(filter.filter(b"\x1bP1+r6b75=1B4F41", true), b"");
+        assert_eq!(filter.filter(b"\x1b\\c", true), b"c");
+    }
+
+    #[test]
+    fn terminal_response_filter_drops_response_csi_but_preserves_keys() {
+        let mut filter = TerminalResponseInputFilter::default();
+
+        assert_eq!(filter.filter(b"\x1b[?12;4$y", true), b"");
+        assert_eq!(filter.filter(b"\x1b[24;80R", true), b"");
+        assert_eq!(
+            filter.filter(b"\x1b[A\x1bOB\x1b[6~", true),
+            b"\x1b[A\x1bOB\x1b[6~"
+        );
+    }
+
+    #[test]
+    fn terminal_response_filter_forwards_everything_when_not_filtering() {
+        let mut filter = TerminalResponseInputFilter::default();
+        let bytes = b"\x1b]10;rgb:ffff/ffff/ffff\x07\x1bP1+r6b75=1B4F41\x1b\\";
+
+        assert_eq!(filter.filter(bytes, false), bytes);
+    }
+
+    #[test]
+    fn input_sync_root_targets_visible_non_supervisor_sessions() {
+        let mut state = DaemonState::new();
+        let worker = state
+            .workspace
+            .add_session(user_shell_launch("Worker", "root worker"));
+        let supervisor = state
+            .workspace
+            .add_session(user_shell_launch("Supervisor", "hidden supervisor"));
+        let grouped_worker = state
+            .workspace
+            .add_session(user_shell_launch("Grouped", "grouped worker"));
+        let group_id = GroupId(1);
+        state.workspace_items = vec![
+            WorkspaceItem::Session(worker),
+            WorkspaceItem::Session(supervisor),
+            WorkspaceItem::Group(group_id),
+        ];
+        state.groups.insert(
+            group_id,
+            SupervisedGroupState {
+                id: group_id,
+                name: "Group".into(),
+                member_session_ids: vec![grouped_worker],
+                supervisor_session_id: Some(supervisor),
+                provider: None,
+                goal: None,
+                summary_markdown: String::new(),
+                supervisor_visible: true,
+                summary_updated_at: None,
+                actions: Vec::new(),
+            },
+        );
+        state.input_sync_scope = InputSyncScope::RootVisible;
+
+        let targets = input_sync_targets(&state);
+
+        assert_eq!(targets, BTreeSet::from([worker]));
+    }
+
+    #[test]
+    fn input_sync_group_targets_group_members_only() {
+        let mut state = DaemonState::new();
+        let root = state
+            .workspace
+            .add_session(user_shell_launch("Root", "root worker"));
+        let member_a = state
+            .workspace
+            .add_session(user_shell_launch("A", "group member"));
+        let member_b = state
+            .workspace
+            .add_session(user_shell_launch("B", "group member"));
+        let supervisor = state
+            .workspace
+            .add_session(user_shell_launch("Supervisor", "group supervisor"));
+        let group_id = GroupId(7);
+        state.workspace_items = vec![WorkspaceItem::Session(root), WorkspaceItem::Group(group_id)];
+        state.groups.insert(
+            group_id,
+            SupervisedGroupState {
+                id: group_id,
+                name: "Group".into(),
+                member_session_ids: vec![member_a, member_b],
+                supervisor_session_id: Some(supervisor),
+                provider: None,
+                goal: None,
+                summary_markdown: String::new(),
+                supervisor_visible: true,
+                summary_updated_at: None,
+                actions: Vec::new(),
+            },
+        );
+        state.input_sync_scope = InputSyncScope::GroupMembers { group_id };
+
+        let targets = input_sync_targets(&state);
+
+        assert_eq!(targets, BTreeSet::from([member_a, member_b]));
+    }
+
+    #[test]
+    fn terminal_assist_insert_targets_origin_when_sync_disabled() {
+        let mut state = DaemonState::new();
+        let session = state
+            .workspace
+            .add_session(user_shell_launch("Shell", "single shell"));
+        state.input_sync_enabled = false;
+        state.input_sync_scope = InputSyncScope::RootVisible;
+
+        let targets = terminal_assist_insert_targets(&state, session);
+
+        assert_eq!(targets, BTreeSet::from([session]));
+    }
+
+    #[test]
+    fn terminal_assist_insert_targets_group_when_sync_enabled() {
+        let mut state = DaemonState::new();
+        let root = state
+            .workspace
+            .add_session(user_shell_launch("Root", "root worker"));
+        let member_a = state
+            .workspace
+            .add_session(user_shell_launch("A", "group member"));
+        let member_b = state
+            .workspace
+            .add_session(user_shell_launch("B", "group member"));
+        let group_id = GroupId(11);
+        state.workspace_items = vec![WorkspaceItem::Session(root), WorkspaceItem::Group(group_id)];
+        state.groups.insert(
+            group_id,
+            SupervisedGroupState {
+                id: group_id,
+                name: "Group".into(),
+                member_session_ids: vec![member_a, member_b],
+                supervisor_session_id: None,
+                provider: None,
+                goal: None,
+                summary_markdown: String::new(),
+                supervisor_visible: false,
+                summary_updated_at: None,
+                actions: Vec::new(),
+            },
+        );
+        state.input_sync_enabled = true;
+        state.input_sync_scope = InputSyncScope::GroupMembers { group_id };
+
+        let targets = terminal_assist_insert_targets(&state, member_a);
+
+        assert_eq!(targets, BTreeSet::from([member_a, member_b]));
+    }
+
+    #[test]
+    fn terminal_assist_insert_targets_origin_when_origin_outside_sync_scope() {
+        let mut state = DaemonState::new();
+        let root = state
+            .workspace
+            .add_session(user_shell_launch("Root", "root worker"));
+        let member = state
+            .workspace
+            .add_session(user_shell_launch("A", "group member"));
+        let group_id = GroupId(12);
+        state.workspace_items = vec![WorkspaceItem::Session(root), WorkspaceItem::Group(group_id)];
+        state.groups.insert(
+            group_id,
+            SupervisedGroupState {
+                id: group_id,
+                name: "Group".into(),
+                member_session_ids: vec![member],
+                supervisor_session_id: None,
+                provider: None,
+                goal: None,
+                summary_markdown: String::new(),
+                supervisor_visible: false,
+                summary_updated_at: None,
+                actions: Vec::new(),
+            },
+        );
+        state.input_sync_enabled = true;
+        state.input_sync_scope = InputSyncScope::GroupMembers { group_id };
+
+        let targets = terminal_assist_insert_targets(&state, root);
+
+        assert_eq!(targets, BTreeSet::from([root]));
     }
 
     fn env_lock() -> &'static Mutex<()> {
@@ -2104,133 +2974,5 @@ mod tests {
 
         state.shutdown_workspace();
         let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn drain_worker_results_persists_provider_demotions_per_session() {
-        let mut state = DaemonState::new();
-
-        let (summary_request_tx, _summary_request_rx) = mpsc::channel();
-        let (summary_result_tx, summary_result_rx) = mpsc::channel();
-        state.summary_worker = Some(SummaryWorker {
-            requests: summary_request_tx,
-            responses: summary_result_rx,
-        });
-        summary_result_tx
-            .send(SummaryResult {
-                session_id: SessionId(1),
-                signature: "summary".into(),
-                substantive_signature: "summary-substantive".into(),
-                summary: ProviderCallResult {
-                    provider: Some(crate::synthesis::SynthesisProvider::ClaudeCli),
-                    value: Err("openai failed".into()),
-                    demoted_provider: Some(crate::synthesis::SynthesisProvider::OpenAi),
-                },
-            })
-            .expect("send summary result");
-
-        let (naming_request_tx, _naming_request_rx) = mpsc::channel();
-        let (naming_result_tx, naming_result_rx) = mpsc::channel();
-        state.naming_worker = Some(NamingWorker {
-            requests: naming_request_tx,
-            responses: naming_result_rx,
-        });
-        naming_result_tx
-            .send(NamingResult {
-                session_id: SessionId(2),
-                signature: "naming".into(),
-                suggestion: ProviderCallResult {
-                    provider: Some(crate::synthesis::SynthesisProvider::ClaudeCli),
-                    value: Err("claude failed".into()),
-                    demoted_provider: Some(crate::synthesis::SynthesisProvider::ClaudeCli),
-                },
-            })
-            .expect("send naming result");
-
-        let (nudge_request_tx, _nudge_request_rx) = mpsc::channel();
-        let (nudge_result_tx, nudge_result_rx) = mpsc::channel();
-        state.nudge_worker = Some(NudgeWorker {
-            requests: nudge_request_tx,
-            responses: nudge_result_rx,
-        });
-        nudge_result_tx
-            .send(NudgeResult {
-                session_id: SessionId(3),
-                signature: "nudge".into(),
-                suggestion: ProviderCallResult {
-                    provider: Some(crate::synthesis::SynthesisProvider::ClaudeCli),
-                    value: Err("codex failed".into()),
-                    demoted_provider: Some(crate::synthesis::SynthesisProvider::CodexCli),
-                },
-            })
-            .expect("send nudge result");
-
-        let changed = drain_worker_results(&mut state);
-        assert!(!changed);
-        assert!(
-            state
-                .summary_cache
-                .get(&SessionId(1))
-                .unwrap()
-                .skipped_providers
-                .contains_key(&crate::synthesis::SynthesisProvider::OpenAi)
-        );
-        assert!(
-            state
-                .naming_cache
-                .get(&SessionId(2))
-                .unwrap()
-                .skipped_providers
-                .contains_key(&crate::synthesis::SynthesisProvider::ClaudeCli)
-        );
-        assert!(
-            state
-                .nudge_cache
-                .get(&SessionId(3))
-                .unwrap()
-                .skipped_providers
-                .contains_key(&crate::synthesis::SynthesisProvider::CodexCli)
-        );
-    }
-
-    #[test]
-    fn maybe_queue_summary_retries_expired_provider_demotions() {
-        let mut state = DaemonState::new();
-
-        let (request_tx, request_rx) = mpsc::channel();
-        let (response_tx, response_rx) = mpsc::channel();
-        state.summary_worker = Some(SummaryWorker {
-            requests: request_tx,
-            responses: response_rx,
-        });
-
-        let session_id = SessionId(7);
-        let mut entry = SummaryCacheEntry::new();
-        entry.skipped_providers.insert(
-            crate::synthesis::SynthesisProvider::OpenAi,
-            Instant::now() - PROVIDER_DEMOTION_COOLDOWN - Duration::from_secs(1),
-        );
-        state.summary_cache.insert(session_id, entry);
-
-        let evidence = crate::synthesis::TacticalEvidence {
-            session_name: "Shell".into(),
-            task_label: "Retry".into(),
-            dominant_process: None,
-            process_tree_excerpt: None,
-            recent_files: vec![],
-            terminal_status_line: None,
-            terminal_status_line_age: None,
-            recent_terminal_activity: vec![],
-            recent_events: vec![],
-        };
-
-        maybe_queue_summary(&mut state, session_id, &evidence);
-
-        let job = request_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("summary job should be queued after cooldown");
-        assert!(job.preferences.skipped_providers.is_empty());
-
-        drop(response_tx);
     }
 }

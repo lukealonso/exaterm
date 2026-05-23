@@ -1,15 +1,4 @@
 const ESTIMATED_TERMINAL_CELL_WIDTH: i32 = 8;
-const ESTIMATED_TERMINAL_CELL_HEIGHT: i32 = 18;
-const MIN_EMBEDDED_TERMINAL_COLS: i32 = 80;
-const MIN_EMBEDDED_TERMINAL_ROWS: i32 = 24;
-const EMBEDDED_TERMINAL_CARD_CHROME_WIDTH: i32 = 72;
-const EMBEDDED_TERMINAL_CARD_CHROME_HEIGHT: i32 = 168;
-const EMBEDDED_TERMINAL_MIN_WIDTH: i32 = (ESTIMATED_TERMINAL_CELL_WIDTH
-    * MIN_EMBEDDED_TERMINAL_COLS)
-    + EMBEDDED_TERMINAL_CARD_CHROME_WIDTH;
-const EMBEDDED_TERMINAL_MIN_HEIGHT: i32 = (ESTIMATED_TERMINAL_CELL_HEIGHT
-    * MIN_EMBEDDED_TERMINAL_ROWS)
-    + EMBEDDED_TERMINAL_CARD_CHROME_HEIGHT;
 
 // ---------------------------------------------------------------------------
 // Grid tiling — placement of cards into a column-homogeneous grid with
@@ -39,13 +28,13 @@ fn is_tileable(columns: usize, n: usize) -> bool {
 
 /// Column count heuristic based on session count and available pixel width.
 /// This is the "natural" preference before tileability adjustment.
-fn natural_columns(total: usize, available_width: i32, focused: bool) -> usize {
+fn natural_columns(total: usize, available_width: i32) -> usize {
     if total == 0 {
         return 0;
     }
 
     if available_width <= 0 {
-        return if focused || total <= 2 {
+        return if total <= 2 {
             total
         } else if total <= 4 {
             2
@@ -58,12 +47,10 @@ fn natural_columns(total: usize, available_width: i32, focused: bool) -> usize {
         };
     }
 
-    if focused {
-        total
-    } else if total == 1 {
+    if total == 1 {
         1
     } else if total == 2 {
-        if (available_width / 2) >= EMBEDDED_TERMINAL_MIN_WIDTH {
+        if (available_width / 2) >= ESTIMATED_TERMINAL_CELL_WIDTH * 80 {
             2
         } else {
             1
@@ -141,11 +128,7 @@ fn build_placements(columns: usize, session_count: usize) -> Vec<CardPlacement> 
     placements
 }
 
-pub fn compute_tiling(
-    session_count: usize,
-    available_width: i32,
-    focused: bool,
-) -> GridTiling {
+pub fn compute_tiling(session_count: usize, available_width: i32) -> GridTiling {
     if session_count == 0 {
         return GridTiling {
             columns: 0,
@@ -153,22 +136,7 @@ pub fn compute_tiling(
         };
     }
 
-    if focused {
-        let columns = session_count;
-        let placements = (0..session_count)
-            .map(|i| CardPlacement {
-                col: i,
-                row: 0,
-                col_span: 1,
-            })
-            .collect();
-        return GridTiling {
-            columns,
-            placements,
-        };
-    }
-
-    let natural = natural_columns(session_count, available_width, false);
+    let natural = natural_columns(session_count, available_width);
     let columns = nearest_tileable_columns(natural.max(1), session_count);
     let placements = build_placements(columns, session_count);
     GridTiling {
@@ -177,46 +145,8 @@ pub fn compute_tiling(
     }
 }
 
-pub fn battlefield_columns(total: usize, available_width: i32, focused: bool) -> u32 {
-    compute_tiling(total, available_width, focused).columns as u32
-}
-
-pub fn battlefield_can_embed_terminals(
-    total: usize,
-    columns: usize,
-    available_width: i32,
-    available_height: i32,
-) -> bool {
-    if total == 0 || columns == 0 {
-        return false;
-    }
-
-    let tile_width =
-        (available_width.max(0) - ((columns.saturating_sub(1)) as i32 * 12) - 24) / columns as i32;
-    let rows = ((total as f32) / (columns as f32)).ceil() as i32;
-    let tile_height = if rows > 0 {
-        (available_height.max(0) - ((rows - 1) * 12) - 24) / rows
-    } else {
-        0
-    };
-
-    tile_width >= EMBEDDED_TERMINAL_MIN_WIDTH && tile_height >= EMBEDDED_TERMINAL_MIN_HEIGHT
-}
-
-pub fn visible_scrollback_line_capacity(height: i32) -> usize {
-    const SCROLLBACK_VERTICAL_PADDING: i32 = 16;
-    const SCROLLBACK_LINE_HEIGHT: i32 = 14;
-    const SCROLLBACK_LINE_SPACING: i32 = 4;
-    const MIN_SCROLLBACK_LINES: usize = 1;
-
-    if height <= 0 {
-        return 3;
-    }
-
-    let usable_height = (height - SCROLLBACK_VERTICAL_PADDING).max(SCROLLBACK_LINE_HEIGHT);
-    let line_block = SCROLLBACK_LINE_HEIGHT + SCROLLBACK_LINE_SPACING;
-    let lines = ((usable_height + SCROLLBACK_LINE_SPACING) / line_block).max(1);
-    (lines as usize).max(MIN_SCROLLBACK_LINES)
+pub fn battlefield_columns(total: usize, available_width: i32) -> u32 {
+    compute_tiling(total, available_width).columns as u32
 }
 
 // ---------------------------------------------------------------------------
@@ -227,7 +157,6 @@ pub fn visible_scrollback_line_capacity(height: i32) -> usize {
 pub const GAP: f64 = 12.0;
 pub const MARGIN: f64 = 12.0;
 pub const CARD_MIN_HEIGHT: f64 = 220.0;
-pub const FOCUS_RAIL_CARD_MIN_HEIGHT: f64 = 148.0;
 
 /// A positioned card rectangle (origin + size) in the view coordinate space.
 #[derive(Debug, Clone, PartialEq)]
@@ -256,12 +185,9 @@ pub fn card_layout(card_count: usize, view_w: f64, view_h: f64) -> Vec<CardRect>
         return Vec::new();
     }
 
-    let tiling = compute_tiling(card_count, view_w as i32, false);
+    let tiling = compute_tiling(card_count, view_w as i32);
     let cols = tiling.columns.max(1);
-    let rows = tiling
-        .placements
-        .last()
-        .map_or(1, |p| p.row + 1);
+    let rows = tiling.placements.last().map_or(1, |p| p.row + 1);
 
     let cell_w = (view_w - MARGIN * 2.0 - GAP * (cols as f64 - 1.0)) / cols as f64;
     let card_h = if rows > 0 {
@@ -275,8 +201,7 @@ pub fn card_layout(card_count: usize, view_w: f64, view_h: f64) -> Vec<CardRect>
         .placements
         .iter()
         .map(|p| {
-            let card_w =
-                cell_w * p.col_span as f64 + GAP * (p.col_span as f64 - 1.0);
+            let card_w = cell_w * p.col_span as f64 + GAP * (p.col_span as f64 - 1.0);
             let x = MARGIN + p.col as f64 * (cell_w + GAP);
             let y = MARGIN + p.row as f64 * (card_h + GAP);
             CardRect {
@@ -289,27 +214,6 @@ pub fn card_layout(card_count: usize, view_w: f64, view_h: f64) -> Vec<CardRect>
         .collect()
 }
 
-pub fn focus_card_layout(card_count: usize, view_w: f64, view_h: f64) -> Vec<CardRect> {
-    if card_count == 0 {
-        return Vec::new();
-    }
-
-    let card_h = (view_h - MARGIN * 2.0).max(FOCUS_RAIL_CARD_MIN_HEIGHT);
-    let card_w =
-        (view_w - MARGIN * 2.0 - GAP * (card_count.saturating_sub(1)) as f64) / card_count as f64;
-    let mut rects = Vec::with_capacity(card_count);
-    for i in 0..card_count {
-        let x = MARGIN + i as f64 * (card_w + GAP);
-        rects.push(CardRect {
-            x,
-            y: MARGIN,
-            w: card_w.max(0.0),
-            h: card_h,
-        });
-    }
-    rects
-}
-
 pub fn card_terminal_slot_rect(card: &CardRect) -> TerminalSlotRect {
     const PADDING_X: f64 = 16.0;
     const TOP_CHROME: f64 = 104.0;
@@ -319,17 +223,6 @@ pub fn card_terminal_slot_rect(card: &CardRect) -> TerminalSlotRect {
         y: card.y + TOP_CHROME,
         w: (card.w - (PADDING_X * 2.0)).max(0.0),
         h: (card.h - TOP_CHROME - BOTTOM_CHROME).max(0.0),
-    }
-}
-
-pub fn focus_terminal_slot_rect(view_w: i32, view_h: i32) -> TerminalSlotRect {
-    let padding = 18.0;
-    let header = 208.0;
-    TerminalSlotRect {
-        x: padding,
-        y: header,
-        w: (view_w as f64 - padding * 2.0).max(0.0),
-        h: (view_h as f64 - header - padding).max(0.0),
     }
 }
 
@@ -386,8 +279,7 @@ mod tests {
                 assert!(
                     !grid[p.row][c],
                     "overlap at row={} col={} (n={n}, cols={cols})",
-                    p.row,
-                    c
+                    p.row, c
                 );
                 grid[p.row][c] = true;
             }
@@ -403,14 +295,14 @@ mod tests {
     #[test]
     fn tiling_n1_through_n12_fill_without_gaps() {
         for n in 1..=12 {
-            let t = compute_tiling(n, 1600, false);
+            let t = compute_tiling(n, 1600);
             assert_tiling_fills_grid(&t, n);
         }
     }
 
     #[test]
     fn tiling_n3_uses_two_columns_with_wide_bottom() {
-        let t = compute_tiling(3, 1400, false);
+        let t = compute_tiling(3, 1400);
         assert_eq!(t.columns, 2);
         assert_eq!(t.placements[0].col_span, 1);
         assert_eq!(t.placements[1].col_span, 1);
@@ -419,7 +311,7 @@ mod tests {
 
     #[test]
     fn tiling_n5_at_moderate_width() {
-        let t = compute_tiling(5, 1400, false);
+        let t = compute_tiling(5, 1400);
         assert!(is_tileable(t.columns, 5));
         assert_tiling_fills_grid(&t, 5);
     }
@@ -427,22 +319,15 @@ mod tests {
     #[test]
     fn tiling_n7_avoids_three_columns() {
         // c=3 is not tileable for 7. Should pick c=2 or c=4.
-        let t = compute_tiling(7, 1400, false);
+        let t = compute_tiling(7, 1400);
         assert_ne!(t.columns, 3);
         assert_tiling_fills_grid(&t, 7);
     }
 
     #[test]
-    fn tiling_focused_is_single_row() {
-        let t = compute_tiling(5, 1400, true);
-        assert_eq!(t.columns, 5);
-        assert!(t.placements.iter().all(|p| p.row == 0 && p.col_span == 1));
-    }
-
-    #[test]
     fn tiling_perfect_grids_have_no_spanning() {
         for &(n, expected_cols) in &[(4, 2), (6, 3), (9, 3)] {
-            let t = compute_tiling(n, 1600, false);
+            let t = compute_tiling(n, 1600);
             assert_eq!(t.columns, expected_cols, "n={n}");
             assert!(
                 t.placements.iter().all(|p| p.col_span == 1),
@@ -451,38 +336,17 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // battlefield_columns backward compatibility.
-    // -----------------------------------------------------------------------
-
     #[test]
     fn column_policy_keeps_two_terminal_layout_side_by_side() {
-        assert_eq!(battlefield_columns(2, 1480, false), 2);
-        assert_eq!(battlefield_columns(2, 1000, false), 1);
+        assert_eq!(battlefield_columns(2, 1480), 2);
+        assert_eq!(battlefield_columns(2, 1000), 1);
     }
 
     #[test]
     fn nine_terminal_layout_stays_three_by_three() {
-        assert_eq!(battlefield_columns(9, 2200, false), 3);
-        assert_eq!(battlefield_columns(9, 1400, false), 3);
-        assert_eq!(battlefield_columns(9, -1, false), 3);
-    }
-
-    // -----------------------------------------------------------------------
-    // Embedding.
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn four_terminal_interstitial_layout_collapses_to_scrollback() {
-        assert!(!battlefield_can_embed_terminals(4, 2, 1500, 1100));
-        assert!(!battlefield_can_embed_terminals(4, 2, 1600, 1150));
-    }
-
-    #[test]
-    fn embedded_terminals_require_genuinely_roomy_battlefield() {
-        assert!(battlefield_can_embed_terminals(1, 1, 1200, 900));
-        assert!(battlefield_can_embed_terminals(2, 2, 1480, 900));
-        assert!(battlefield_can_embed_terminals(4, 2, 1700, 1300));
+        assert_eq!(battlefield_columns(9, 2200), 3);
+        assert_eq!(battlefield_columns(9, 1400), 3);
+        assert_eq!(battlefield_columns(9, -1), 3);
     }
 
     // -----------------------------------------------------------------------
@@ -576,16 +440,5 @@ mod tests {
         assert!(slot.y >= card.y);
         assert!(slot.x + slot.w <= card.x + card.w + 0.01);
         assert!(slot.y + slot.h <= card.y + card.h + 0.01);
-    }
-
-    #[test]
-    fn focus_card_layout_keeps_cards_in_single_top_row() {
-        let rects = focus_card_layout(4, 1200.0, 240.0);
-        assert_eq!(rects.len(), 4);
-        assert!(rects.iter().all(|rect| (rect.y - MARGIN).abs() < 0.01));
-        assert!(rects[1].x > rects[0].x);
-        let expected_w = (1200.0 - MARGIN * 2.0 - GAP * 3.0) / 4.0;
-        assert!((rects[0].w - expected_w).abs() < 0.01);
-        assert!((rects[3].x + rects[3].w - (1200.0 - MARGIN)).abs() < 0.01);
     }
 }

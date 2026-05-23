@@ -45,7 +45,11 @@ fn sanitize_snapshot(snapshot: &WorkspaceSnapshot) -> WorkspaceSnapshot {
             s
         })
         .collect();
-    WorkspaceSnapshot { sessions }
+    WorkspaceSnapshot {
+        items: snapshot.items.clone(),
+        sessions,
+        groups: snapshot.groups.clone(),
+    }
 }
 
 // --- Control WebSocket: JSON snapshot/command relay ---
@@ -59,13 +63,11 @@ pub async fn ws_control(
         return StatusCode::FORBIDDEN.into_response();
     }
     let relay = state.relay.clone();
-    ws.on_upgrade(move |socket| handle_control(socket, relay)).into_response()
+    ws.on_upgrade(move |socket| handle_control(socket, relay))
+        .into_response()
 }
 
-async fn handle_control(
-    mut socket: WebSocket,
-    relay: Arc<crate::relay::DaemonRelay>,
-) {
+async fn handle_control(mut socket: WebSocket, relay: Arc<crate::relay::DaemonRelay>) {
     // Send the current snapshot from the same receiver we'll subscribe to,
     // so no update can be lost between the initial send and the change loop.
     let mut snapshots = relay.snapshots.clone();
@@ -119,7 +121,8 @@ pub async fn ws_stream(
         return StatusCode::FORBIDDEN.into_response();
     }
     let relay = state.relay.clone();
-    ws.on_upgrade(move |socket| handle_stream(socket, relay, session_id)).into_response()
+    ws.on_upgrade(move |socket| handle_stream(socket, relay, session_id))
+        .into_response()
 }
 
 async fn handle_stream(
@@ -232,20 +235,28 @@ mod tests {
     #[test]
     fn localhost_http_is_allowed() {
         assert!(origin_allowed(&headers_with_origin("http://localhost")));
-        assert!(origin_allowed(&headers_with_origin("http://localhost:9800")));
+        assert!(origin_allowed(&headers_with_origin(
+            "http://localhost:9800"
+        )));
     }
 
     #[test]
     fn localhost_https_is_allowed() {
         assert!(origin_allowed(&headers_with_origin("https://localhost")));
-        assert!(origin_allowed(&headers_with_origin("https://localhost:9800")));
+        assert!(origin_allowed(&headers_with_origin(
+            "https://localhost:9800"
+        )));
     }
 
     #[test]
     fn loopback_ipv4_is_allowed() {
         assert!(origin_allowed(&headers_with_origin("http://127.0.0.1")));
-        assert!(origin_allowed(&headers_with_origin("http://127.0.0.1:9800")));
-        assert!(origin_allowed(&headers_with_origin("https://127.0.0.1:9800")));
+        assert!(origin_allowed(&headers_with_origin(
+            "http://127.0.0.1:9800"
+        )));
+        assert!(origin_allowed(&headers_with_origin(
+            "https://127.0.0.1:9800"
+        )));
     }
 
     #[test]
@@ -257,12 +268,16 @@ mod tests {
 
     #[test]
     fn localhost_subdomain_is_rejected() {
-        assert!(!origin_allowed(&headers_with_origin("http://localhost.evil.com")));
+        assert!(!origin_allowed(&headers_with_origin(
+            "http://localhost.evil.com"
+        )));
     }
 
     #[test]
     fn loopback_subdomain_is_rejected() {
-        assert!(!origin_allowed(&headers_with_origin("http://127.0.0.1.evil.com")));
+        assert!(!origin_allowed(&headers_with_origin(
+            "http://127.0.0.1.evil.com"
+        )));
     }
 
     #[test]
@@ -278,8 +293,10 @@ mod tests {
 
     #[test]
     fn sanitize_snapshot_replaces_socket_paths() {
-        use exaterm_types::model::{SessionId, SessionRecord, SessionLaunch, SessionKind, SessionStatus};
-        use exaterm_types::proto::{SessionSnapshot, ObservationSnapshot};
+        use exaterm_types::model::{
+            SessionId, SessionKind, SessionLaunch, SessionRecord, SessionStatus,
+        };
+        use exaterm_types::proto::{ObservationSnapshot, SessionSnapshot};
 
         let snapshot = WorkspaceSnapshot {
             sessions: vec![SessionSnapshot {
@@ -291,6 +308,7 @@ mod tests {
                         program: "/bin/sh".into(),
                         args: vec![],
                         cwd: None,
+                        env: vec![],
                         kind: SessionKind::WaitingShell,
                     },
                     display_name: None,
@@ -299,12 +317,10 @@ mod tests {
                     events: vec![],
                 },
                 observation: ObservationSnapshot::default(),
-                summary: None,
                 raw_stream_socket_name: Some("/tmp/exaterm-abc/session-1.sock".into()),
-                auto_nudge_enabled: false,
-                last_nudge: None,
-                last_sent_age_secs: None,
             }],
+            groups: Vec::new(),
+            items: Vec::new(),
         };
 
         let sanitized = sanitize_snapshot(&snapshot);
@@ -320,6 +336,8 @@ mod tests {
     fn sanitize_snapshot_preserves_none_socket() {
         let snapshot = WorkspaceSnapshot {
             sessions: vec![],
+            groups: Vec::new(),
+            items: Vec::new(),
         };
         let sanitized = sanitize_snapshot(&snapshot);
         assert!(sanitized.sessions.is_empty());

@@ -5,7 +5,6 @@ use objc2_app_kit::{NSMenu, NSMenuItem};
 use objc2_foundation::ns_string;
 
 /// Menu tag constants.
-pub const TAG_TOGGLE_AUTO_NUDGE: i32 = 3;
 pub const TAG_SYNC_INPUTS: i32 = 4;
 pub const TAG_NEW_SHELL: i32 = 11;
 
@@ -84,15 +83,6 @@ pub fn build_menu_bar(mtm: MainThreadMarker) -> Retained<NSMenu> {
             ns_string!("v"),
         )
     };
-    let auto_nudge_item = unsafe {
-        NSMenuItem::initWithTitle_action_keyEquivalent(
-            NSMenuItem::alloc(mtm),
-            ns_string!("Toggle Auto-Nudge"),
-            Some(sel!(toggleAutoNudge:)),
-            ns_string!(""),
-        )
-    };
-    auto_nudge_item.setTag(TAG_TOGGLE_AUTO_NUDGE as isize);
     let sync_inputs_item = unsafe {
         NSMenuItem::initWithTitle_action_keyEquivalent(
             NSMenuItem::alloc(mtm),
@@ -112,7 +102,6 @@ pub fn build_menu_bar(mtm: MainThreadMarker) -> Retained<NSMenu> {
     };
     edit_menu.addItem(&copy_item);
     edit_menu.addItem(&paste_item);
-    edit_menu.addItem(&auto_nudge_item);
     edit_menu.addItem(&sync_inputs_item);
     edit_menu.addItem(&NSMenuItem::separatorItem(mtm));
     edit_menu.addItem(&select_all_item);

@@ -71,9 +71,10 @@ fn parse_args() -> Opts {
                 }
             }
             "--no-embed" => {
-                dev_assets = Some(PathBuf::from(
-                    concat!(env!("CARGO_MANIFEST_DIR"), "/frontend/dist"),
-                ));
+                dev_assets = Some(PathBuf::from(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/frontend/dist"
+                )));
             }
             other => {
                 eprintln!("unknown argument: {other}");

@@ -1,5 +1,7 @@
+pub mod config;
 pub mod daemon;
 pub mod file_watch;
+pub mod mcp;
 pub mod model;
 pub mod observation;
 pub mod process;

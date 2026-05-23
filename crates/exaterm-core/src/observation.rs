@@ -1,6 +1,5 @@
 use crate::model::{SessionKind, SessionLaunch, SessionRecord};
 use crate::runtime::StreamRuntimeUpdate;
-use crate::synthesis::{NamingEvidence, NudgeEvidence, TacticalEvidence, TacticalSynthesis};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -97,10 +96,6 @@ pub fn clear_file_activity(observation: &mut SessionObservation) {
     observation.recent_file_activity.clear();
 }
 
-pub fn is_bare_waiting_shell(session: &SessionRecord, observation: &SessionObservation) -> bool {
-    session.launch.kind == SessionKind::WaitingShell && observation.shell_child_command.is_none()
-}
-
 pub fn refresh_observation(
     observation: &mut SessionObservation,
     session: &SessionRecord,
@@ -166,77 +161,7 @@ pub fn effective_display_name(session: &SessionRecord) -> String {
         .unwrap_or_else(|| session.launch.name.clone())
 }
 
-pub fn build_tactical_evidence(
-    session: &SessionRecord,
-    observation: &SessionObservation,
-) -> TacticalEvidence {
-    TacticalEvidence {
-        session_name: effective_display_name(session),
-        task_label: session.launch.subtitle.clone(),
-        dominant_process: observation.dominant_process.clone(),
-        process_tree_excerpt: observation.process_tree_excerpt.clone(),
-        recent_files: observation.recent_files.clone(),
-        terminal_status_line: observation.painted_line.clone(),
-        terminal_status_line_age: Some(relative_age_label(observation.last_change.elapsed())),
-        recent_terminal_activity: synthesis_terminal_activity(observation),
-        recent_events: session
-            .events
-            .iter()
-            .rev()
-            .filter(|event| is_runtime_event(&event.summary))
-            .take(4)
-            .map(|event| event.summary.clone())
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect(),
-    }
-}
-
-pub fn build_naming_evidence(
-    session: &SessionRecord,
-    observation: &SessionObservation,
-) -> NamingEvidence {
-    NamingEvidence {
-        current_name: session.display_name.clone().unwrap_or_default(),
-        recent_terminal_history: naming_terminal_history(observation),
-    }
-}
-
-pub fn build_nudge_evidence(
-    session: &SessionRecord,
-    observation: &SessionObservation,
-    summary: &TacticalSynthesis,
-) -> NudgeEvidence {
-    NudgeEvidence {
-        session_name: effective_display_name(session),
-        shell_child_command: observation.shell_child_command.clone(),
-        idle_seconds: Some(observation.last_change.elapsed().as_secs()),
-        tactical_state_brief: summary.tactical_state_brief.clone(),
-        attention_brief: summary.attention_brief.clone(),
-        headline: summary.headline.clone(),
-        recent_terminal_history: nudge_terminal_history(observation),
-    }
-}
-
-pub fn synthesis_terminal_activity(observation: &SessionObservation) -> Vec<String> {
-    let mut entries = model_terminal_history_window(observation, 60, 100);
-
-    if let Some(painted) = observation.painted_line.as_deref() {
-        let trimmed = painted.trim();
-        if !trimmed.is_empty() {
-            entries.push(format!("[most recent updated line] {trimmed}"));
-        }
-    }
-
-    entries
-}
-
-pub fn naming_terminal_history(observation: &SessionObservation) -> Vec<String> {
-    model_terminal_history_window(observation, 5 * 60, 256)
-}
-
-pub fn nudge_terminal_history(observation: &SessionObservation) -> Vec<String> {
+pub fn terminal_assist_history(observation: &SessionObservation) -> Vec<String> {
     model_terminal_history_window(observation, 10 * 60, 512)
 }
 
@@ -370,24 +295,12 @@ fn relative_age_label(duration: Duration) -> String {
     }
 }
 
-fn is_runtime_event(summary: &str) -> bool {
-    !matches!(
-        summary,
-        "Entered focused terminal view"
-            | "Returned to battlefield view"
-            | "Probe opened"
-            | "Probe closed"
-            | "Probe pinned for ongoing watch"
-            | "Probe returned to peek mode"
-    ) && !summary.starts_with("Probe switched to ")
-}
-
 fn launch_command_hint(launch: &SessionLaunch) -> Option<String> {
     match launch.kind {
         SessionKind::WaitingShell => Some("Interactive shell ready".into()),
         SessionKind::PlanningStream => None,
         SessionKind::BlockingPrompt => Some("Waiting on approval prompt".into()),
-        SessionKind::RunningStream => Some("cargo test parser".into()),
+        SessionKind::RunningStream => None,
         SessionKind::FailingTask => Some("Task exited after failure".into()),
     }
 }
@@ -440,9 +353,8 @@ fn is_meaningful_output_line(line: &str) -> bool {
 mod tests {
     use super::{
         append_recent_lines, apply_file_activity, compute_observation_refresh,
-        effective_display_name, find_git_worktree_root, is_bare_waiting_shell,
-        naming_terminal_history, record_terminal_input_activity, synthesis_terminal_activity,
-        SessionObservation, TerminalActivityEntry,
+        effective_display_name, find_git_worktree_root, record_terminal_input_activity,
+        terminal_assist_history, SessionObservation, TerminalActivityEntry,
     };
     use crate::model::{
         user_shell_launch, SessionId, SessionKind, SessionLaunch, SessionRecord, SessionStatus,
@@ -466,7 +378,7 @@ mod tests {
     }
 
     #[test]
-    fn synthesis_activity_contains_terminal_history_and_most_recent_updated_line() {
+    fn terminal_assist_history_contains_terminal_activity() {
         let mut observation = SessionObservation::new();
         let now = Instant::now();
         observation.terminal_activity = vec![
@@ -479,74 +391,51 @@ mod tests {
                 text: "test result: ok".to_string(),
             },
         ];
-        observation.painted_line = Some("Working 7".to_string());
 
-        let history = synthesis_terminal_activity(&observation);
-        assert_eq!(history.len(), 3);
+        let history = terminal_assist_history(&observation);
+        assert_eq!(history.len(), 2);
         assert!(history[0].ends_with("• Ran cargo test"));
         assert!(history[1].ends_with("test result: ok"));
-        assert_eq!(history[2], "[most recent updated line] Working 7");
     }
 
     #[test]
-    fn synthesis_activity_keeps_at_least_100_lines_when_recent_activity_is_short() {
+    fn terminal_assist_history_keeps_at_least_512_lines_when_recent_activity_is_short() {
         let mut observation = SessionObservation::new();
         let now = Instant::now();
-        observation.terminal_activity = (0..300)
+        observation.terminal_activity = (0..700)
             .map(|index| TerminalActivityEntry {
-                at: now - Duration::from_secs(((300 - index) * 2) as u64),
+                at: now - Duration::from_secs(((700 - index) * 2) as u64),
                 text: format!("line {index}"),
             })
             .collect();
 
-        let history = synthesis_terminal_activity(&observation);
-        assert_eq!(history.len(), 100);
+        let history = terminal_assist_history(&observation);
+        assert_eq!(history.len(), 512);
         assert!(history
             .first()
-            .is_some_and(|line| line.ends_with("line 200")));
+            .is_some_and(|line| line.ends_with("line 188")));
         assert!(history
             .last()
-            .is_some_and(|line| line.ends_with("line 299")));
+            .is_some_and(|line| line.ends_with("line 699")));
     }
 
     #[test]
-    fn synthesis_activity_keeps_more_than_100_lines_when_one_minute_window_is_larger() {
+    fn terminal_assist_history_keeps_more_than_512_lines_when_ten_minute_window_is_larger() {
         let mut observation = SessionObservation::new();
         let now = Instant::now();
-        observation.terminal_activity = (0..160)
+        observation.terminal_activity = (0..580)
             .map(|index| TerminalActivityEntry {
-                at: now - Duration::from_millis(((160 - index) * 250) as u64),
+                at: now - Duration::from_millis(((580 - index) * 10) as u64),
                 text: format!("line {index}"),
             })
             .collect();
 
-        let history = synthesis_terminal_activity(&observation);
-        assert_eq!(history.len(), 160);
+        let history = terminal_assist_history(&observation);
+        assert_eq!(history.len(), 580);
         assert!(history.first().is_some_and(|line| line.ends_with("line 0")));
         assert!(history
             .last()
-            .is_some_and(|line| line.ends_with("line 159")));
-    }
-
-    #[test]
-    fn model_history_keeps_more_than_256_lines_when_five_minutes_is_larger() {
-        let mut observation = SessionObservation::new();
-        let now = Instant::now();
-        observation.terminal_activity = (0..400)
-            .map(|index| TerminalActivityEntry {
-                at: now - Duration::from_secs((400 - index) as u64),
-                text: format!("line {index}"),
-            })
-            .collect();
-
-        let history = naming_terminal_history(&observation);
-        assert_eq!(history.len(), 299);
-        assert!(history
-            .first()
-            .is_some_and(|line| line.ends_with("line 101")));
-        assert!(history
-            .last()
-            .is_some_and(|line| line.ends_with("line 399")));
+            .is_some_and(|line| line.ends_with("line 579")));
     }
 
     #[test]
@@ -635,42 +524,6 @@ mod tests {
         let refresh = compute_observation_refresh(&session, false);
         assert!(refresh.shell_child_command.is_none());
         assert!(refresh.dominant_process.is_none());
-    }
-
-    #[test]
-    fn bare_waiting_shell_detects_shell_without_subprocesses() {
-        let session = session_record_with_cwd(
-            SessionId(42),
-            tempdir_path("exaterm-observation-bare-shell"),
-        );
-        let observation = SessionObservation::new();
-
-        assert!(is_bare_waiting_shell(&session, &observation));
-    }
-
-    #[test]
-    fn bare_waiting_shell_rejects_shell_with_direct_child() {
-        let session = session_record_with_cwd(
-            SessionId(42),
-            tempdir_path("exaterm-observation-active-shell"),
-        );
-        let mut observation = SessionObservation::new();
-        observation.shell_child_command = Some("codex".into());
-
-        assert!(!is_bare_waiting_shell(&session, &observation));
-    }
-
-    #[test]
-    fn bare_waiting_shell_ignores_terminal_evidence_without_subprocesses() {
-        let session = session_record_with_cwd(
-            SessionId(42),
-            tempdir_path("exaterm-observation-terminal-evidence"),
-        );
-        let mut observation = SessionObservation::new();
-        observation.active_command = Some("codex".into());
-        observation.work_output_excerpt = Some("Updating parser".into());
-
-        assert!(is_bare_waiting_shell(&session, &observation));
     }
 
     #[test]

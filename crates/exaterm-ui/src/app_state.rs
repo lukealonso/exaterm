@@ -1,15 +1,10 @@
-use crate::presentation::{
-    attention_bar_presentation, attention_presentation, combined_focus_summary_text,
-    nudge_state_presentation, status_chip_label, AttentionPresentation, NudgeStatePresentation,
-    SegmentedBarPresentation,
-};
+use crate::presentation::status_chip_label;
 use crate::supervision::{
-    build_battle_card, derive_battle_card_status, BattleCardStatus, ObservedActivity,
+    build_session_tile, derive_session_tile_status, ObservedActivity, SessionTileStatus,
 };
 use crate::workspace_view::WorkspaceViewState;
 use exaterm_types::model::SessionId;
 use exaterm_types::proto::WorkspaceSnapshot;
-use exaterm_types::synthesis::{AttentionLevel, TacticalSynthesis};
 use std::collections::BTreeMap;
 
 /// Data needed to render a single card in the battlefield view.
@@ -17,69 +12,15 @@ use std::collections::BTreeMap;
 pub struct CardRenderData {
     pub id: SessionId,
     pub title: String,
-    pub status: BattleCardStatus,
+    pub status: SessionTileStatus,
     pub status_label: String,
     pub recency: String,
-    pub scrollback: Vec<String>,
-    /// One-line synthesis headline (e.g. "Parser pass completed").
-    pub headline: String,
-    pub combined_headline: String,
-    /// Optional detailed synthesis text.
-    pub detail: Option<String>,
-    /// Optional alert text (operator action recommendation).
-    pub alert: Option<String>,
-    pub attention: Option<AttentionPresentation>,
-    pub attention_reason: Option<String>,
-    pub attention_bar: Option<SegmentedBarPresentation>,
-    pub attention_bar_reason: Option<String>,
-    pub nudge_state: NudgeStatePresentation,
-    pub last_nudge: Option<String>,
-}
-
-#[derive(Clone, Debug)]
-pub struct FocusRenderData {
-    pub id: SessionId,
-    pub title: String,
-    pub status: BattleCardStatus,
-    pub status_label: String,
-    pub combined_headline: String,
-    pub attention: Option<AttentionPresentation>,
-    pub attention_reason: Option<String>,
-    pub attention_bar: Option<SegmentedBarPresentation>,
-    pub attention_bar_reason: Option<String>,
-}
-
-/// Extract headline, detail, and alert strings from an optional `TacticalSynthesis`.
-///
-/// - `headline`: the synthesis headline, or empty if absent.
-/// - `detail`: the tactical state brief, if present.
-/// - `alert`: the attention brief, if the attention level requires intervention.
-pub fn extract_synthesis_fields(
-    synthesis: Option<&TacticalSynthesis>,
-) -> (String, Option<String>, Option<String>) {
-    match synthesis {
-        Some(s) => {
-            let headline = s.headline.clone().unwrap_or_default();
-            let detail = s.tactical_state_brief.clone();
-            let alert = match s.attention_level {
-                AttentionLevel::Autopilot | AttentionLevel::Monitor => None,
-                _ => s.attention_brief.clone(),
-            };
-            (headline, detail, alert)
-        }
-        None => (String::new(), None, None),
-    }
 }
 
 pub struct AppState {
     pub workspace: WorkspaceViewState,
     pub observations: BTreeMap<SessionId, ObservedActivity>,
-    pub recent_lines: BTreeMap<SessionId, Vec<String>>,
     pub raw_socket_names: BTreeMap<SessionId, String>,
-    pub summaries: BTreeMap<SessionId, TacticalSynthesis>,
-    pub auto_nudge_enabled: BTreeMap<SessionId, bool>,
-    pub last_nudges: BTreeMap<SessionId, String>,
-    pub last_nudge_sent_age_secs: BTreeMap<SessionId, u64>,
 }
 
 impl AppState {
@@ -87,12 +28,7 @@ impl AppState {
         Self {
             workspace: WorkspaceViewState::new(),
             observations: BTreeMap::new(),
-            recent_lines: BTreeMap::new(),
             raw_socket_names: BTreeMap::new(),
-            summaries: BTreeMap::new(),
-            auto_nudge_enabled: BTreeMap::new(),
-            last_nudges: BTreeMap::new(),
-            last_nudge_sent_age_secs: BTreeMap::new(),
         }
     }
 
@@ -102,17 +38,7 @@ impl AppState {
         for session in &snapshot.sessions {
             let obs = self.observations.entry(session.record.id).or_default();
             let snap_obs = &session.observation;
-            obs.active_command = snap_obs.active_command.clone();
-            obs.dominant_process = snap_obs.dominant_process.clone();
-            obs.recent_files = snap_obs.recent_files.clone();
-            obs.work_output_excerpt = snap_obs.work_output_excerpt.clone();
             obs.idle_seconds = Some(snap_obs.last_change_age_secs);
-        }
-
-        // Store recent terminal output lines for card scrollback.
-        for session in &snapshot.sessions {
-            self.recent_lines
-                .insert(session.record.id, session.observation.recent_lines.clone());
         }
 
         // Track raw stream socket names for each session.
@@ -125,227 +51,112 @@ impl AppState {
             }
         }
 
-        // Store synthesis summaries from the snapshot.
-        for session in &snapshot.sessions {
-            if let Some(ref synthesis) = session.summary {
-                self.summaries.insert(session.record.id, synthesis.clone());
-            } else {
-                self.summaries.remove(&session.record.id);
-            }
-        }
-
-        for session in &snapshot.sessions {
-            self.auto_nudge_enabled
-                .insert(session.record.id, session.auto_nudge_enabled);
-            if let Some(ref last_nudge) = session.last_nudge {
-                self.last_nudges
-                    .insert(session.record.id, last_nudge.clone());
-            } else {
-                self.last_nudges.remove(&session.record.id);
-            }
-            if let Some(age) = session.last_sent_age_secs {
-                self.last_nudge_sent_age_secs.insert(session.record.id, age);
-            } else {
-                self.last_nudge_sent_age_secs.remove(&session.record.id);
-            }
-        }
-
-        // Remove observations, socket names, and summaries for sessions no longer present.
+        // Remove observations and socket names for sessions no longer present.
         let session_ids: Vec<_> = snapshot.sessions.iter().map(|s| s.record.id).collect();
         self.observations.retain(|id, _| session_ids.contains(id));
-        self.recent_lines.retain(|id, _| session_ids.contains(id));
         self.raw_socket_names
             .retain(|id, _| session_ids.contains(id));
-        self.summaries.retain(|id, _| session_ids.contains(id));
-        self.auto_nudge_enabled
-            .retain(|id, _| session_ids.contains(id));
-        self.last_nudges.retain(|id, _| session_ids.contains(id));
-        self.last_nudge_sent_age_secs
-            .retain(|id, _| session_ids.contains(id));
 
-        // Update workspace state with the latest session records.
+        // Update workspace state with the latest records and daemon-owned item order.
         let records = snapshot.sessions.iter().map(|s| s.record.clone()).collect();
-        self.workspace.replace_sessions(records);
+        self.workspace
+            .replace_workspace(records, snapshot.groups.clone(), snapshot.items.clone());
     }
 
     /// Build card render data for the battlefield view.
     pub fn card_render_data(&self) -> Vec<CardRenderData> {
         self.workspace
-            .sessions()
+            .ordered_session_ids()
             .iter()
-            .map(|session| {
+            .filter_map(|session_id| {
+                let session = self.workspace.session(*session_id)?;
                 let observed = self
                     .observations
-                    .get(&session.id)
+                    .get(session_id)
                     .cloned()
                     .unwrap_or_default();
-                let card = build_battle_card(session, &observed);
-                let scrollback = self
-                    .recent_lines
-                    .get(&session.id)
-                    .map(|lines| {
-                        let taken: Vec<String> = lines
-                            .iter()
-                            .rev()
-                            .map(|l| l.trim().to_string())
-                            .filter(|l| !l.is_empty())
-                            .take(4)
-                            .collect();
-                        taken.into_iter().rev().collect()
-                    })
-                    .unwrap_or_default();
+                let card = build_session_tile(session, &observed);
                 let title = session
                     .display_name
                     .as_deref()
                     .unwrap_or(&card.title)
                     .to_string();
-                let (headline, detail, alert) =
-                    extract_synthesis_fields(self.summaries.get(&session.id));
                 let status_label = status_chip_label(card.status, &card.recency_label);
-                let (attention, attention_reason) =
-                    attention_presentation(self.summaries.get(&session.id))
-                        .map(|(presentation, reason)| (Some(presentation), reason))
-                        .unwrap_or((None, None));
-                let (attention_bar, attention_bar_reason) =
-                    attention_bar_presentation(self.summaries.get(&session.id))
-                        .map(|(presentation, reason)| (Some(presentation), reason))
-                        .unwrap_or((None, None));
-                let auto_nudge_enabled = self
-                    .auto_nudge_enabled
-                    .get(&session.id)
-                    .copied()
-                    .unwrap_or(false);
-                let cooldown_active = self
-                    .last_nudge_sent_age_secs
-                    .get(&session.id)
-                    .copied()
-                    .is_some_and(|age| age < 120);
-                CardRenderData {
+                Some(CardRenderData {
                     id: session.id,
                     title,
                     status: card.status,
                     status_label,
                     recency: card.recency_label,
-                    scrollback,
-                    combined_headline: combined_focus_summary_text(
-                        &headline,
-                        self.summaries
-                            .get(&session.id)
-                            .and_then(|summary| summary.attention_brief.as_deref()),
-                    ),
-                    headline,
-                    detail,
-                    alert,
-                    attention,
-                    attention_reason,
-                    attention_bar,
-                    attention_bar_reason,
-                    nudge_state: nudge_state_presentation(
-                        auto_nudge_enabled,
-                        cooldown_active,
-                        false,
-                    ),
-                    last_nudge: self.last_nudges.get(&session.id).cloned(),
-                }
+                })
             })
             .collect()
     }
 
-    pub fn focus_render_data(&self, session_id: SessionId) -> Option<FocusRenderData> {
-        let session = self.workspace.session(session_id)?;
-        let observed = self
-            .observations
-            .get(&session_id)
-            .cloned()
-            .unwrap_or_default();
-        let card = build_battle_card(session, &observed);
-        let title = session
-            .display_name
-            .as_deref()
-            .unwrap_or(&card.title)
-            .to_string();
-        let summary = self.summaries.get(&session_id);
-        let status_label = status_chip_label(card.status, &card.recency_label);
-        let (headline, _, _) = extract_synthesis_fields(summary);
-        let (attention, attention_reason) = attention_presentation(summary)
-            .map(|(presentation, reason)| (Some(presentation), reason))
-            .unwrap_or((None, None));
-        let (attention_bar, attention_bar_reason) = attention_bar_presentation(summary)
-            .map(|(presentation, reason)| (Some(presentation), reason))
-            .unwrap_or((None, None));
-        Some(FocusRenderData {
-            id: session_id,
-            title,
-            status: card.status,
-            status_label,
-            combined_headline: combined_focus_summary_text(
-                &headline,
-                summary.and_then(|s| s.attention_brief.as_deref()),
-            ),
-            attention,
-            attention_reason,
-            attention_bar,
-            attention_bar_reason,
-        })
-    }
-
     /// Select the next session in the list (wrapping around).
     pub fn select_next_session(&mut self) {
-        let sessions = self.workspace.sessions();
+        let sessions = self.workspace.ordered_session_ids();
         if sessions.is_empty() {
             return;
         }
         let current = self.workspace.selected_session();
         let next = match current {
             Some(id) => {
-                let idx = sessions.iter().position(|s| s.id == id).unwrap_or(0);
+                let idx = sessions
+                    .iter()
+                    .position(|session_id| *session_id == id)
+                    .unwrap_or(0);
                 let next_idx = (idx + 1) % sessions.len();
-                sessions[next_idx].id
+                sessions[next_idx]
             }
-            None => sessions[0].id,
+            None => sessions[0],
         };
         self.workspace.select_session(next);
     }
 
     /// Select the previous session in the list (wrapping around).
     pub fn select_previous_session(&mut self) {
-        let sessions = self.workspace.sessions();
+        let sessions = self.workspace.ordered_session_ids();
         if sessions.is_empty() {
             return;
         }
         let current = self.workspace.selected_session();
         let prev = match current {
             Some(id) => {
-                let idx = sessions.iter().position(|s| s.id == id).unwrap_or(0);
+                let idx = sessions
+                    .iter()
+                    .position(|session_id| *session_id == id)
+                    .unwrap_or(0);
                 let prev_idx = if idx == 0 {
                     sessions.len() - 1
                 } else {
                     idx - 1
                 };
-                sessions[prev_idx].id
+                sessions[prev_idx]
             }
-            None => sessions[sessions.len() - 1].id,
+            None => sessions[sessions.len() - 1],
         };
         self.workspace.select_session(prev);
     }
 
     /// Build a summary line for display in the window.
-    pub fn session_summaries(&self) -> Vec<(SessionId, String, BattleCardStatus)> {
+    pub fn session_summaries(&self) -> Vec<(SessionId, String, SessionTileStatus)> {
         self.workspace
-            .sessions()
+            .ordered_session_ids()
             .iter()
-            .map(|session| {
+            .filter_map(|session_id| {
+                let session = self.workspace.session(*session_id)?;
                 let observed = self
                     .observations
-                    .get(&session.id)
+                    .get(session_id)
                     .cloned()
                     .unwrap_or_default();
-                let status = derive_battle_card_status(session.status, &observed);
+                let status = derive_session_tile_status(session.status, &observed);
                 let display_name = session
                     .display_name
                     .as_deref()
                     .unwrap_or(&session.launch.name);
-                (session.id, display_name.to_string(), status)
+                Some((session.id, display_name.to_string(), status))
             })
             .collect()
     }
@@ -354,11 +165,29 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use exaterm_types::model::{SessionId, SessionRecord, SessionStatus};
+    use exaterm_types::model::{
+        GroupId, SessionId, SessionRecord, SessionStatus, SupervisedGroupRecord, WorkspaceItem,
+    };
     use exaterm_types::proto::{ObservationSnapshot, SessionSnapshot, WorkspaceSnapshot};
 
     fn make_snapshot(sessions: Vec<SessionSnapshot>) -> WorkspaceSnapshot {
-        WorkspaceSnapshot { sessions }
+        WorkspaceSnapshot {
+            items: Vec::new(),
+            sessions,
+            groups: Vec::new(),
+        }
+    }
+
+    fn make_snapshot_with_items(
+        items: Vec<WorkspaceItem>,
+        sessions: Vec<SessionSnapshot>,
+        groups: Vec<SupervisedGroupRecord>,
+    ) -> WorkspaceSnapshot {
+        WorkspaceSnapshot {
+            items,
+            sessions,
+            groups,
+        }
     }
 
     fn make_session_snapshot(id: u32, name: &str, status: SessionStatus) -> SessionSnapshot {
@@ -372,11 +201,23 @@ mod tests {
                 events: Vec::new(),
             },
             observation: ObservationSnapshot::default(),
-            summary: None,
             raw_stream_socket_name: None,
-            auto_nudge_enabled: false,
-            last_nudge: None,
-            last_sent_age_secs: None,
+        }
+    }
+
+    fn make_group(id: u32, name: &str, members: Vec<SessionId>) -> SupervisedGroupRecord {
+        SupervisedGroupRecord {
+            id: GroupId(id),
+            name: name.into(),
+            member_session_ids: members,
+            supervisor_session_id: None,
+            provider: None,
+            goal: None,
+            summary_markdown: String::new(),
+            supervisor_visible: false,
+            summary_age_secs: None,
+            latest_action_age_secs: None,
+            actions: Vec::new(),
         }
     }
 
@@ -392,6 +233,90 @@ mod tests {
 
         assert_eq!(state.workspace.sessions().len(), 2);
         assert_eq!(state.observations.len(), 2);
+    }
+
+    #[test]
+    fn apply_snapshot_preserves_workspace_items_and_groups() {
+        let mut state = AppState::new();
+        let sessions = vec![
+            make_session_snapshot(1, "Shell 1", SessionStatus::Running),
+            make_session_snapshot(2, "Shell 2", SessionStatus::Running),
+        ];
+        let group = make_group(7, "Review group", vec![SessionId(1), SessionId(2)]);
+        let snapshot = make_snapshot_with_items(
+            vec![
+                WorkspaceItem::Group(GroupId(7)),
+                WorkspaceItem::Session(SessionId(2)),
+                WorkspaceItem::Session(SessionId(1)),
+            ],
+            sessions,
+            vec![group],
+        );
+
+        state.apply_snapshot(&snapshot);
+
+        assert_eq!(
+            state.workspace.ordered_visible_items(),
+            &[
+                WorkspaceItem::Group(GroupId(7)),
+                WorkspaceItem::Session(SessionId(2)),
+                WorkspaceItem::Session(SessionId(1)),
+            ]
+        );
+        assert_eq!(
+            state.workspace.ordered_session_ids(),
+            &[SessionId(2), SessionId(1)]
+        );
+        assert_eq!(
+            state
+                .workspace
+                .group(GroupId(7))
+                .map(|group| group.name.as_str()),
+            Some("Review group")
+        );
+        assert_eq!(state.workspace.selected_session(), Some(SessionId(2)));
+        assert_eq!(
+            state.workspace.selected_workspace_item(),
+            Some(WorkspaceItem::Group(GroupId(7)))
+        );
+    }
+
+    #[test]
+    fn apply_snapshot_prunes_stale_groups_and_group_items() {
+        let mut state = AppState::new();
+        let initial = make_snapshot_with_items(
+            vec![
+                WorkspaceItem::Group(GroupId(7)),
+                WorkspaceItem::Session(SessionId(1)),
+            ],
+            vec![make_session_snapshot(1, "Shell 1", SessionStatus::Running)],
+            vec![make_group(7, "Old group", vec![SessionId(1)])],
+        );
+        state.apply_snapshot(&initial);
+        state
+            .workspace
+            .select_workspace_item(WorkspaceItem::Group(GroupId(7)));
+
+        let updated = make_snapshot_with_items(
+            vec![
+                WorkspaceItem::Group(GroupId(7)),
+                WorkspaceItem::Session(SessionId(1)),
+            ],
+            vec![make_session_snapshot(1, "Shell 1", SessionStatus::Running)],
+            Vec::new(),
+        );
+        state.apply_snapshot(&updated);
+
+        assert!(state.workspace.groups().is_empty());
+        assert!(state.workspace.group(GroupId(7)).is_none());
+        assert_eq!(
+            state.workspace.ordered_visible_items(),
+            &[WorkspaceItem::Session(SessionId(1))]
+        );
+        assert_eq!(
+            state.workspace.selected_workspace_item(),
+            Some(WorkspaceItem::Session(SessionId(1)))
+        );
     }
 
     #[test]
@@ -453,23 +378,15 @@ mod tests {
     }
 
     #[test]
-    fn apply_snapshot_maps_observation_fields() {
+    fn apply_snapshot_maps_snapshot_visible_observation_fields() {
         let mut state = AppState::new();
         let mut snap = make_session_snapshot(1, "Shell", SessionStatus::Running);
-        snap.observation.active_command = Some("cargo build".into());
-        snap.observation.dominant_process = Some("rustc".into());
         snap.observation.last_change_age_secs = 5;
-        snap.observation.recent_files = vec!["main.rs".into()];
-        snap.observation.work_output_excerpt = Some("Compiling...".into());
 
         state.apply_snapshot(&make_snapshot(vec![snap]));
 
         let obs = state.observations.get(&SessionId(1)).unwrap();
-        assert_eq!(obs.active_command.as_deref(), Some("cargo build"));
-        assert_eq!(obs.dominant_process.as_deref(), Some("rustc"));
         assert_eq!(obs.idle_seconds, Some(5));
-        assert_eq!(obs.recent_files, vec!["main.rs"]);
-        assert_eq!(obs.work_output_excerpt.as_deref(), Some("Compiling..."));
     }
 
     #[test]
@@ -530,20 +447,6 @@ mod tests {
     }
 
     #[test]
-    fn card_render_data_scrollback_empty_without_ios() {
-        let mut state = AppState::new();
-        let snapshot = make_snapshot(vec![make_session_snapshot(
-            1,
-            "Shell 1",
-            SessionStatus::Running,
-        )]);
-        state.apply_snapshot(&snapshot);
-
-        let cards = state.card_render_data();
-        assert!(cards[0].scrollback.is_empty());
-    }
-
-    #[test]
     fn card_render_data_uses_display_name() {
         let mut state = AppState::new();
         let mut snap = make_session_snapshot(1, "Shell 1", SessionStatus::Running);
@@ -552,34 +455,6 @@ mod tests {
 
         let cards = state.card_render_data();
         assert_eq!(cards[0].title, "My Project");
-    }
-
-    #[test]
-    fn card_render_data_uses_attention_bar_and_cooldown_nudge_state() {
-        use exaterm_types::synthesis::{AttentionLevel, TacticalState, TacticalSynthesis};
-
-        let mut state = AppState::new();
-        let mut snap = make_session_snapshot(1, "Shell 1", SessionStatus::Running);
-        snap.summary = Some(TacticalSynthesis {
-            tactical_state: TacticalState::Working,
-            tactical_state_brief: Some("Routine setup".into()),
-            attention_level: AttentionLevel::Guide,
-            attention_brief: Some("Operator should keep watching this setup.".into()),
-            headline: Some("Setup is moving but still deserves active supervision.".into()),
-            tool_not_likely_coding_agent: false,
-        });
-        snap.auto_nudge_enabled = true;
-        snap.last_sent_age_secs = Some(30);
-
-        state.apply_snapshot(&make_snapshot(vec![snap]));
-
-        let cards = state.card_render_data();
-        assert_eq!(cards[0].attention_bar.unwrap().fill, 3);
-        assert_eq!(
-            cards[0].attention_bar_reason.as_deref(),
-            Some("Operator should keep watching this setup.")
-        );
-        assert_eq!(cards[0].nudge_state.label, "AUTONUDGE COOLDOWN");
     }
 
     #[test]
@@ -633,159 +508,6 @@ mod tests {
     }
 
     #[test]
-    fn extract_synthesis_fields_none() {
-        let (headline, detail, alert) = extract_synthesis_fields(None);
-        assert!(headline.is_empty());
-        assert!(detail.is_none());
-        assert!(alert.is_none());
-    }
-
-    #[test]
-    fn extract_synthesis_fields_with_headline() {
-        use exaterm_types::synthesis::{AttentionLevel, TacticalState, TacticalSynthesis};
-        let synth = TacticalSynthesis {
-            tactical_state: TacticalState::Working,
-            tactical_state_brief: Some("Steady progress".into()),
-            attention_level: AttentionLevel::Autopilot,
-            attention_brief: None,
-            headline: Some("Build passing".into()),
-            tool_not_likely_coding_agent: false,
-        };
-        let (headline, detail, alert) = extract_synthesis_fields(Some(&synth));
-        assert_eq!(headline, "Build passing");
-        assert_eq!(detail.as_deref(), Some("Steady progress"));
-        assert!(
-            alert.is_none(),
-            "Autopilot attention should produce no alert"
-        );
-    }
-
-    #[test]
-    fn extract_synthesis_fields_with_alert() {
-        use exaterm_types::synthesis::{AttentionLevel, TacticalState, TacticalSynthesis};
-        let synth = TacticalSynthesis {
-            tactical_state: TacticalState::Blocked,
-            tactical_state_brief: None,
-            attention_level: AttentionLevel::Intervene,
-            attention_brief: Some("Process stuck, needs input".into()),
-            headline: Some("Blocked on user".into()),
-            tool_not_likely_coding_agent: false,
-        };
-        let (headline, _detail, alert) = extract_synthesis_fields(Some(&synth));
-        assert_eq!(headline, "Blocked on user");
-        assert_eq!(alert.as_deref(), Some("Process stuck, needs input"));
-    }
-
-    #[test]
-    fn apply_snapshot_stores_summaries() {
-        use exaterm_types::synthesis::{AttentionLevel, TacticalState, TacticalSynthesis};
-        let mut state = AppState::new();
-        let mut snap = make_session_snapshot(1, "Shell", SessionStatus::Running);
-        snap.summary = Some(TacticalSynthesis {
-            tactical_state: TacticalState::Working,
-            tactical_state_brief: None,
-            attention_level: AttentionLevel::Monitor,
-            attention_brief: None,
-            headline: Some("Tests passing".into()),
-            tool_not_likely_coding_agent: false,
-        });
-
-        state.apply_snapshot(&make_snapshot(vec![snap]));
-
-        assert!(state.summaries.contains_key(&SessionId(1)));
-        let synth = state.summaries.get(&SessionId(1)).unwrap();
-        assert_eq!(synth.headline.as_deref(), Some("Tests passing"));
-    }
-
-    #[test]
-    fn apply_snapshot_clears_summary_when_absent() {
-        use exaterm_types::synthesis::{AttentionLevel, TacticalState, TacticalSynthesis};
-        let mut state = AppState::new();
-
-        // First snapshot with a summary.
-        let mut snap = make_session_snapshot(1, "Shell", SessionStatus::Running);
-        snap.summary = Some(TacticalSynthesis {
-            tactical_state: TacticalState::Working,
-            tactical_state_brief: None,
-            attention_level: AttentionLevel::Monitor,
-            attention_brief: None,
-            headline: Some("Active".into()),
-            tool_not_likely_coding_agent: false,
-        });
-        state.apply_snapshot(&make_snapshot(vec![snap]));
-        assert!(state.summaries.contains_key(&SessionId(1)));
-
-        // Second snapshot without summary.
-        let snap2 = make_session_snapshot(1, "Shell", SessionStatus::Running);
-        state.apply_snapshot(&make_snapshot(vec![snap2]));
-        assert!(!state.summaries.contains_key(&SessionId(1)));
-    }
-
-    #[test]
-    fn card_render_data_includes_synthesis_fields() {
-        use exaterm_types::synthesis::{AttentionLevel, TacticalState, TacticalSynthesis};
-        let mut state = AppState::new();
-        let mut snap = make_session_snapshot(1, "Shell", SessionStatus::Running);
-        snap.summary = Some(TacticalSynthesis {
-            tactical_state: TacticalState::Working,
-            tactical_state_brief: Some("Good momentum".into()),
-            attention_level: AttentionLevel::Guide,
-            attention_brief: Some("Monitor closely".into()),
-            headline: Some("Compiling".into()),
-            tool_not_likely_coding_agent: false,
-        });
-
-        state.apply_snapshot(&make_snapshot(vec![snap]));
-
-        let cards = state.card_render_data();
-        assert_eq!(cards[0].headline, "Compiling");
-        assert_eq!(cards[0].detail.as_deref(), Some("Good momentum"));
-        assert_eq!(cards[0].alert.as_deref(), Some("Monitor closely"));
-    }
-
-    #[test]
-    fn card_render_data_uses_daemon_recent_lines() {
-        let mut state = AppState::new();
-        let mut snap = make_session_snapshot(1, "Shell", SessionStatus::Running);
-        snap.observation.recent_lines = vec![
-            "$ cargo build".into(),
-            "   Compiling exaterm v0.1.0".into(),
-            "    Finished dev".into(),
-        ];
-        state.apply_snapshot(&make_snapshot(vec![snap]));
-
-        let cards = state.card_render_data();
-        assert_eq!(
-            cards[0].scrollback,
-            vec!["$ cargo build", "Compiling exaterm v0.1.0", "Finished dev",]
-        );
-    }
-
-    #[test]
-    fn card_render_data_scrollback_trims_and_filters() {
-        let mut state = AppState::new();
-        let mut snap = make_session_snapshot(1, "Shell", SessionStatus::Running);
-        snap.observation.recent_lines = vec![
-            "line1".into(),
-            "  ".into(), // whitespace-only, should be filtered
-            "".into(),   // empty, should be filtered
-            "line2".into(),
-            "  line3  ".into(), // should be trimmed
-            "line4".into(),
-            "line5".into(),
-            "line6".into(), // exceeds limit of 4
-        ];
-        state.apply_snapshot(&make_snapshot(vec![snap]));
-
-        let cards = state.card_render_data();
-        // Takes last 4 non-empty trimmed lines
-        assert_eq!(
-            cards[0].scrollback,
-            vec!["line3", "line4", "line5", "line6"]
-        );
-    }
-
-    #[test]
     fn session_summaries_derive_correct_status_for_idle() {
         let mut state = AppState::new();
         let mut snap = make_session_snapshot(1, "Shell", SessionStatus::Running);
@@ -794,32 +516,6 @@ mod tests {
         state.apply_snapshot(&make_snapshot(vec![snap]));
 
         let summaries = state.session_summaries();
-        assert_eq!(summaries[0].2, BattleCardStatus::Idle);
-    }
-
-    #[test]
-    fn focus_render_data_includes_attention_bar() {
-        use exaterm_types::synthesis::{AttentionLevel, TacticalState, TacticalSynthesis};
-
-        let mut state = AppState::new();
-        let mut snap = make_session_snapshot(1, "Shell", SessionStatus::Running);
-        snap.summary = Some(TacticalSynthesis {
-            tactical_state: TacticalState::Blocked,
-            tactical_state_brief: Some("Waiting on operator".into()),
-            attention_level: AttentionLevel::Intervene,
-            attention_brief: Some("Operator action is required before progress can resume.".into()),
-            headline: Some("Hard stop waiting on operator input.".into()),
-            tool_not_likely_coding_agent: false,
-        });
-
-        state.apply_snapshot(&make_snapshot(vec![snap]));
-
-        let focus = state.focus_render_data(SessionId(1)).unwrap();
-        assert_eq!(focus.attention.unwrap().label, "INTERVENE");
-        assert_eq!(focus.attention_bar.unwrap().fill, 4);
-        assert_eq!(
-            focus.attention_bar_reason.as_deref(),
-            Some("Operator action is required before progress can resume.")
-        );
+        assert_eq!(summaries[0].2, SessionTileStatus::Idle);
     }
 }

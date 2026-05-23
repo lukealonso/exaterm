@@ -29,7 +29,11 @@ fn main() {
     let node_modules = frontend_dir.join("node_modules");
     let deps_available = node_modules.exists();
     let marker_path = dist_dir.join(".deps-state");
-    let marker_value = if deps_available { "full" } else { "placeholder" };
+    let marker_value = if deps_available {
+        "full"
+    } else {
+        "placeholder"
+    };
     let needs_rebuild = fs::read_to_string(&marker_path)
         .map(|prev| prev != marker_value)
         .unwrap_or(true);
@@ -83,12 +87,15 @@ fn main() {
 /// been built.
 fn ensure_placeholder_dist(dist_dir: &Path) {
     for (name, content) in [
-        ("index.html", "<!doctype html><html><head>\
+        (
+            "index.html",
+            "<!doctype html><html><head>\
             <link rel=\"stylesheet\" href=\"/assets/app.css\">\
             <link rel=\"stylesheet\" href=\"/assets/main.css\">\
             </head><body>frontend not built\
             <script src=\"/assets/main.js\"></script>\
-            </body></html>"),
+            </body></html>",
+        ),
         ("main.js", "// placeholder"),
         ("main.css", "/* placeholder */"),
         ("app.css", "/* placeholder */"),

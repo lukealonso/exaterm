@@ -272,6 +272,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "exaterm"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "exaterm-core"
 version = "0.1.0"
 dependencies = [
@@ -290,9 +297,11 @@ dependencies = [
 name = "exaterm-gtk"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "exaterm-core",
  "exaterm-types",
  "exaterm-ui",
+ "gdk-pixbuf",
  "gio",
  "glib",
  "gtk4",

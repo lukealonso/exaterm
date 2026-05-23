@@ -4,6 +4,46 @@ use std::path::PathBuf;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct SessionId(pub u32);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct GroupId(pub u32);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceItem {
+    Session(SessionId),
+    Group(GroupId),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SupervisorProvider {
+    Codex,
+    Claude,
+    Other,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SupervisorActionRecord {
+    pub sequence: u64,
+    pub summary: String,
+    pub age_secs: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SupervisedGroupRecord {
+    pub id: GroupId,
+    pub name: String,
+    pub member_session_ids: Vec<SessionId>,
+    pub supervisor_session_id: Option<SessionId>,
+    pub provider: Option<SupervisorProvider>,
+    pub goal: Option<String>,
+    pub summary_markdown: String,
+    pub supervisor_visible: bool,
+    pub summary_age_secs: Option<u64>,
+    pub latest_action_age_secs: Option<u64>,
+    pub actions: Vec<SupervisorActionRecord>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SessionKind {
     WaitingShell,

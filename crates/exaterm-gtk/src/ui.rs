@@ -1,234 +1,141 @@
-use crate::actions::{set_auto_nudge_hover, toggle_auto_nudge};
 use crate::beachhead::BeachheadConnection;
-use crate::style::{
-    apply_battle_card_surface_style, apply_battle_status_style, configure_app_icons, load_css,
-};
+use crate::style::{configure_app_icons, load_css};
 use crate::terminal_adapter::{
-    ClientDisplayRuntime, attach_display_runtime, measured_terminal_size_hint,
-    spawn_daemon_display_bridge, spawn_runtime, terminal_size_hint,
+    attach_display_runtime, enable_terminal_image_support, measured_terminal_size_hint,
+    spawn_daemon_display_bridge, spawn_runtime, terminal_display_capabilities, terminal_size_hint,
+    ClientDisplayRuntime,
 };
-use crate::widgets::{FocusWidgets, SegmentedBarWidgets, SessionCardWidgets, build_segmented_bar};
+use crate::widgets::{GroupCardWidgets, SessionCardWidgets};
+use exaterm_core::config::{apply_app_config_environment, load_app_config};
 use exaterm_core::model::{
     blocking_prompt_launch, planning_stream_launch, running_stream_launch, ssh_shell_launch,
     user_shell_launch,
 };
 use exaterm_core::observation::{
-    SessionObservation, apply_stream_update, build_naming_evidence, build_tactical_evidence,
-    is_bare_waiting_shell, refresh_observation as refresh_session_observation,
-    scrollback_fragments,
+    apply_stream_update, refresh_observation as refresh_session_observation, SessionObservation,
 };
 use exaterm_core::runtime::{RuntimeEvent, SessionRuntime};
-use exaterm_core::synthesis::{
-    NamingEvidence, ProviderCallResult, ProviderPreferences, SynthesisBackendRegistry,
-    SynthesisProvider, TacticalEvidence, name_signature, should_skip_repeated_paused_summary,
-    summary_signature, summary_substantive_signature,
+use exaterm_types::model::{
+    GroupId, SessionId, SessionLaunch, SessionRecord, SupervisedGroupRecord, WorkspaceItem,
 };
-use exaterm_types::model::{SessionId, SessionLaunch, SessionRecord};
-use exaterm_types::proto::{ClientMessage, ObservationSnapshot, ServerMessage, WorkspaceSnapshot};
-use exaterm_types::synthesis::{AttentionLevel, NameSuggestion, TacticalState, TacticalSynthesis};
+use exaterm_types::proto::{
+    ClientMessage, InputSyncScope, ObservationSnapshot, ServerMessage, WorkspaceSnapshot,
+};
 use exaterm_ui::beachhead::{parse_run_mode, BeachheadTarget, ParsedArgs, RunMode};
-use exaterm_ui::layout::{
-    battlefield_can_embed_terminals, compute_tiling, GridTiling,
-    visible_scrollback_line_capacity as layout_visible_scrollback_line_capacity,
-};
-use exaterm_ui::presentation::{
-    ChromeVisibility as CardChromeVisibility, attention_bar_presentation, chrome_visibility,
-    combined_focus_summary_text, nudge_state_presentation, status_chip_label,
-};
-use exaterm_ui::supervision::{
-    BattleCardStatus, BattleCardViewModel, ObservedActivity, SignalTone, build_battle_card,
-};
+use exaterm_ui::layout::{compute_tiling, GridTiling};
 use exaterm_ui::workspace_view::WorkspaceViewState;
 use gtk::gdk;
 use gtk::prelude::*;
 use libadwaita as adw;
 use libadwaita::prelude::*;
-use pangocairo::functions::show_layout;
 use portable_pty::PtySize;
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::os::fd::AsRawFd;
-use std::os::unix::net::UnixStream;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
-use std::thread;
 use std::time::{Duration, Instant};
 use vte::prelude::*;
 use vte4 as vte;
 
-const APP_ID: &str = "io.exaterm.Exaterm";
+pub(crate) const APP_ID: &str = "io.exaterm.Exaterm";
 const TERMINATOR_AMBIENCE_FOREGROUND: &str = "#ffffff";
 const TERMINATOR_AMBIENCE_BACKGROUND: &str = "#000000";
 const TERMINATOR_AMBIENCE_PALETTE: [&str; 16] = [
     "#2e3436", "#cc0000", "#4e9a06", "#c4a000", "#3465a4", "#75507b", "#06989a", "#d3d7cf",
     "#555753", "#ef2929", "#8ae234", "#fce94f", "#729fcf", "#ad7fa8", "#34e2e2", "#eeeeec",
 ];
-const PROVIDER_DEMOTION_COOLDOWN: Duration = Duration::from_secs(300);
-
-struct SummaryWorker {
-    requests: mpsc::Sender<SummaryJob>,
-    responses: mpsc::Receiver<SummaryResult>,
-}
-
-struct NamingWorker {
-    requests: mpsc::Sender<NamingJob>,
-    responses: mpsc::Receiver<NamingResult>,
-}
-
-struct NamingJob {
-    session_id: SessionId,
-    signature: String,
-    evidence: NamingEvidence,
-    preferences: ProviderPreferences,
-}
-
-struct NamingResult {
-    session_id: SessionId,
-    signature: String,
-    suggestion: ProviderCallResult<NameSuggestion>,
-}
-
-struct SummaryJob {
-    session_id: SessionId,
-    signature: String,
-    substantive_signature: String,
-    evidence: TacticalEvidence,
-    preferences: ProviderPreferences,
-}
-
-struct SummaryResult {
-    session_id: SessionId,
-    signature: String,
-    substantive_signature: String,
-    summary: ProviderCallResult<TacticalSynthesis>,
-}
-
-struct SummaryCacheEntry {
-    first_seen: Instant,
-    completed_signature: Option<String>,
-    completed_substantive_signature: Option<String>,
-    requested_signature: Option<String>,
-    last_summary: Option<TacticalSynthesis>,
-    last_error: Option<String>,
-    last_attempt: Option<Instant>,
-    in_flight: bool,
-    skipped_providers: BTreeMap<SynthesisProvider, Instant>,
-}
-
-struct NamingCacheEntry {
-    completed_signature: Option<String>,
-    requested_signature: Option<String>,
-    last_name: Option<String>,
-    last_error: Option<String>,
-    last_attempt: Option<Instant>,
-    in_flight: bool,
-    skipped_providers: BTreeMap<SynthesisProvider, Instant>,
-}
-
-pub(crate) struct NudgeCacheEntry {
-    pub(crate) enabled: bool,
-    pub(crate) hovered: bool,
-    pub(crate) last_sent: Option<Instant>,
-}
-
-impl SummaryCacheEntry {
-    fn new() -> Self {
-        Self {
-            first_seen: Instant::now(),
-            completed_signature: None,
-            completed_substantive_signature: None,
-            requested_signature: None,
-            last_summary: None,
-            last_error: None,
-            last_attempt: None,
-            in_flight: false,
-            skipped_providers: BTreeMap::new(),
-        }
-    }
-}
-
-fn summary_refresh_interval(_session_age: Duration) -> Duration {
-    Duration::from_secs(5 * 60)
-}
-
-impl NamingCacheEntry {
-    fn new() -> Self {
-        Self {
-            completed_signature: None,
-            requested_signature: None,
-            last_name: None,
-            last_error: None,
-            last_attempt: None,
-            in_flight: false,
-            skipped_providers: BTreeMap::new(),
-        }
-    }
-}
-
-impl NudgeCacheEntry {
-    pub(crate) fn new() -> Self {
-        Self {
-            enabled: false,
-            hovered: false,
-            last_sent: None,
-        }
-    }
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CardChromeMode {
-    SparseShell,
-    Summarized,
+enum GroupAssessment {
+    Watching,
+    Active,
+    Stalling,
+    Blocked,
+    Complete,
 }
 
-impl CardChromeMode {
-    fn from_summary(summary: Option<&TacticalSynthesis>) -> Self {
-        if summary.is_some() {
-            Self::Summarized
-        } else {
-            Self::SparseShell
+impl GroupAssessment {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Watching => "Watching",
+            Self::Active => "Active",
+            Self::Stalling => "Stalling",
+            Self::Blocked => "Blocked",
+            Self::Complete => "Complete",
         }
     }
 
-    fn summarized(self) -> bool {
-        matches!(self, Self::Summarized)
+    fn card_class(self) -> &'static str {
+        match self {
+            Self::Watching => "group-assessment-watching",
+            Self::Active => "group-assessment-active",
+            Self::Stalling => "group-assessment-stalling",
+            Self::Blocked => "group-assessment-blocked",
+            Self::Complete => "group-assessment-complete",
+        }
+    }
+
+    fn status_class(self) -> &'static str {
+        match self {
+            Self::Watching => "group-status-watching",
+            Self::Active => "group-status-active",
+            Self::Stalling => "group-status-stalling",
+            Self::Blocked => "group-status-blocked",
+            Self::Complete => "group-status-complete",
+        }
     }
 }
 
-fn card_chrome_visibility(
-    chrome_mode: CardChromeMode,
-    focus_mode: bool,
-    has_operator_summary: bool,
-) -> CardChromeVisibility {
-    chrome_visibility(chrome_mode.summarized(), focus_mode, has_operator_summary)
-}
+const GROUP_ASSESSMENT_CARD_CLASSES: [&str; 5] = [
+    "group-assessment-watching",
+    "group-assessment-active",
+    "group-assessment-stalling",
+    "group-assessment-blocked",
+    "group-assessment-complete",
+];
+
+const GROUP_STATUS_CLASSES: [&str; 5] = [
+    "group-status-watching",
+    "group-status-active",
+    "group-status-stalling",
+    "group-status-blocked",
+    "group-status-complete",
+];
 
 pub(crate) struct AppContext {
     mode: RunMode,
     pub(crate) beachhead: Option<BeachheadConnection>,
     pub(crate) state: Rc<RefCell<WorkspaceViewState>>,
     title: adw::WindowTitle,
+    back_to_root_button: gtk::Button,
     empty_state: gtk::Box,
-    content_root: gtk::Box,
     cards: gtk::Grid,
     battlefield_panel: gtk::ScrolledWindow,
     cached_tiling: RefCell<Option<GridTiling>>,
-    pub(crate) sync_inputs_enabled: Arc<AtomicBool>,
-    pub(crate) sync_inputs_permitted: Arc<AtomicBool>,
-    pub(crate) raw_input_writers: Arc<Mutex<BTreeMap<SessionId, Arc<Mutex<UnixStream>>>>>,
-    focus: FocusWidgets,
+    cached_layout_items: RefCell<Vec<WorkspaceItem>>,
+    expanded_group: Cell<Option<GroupId>>,
+    pre_group_window_size: Cell<Option<(i32, i32)>>,
+    terminal_assist_request_id: Cell<u64>,
+    terminal_assist_active: RefCell<Option<TerminalAssistState>>,
+    initial_terminal_focus_done: Cell<bool>,
+    focused_terminal_id: Cell<Option<SessionId>>,
+    focus_next_added_terminal: Cell<bool>,
+    sync_inputs_enabled: Cell<bool>,
+    pending_supervisor_visibility: RefCell<BTreeMap<GroupId, bool>>,
+    terminal_audible_bell: bool,
     session_cards: RefCell<BTreeMap<SessionId, SessionCardWidgets>>,
+    group_cards: RefCell<BTreeMap<GroupId, GroupCardWidgets>>,
     observations: RefCell<BTreeMap<SessionId, SessionObservation>>,
     raw_stream_socket_names: RefCell<BTreeMap<SessionId, String>>,
     pub(crate) runtimes: RefCell<BTreeMap<SessionId, SessionRuntime>>,
     display_runtimes: RefCell<BTreeMap<SessionId, ClientDisplayRuntime>>,
-    summary_worker: Option<SummaryWorker>,
-    summary_cache: RefCell<BTreeMap<SessionId, SummaryCacheEntry>>,
-    naming_worker: Option<NamingWorker>,
-    naming_cache: RefCell<BTreeMap<SessionId, NamingCacheEntry>>,
-    pub(crate) nudge_cache: RefCell<BTreeMap<SessionId, NudgeCacheEntry>>,
     closing_confirmed: Cell<bool>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TerminalAssistState {
+    session_id: SessionId,
+    request_id: Option<u64>,
 }
 
 pub fn run() -> glib::ExitCode {
@@ -242,10 +149,6 @@ pub fn run() -> glib::ExitCode {
         }
     };
 
-    if let Some(workspace) = &parsed.workspace {
-        std::env::set_var("EXATERM_WORKSPACE", workspace.id());
-    }
-
     let app = gtk::Application::builder()
         .application_id(APP_ID)
         .flags(gio::ApplicationFlags::NON_UNIQUE)
@@ -254,7 +157,13 @@ pub fn run() -> glib::ExitCode {
         adw::init().expect("libadwaita should initialize");
         adw::StyleManager::default().set_color_scheme(adw::ColorScheme::ForceDark);
     });
-    app.connect_activate(move |app| build_ui(app, parsed.clone()));
+    app.connect_activate(move |app| {
+        if parsed.workspace.is_some() || visual_gallery_enabled() {
+            launch_workspace(app, parsed.clone());
+        } else {
+            crate::launcher::present_launcher(app, parsed.clone());
+        }
+    });
     let program = argv
         .first()
         .cloned()
@@ -266,7 +175,16 @@ pub(crate) fn daemon_backed(context: &AppContext) -> bool {
     context.beachhead.is_some()
 }
 
-fn build_ui(app: &gtk::Application, parsed: ParsedArgs) {
+pub(crate) fn launch_workspace(app: &gtk::Application, parsed: ParsedArgs) {
+    apply_app_config_environment(&load_app_config());
+    match parsed.workspace.as_ref() {
+        Some(workspace) => std::env::set_var("EXATERM_WORKSPACE", workspace.id()),
+        None => std::env::remove_var("EXATERM_WORKSPACE"),
+    }
+    build_ui(app, parsed);
+}
+
+pub(crate) fn build_ui(app: &gtk::Application, parsed: ParsedArgs) {
     load_css();
     configure_app_icons(APP_ID);
     let mode = parsed.mode.clone();
@@ -332,139 +250,6 @@ fn build_ui(app: &gtk::Application, parsed: ParsedArgs) {
     empty_state.append(&empty_title);
     empty_state.append(&empty_body);
 
-    let focus_title = gtk::Label::builder()
-        .xalign(0.0)
-        .css_classes(vec!["card-title".to_string()])
-        .build();
-    focus_title.set_single_line_mode(true);
-    focus_title.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    focus_title.set_max_width_chars(18);
-    let focus_status = gtk::Label::builder()
-        .xalign(0.5)
-        .css_classes(vec!["card-status".to_string(), "battle-active".to_string()])
-        .label("Active")
-        .build();
-    let focus_headline = gtk::Label::builder()
-        .xalign(0.0)
-        .wrap(true)
-        .hexpand(true)
-        .visible(false)
-        .css_classes(vec![
-            "card-headline".to_string(),
-            "focus-headline".to_string(),
-        ])
-        .build();
-    focus_headline.set_lines(2);
-    focus_headline.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    focus_headline.set_max_width_chars(30);
-    let focus_attention_pill = gtk::Label::builder()
-        .xalign(0.0)
-        .visible(false)
-        .css_classes(vec!["focus-attention-pill".to_string()])
-        .build();
-    focus_attention_pill.set_valign(gtk::Align::End);
-    let focus_alert = gtk::Label::builder()
-        .xalign(0.0)
-        .wrap(true)
-        .hexpand(true)
-        .css_classes(vec!["card-alert".to_string()])
-        .build();
-    focus_alert.set_halign(gtk::Align::Fill);
-    focus_alert.set_single_line_mode(true);
-    focus_alert.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    let focus_terminal_slot = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .hexpand(true)
-        .vexpand(true)
-        .build();
-    focus_terminal_slot.add_css_class("card-terminal-slot");
-    let focus_momentum_bar = build_segmented_bar("Attention Condition");
-    let focus_risk_bar = build_segmented_bar("Unused");
-
-    let focus_header_left = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(0)
-        .hexpand(true)
-        .build();
-    focus_header_left.add_css_class("card-title-stack");
-    focus_header_left.append(&focus_title);
-
-    let focus_header_right = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(0)
-        .halign(gtk::Align::End)
-        .valign(gtk::Align::Start)
-        .build();
-    focus_header_right.add_css_class("card-status-stack");
-    focus_header_right.append(&focus_status);
-
-    let focus_header = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(8)
-        .build();
-    focus_header.add_css_class("card-header-row");
-    focus_header.append(&focus_header_left);
-    focus_header.append(&focus_header_right);
-
-    let focus_bars = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(8)
-        .hexpand(true)
-        .build();
-    focus_bars.add_css_class("card-bars-row");
-    focus_bars.set_homogeneous(true);
-    focus_bars.append(&focus_momentum_bar.frame);
-    focus_bars.append(&focus_risk_bar.frame);
-
-    let focus_summary_box = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(8)
-        .hexpand(true)
-        .vexpand(true)
-        .visible(false)
-        .build();
-    focus_summary_box.add_css_class("focus-summary-box");
-    focus_summary_box.append(&focus_headline);
-    focus_summary_box.append(&focus_attention_pill);
-
-    let focus_content = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(8)
-        .margin_top(16)
-        .margin_bottom(16)
-        .margin_start(16)
-        .margin_end(16)
-        .hexpand(true)
-        .vexpand(true)
-        .build();
-    focus_content.append(&focus_header);
-    focus_content.append(&focus_summary_box);
-    focus_content.append(&focus_alert);
-    focus_content.append(&focus_terminal_slot);
-    focus_content.append(&focus_bars);
-
-    let focus_frame = gtk::Frame::builder()
-        .hexpand(true)
-        .vexpand(true)
-        .child(&focus_content)
-        .build();
-    focus_frame.add_css_class("battle-card");
-    focus_frame.add_css_class("single-card");
-
-    let focus_panel = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(10)
-        .margin_top(8)
-        .margin_bottom(18)
-        .margin_start(18)
-        .margin_end(18)
-        .hexpand(true)
-        .vexpand(true)
-        .visible(false)
-        .build();
-    focus_panel.add_css_class("focus-panel");
-    focus_panel.append(&focus_frame);
-
     let window_title = match &workspace_id {
         Some(id) => format!("exaterm · {id}"),
         None => "exaterm".into(),
@@ -475,10 +260,15 @@ fn build_ui(app: &gtk::Application, parsed: ParsedArgs) {
         .show_end_title_buttons(true)
         .build();
 
-    let add_terminal_button = gtk::Button::builder()
-        .label("+ Add Terminal")
+    let back_to_root_button = gtk::Button::builder()
+        .label("All Terminals")
+        .visible(false)
         .build();
+    back_to_root_button.add_css_class("toolbar-add-button");
+    let add_terminal_button = gtk::Button::builder().label("+ Add Terminal").build();
     add_terminal_button.add_css_class("toolbar-add-button");
+    let supervise_group_button = gtk::Button::builder().label("Supervise Group").build();
+    supervise_group_button.add_css_class("toolbar-add-button");
 
     let toolbar = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
@@ -490,7 +280,9 @@ fn build_ui(app: &gtk::Application, parsed: ParsedArgs) {
         .halign(gtk::Align::Start)
         .build();
     toolbar.add_css_class("battlefield-toolbar");
+    toolbar.append(&back_to_root_button);
     toolbar.append(&add_terminal_button);
+    toolbar.append(&supervise_group_button);
 
     let sync_inputs_button = gtk::ToggleButton::builder()
         .label("Sync Inputs")
@@ -508,7 +300,6 @@ fn build_ui(app: &gtk::Application, parsed: ParsedArgs) {
     content_root.append(&toolbar);
     content_root.append(&empty_state);
     content_root.append(&battlefield_panel);
-    content_root.append(&focus_panel);
 
     let body = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -530,49 +321,38 @@ fn build_ui(app: &gtk::Application, parsed: ParsedArgs) {
         beachhead,
         state: Rc::new(RefCell::new(WorkspaceViewState::new())),
         title,
+        back_to_root_button,
         empty_state,
-        content_root,
         cards,
         battlefield_panel,
         cached_tiling: RefCell::new(None),
-        sync_inputs_enabled: Arc::new(AtomicBool::new(false)),
-        sync_inputs_permitted: Arc::new(AtomicBool::new(true)),
-        raw_input_writers: Arc::new(Mutex::new(BTreeMap::new())),
-        focus: FocusWidgets {
-            panel: focus_panel,
-            frame: focus_frame,
-            header: focus_header,
-            title: focus_title,
-            status: focus_status,
-            summary_box: focus_summary_box,
-            headline: focus_headline,
-            attention_pill: focus_attention_pill,
-            alert: focus_alert,
-            terminal_slot: focus_terminal_slot,
-            bars: focus_bars,
-            momentum_bar: focus_momentum_bar,
-            risk_bar: focus_risk_bar,
-        },
+        cached_layout_items: RefCell::new(Vec::new()),
+        expanded_group: Cell::new(None),
+        pre_group_window_size: Cell::new(None),
+        terminal_assist_request_id: Cell::new(1),
+        terminal_assist_active: RefCell::new(None),
+        initial_terminal_focus_done: Cell::new(false),
+        focused_terminal_id: Cell::new(None),
+        focus_next_added_terminal: Cell::new(false),
+        sync_inputs_enabled: Cell::new(false),
+        pending_supervisor_visibility: RefCell::new(BTreeMap::new()),
+        terminal_audible_bell: load_app_config().terminal.audible_bell,
         session_cards: RefCell::new(BTreeMap::new()),
+        group_cards: RefCell::new(BTreeMap::new()),
         observations: RefCell::new(BTreeMap::new()),
         raw_stream_socket_names: RefCell::new(BTreeMap::new()),
         runtimes: RefCell::new(BTreeMap::new()),
         display_runtimes: RefCell::new(BTreeMap::new()),
-        summary_worker: if visual_gallery_enabled() {
-            spawn_summary_worker()
-        } else {
-            None
-        },
-        summary_cache: RefCell::new(BTreeMap::new()),
-        naming_worker: if visual_gallery_enabled() {
-            spawn_naming_worker()
-        } else {
-            None
-        },
-        naming_cache: RefCell::new(BTreeMap::new()),
-        nudge_cache: RefCell::new(BTreeMap::new()),
         closing_confirmed: Cell::new(false),
     });
+
+    {
+        let button = context.back_to_root_button.clone();
+        let context = context.clone();
+        button.connect_clicked(move |_| {
+            show_top_level_battlefield(&context);
+        });
+    }
 
     {
         let context = context.clone();
@@ -583,10 +363,20 @@ fn build_ui(app: &gtk::Application, parsed: ParsedArgs) {
 
     {
         let context = context.clone();
+        supervise_group_button.connect_clicked(move |_| {
+            create_supervised_group_from_visible_sessions(&context);
+        });
+    }
+
+    {
+        let context = context.clone();
         sync_inputs_button.connect_toggled(move |button| {
-            context
-                .sync_inputs_enabled
-                .store(button.is_active(), Ordering::Relaxed);
+            context.sync_inputs_enabled.set(button.is_active());
+            sync_input_scope_with_daemon(&context);
+            if button.is_active() {
+                focus_sync_input_anchor(&context);
+            }
+            refresh_card_styles(&context);
         });
     }
 
@@ -594,16 +384,33 @@ fn build_ui(app: &gtk::Application, parsed: ParsedArgs) {
         let context = context.clone();
         let keys = gtk::EventControllerKey::new();
         keys.set_propagation_phase(gtk::PropagationPhase::Capture);
-        keys.connect_key_pressed(move |_, key, _, _| {
-            let focused_session = context.state.borrow().focused_session();
-            if key == gdk::Key::Escape && focused_session.is_some() {
-                show_battlefield(&context);
+        keys.connect_key_pressed(move |_, key, _, state| {
+            if context.terminal_assist_active.borrow().is_some() {
+                if matches!(key, gdk::Key::k | gdk::Key::K)
+                    && state.contains(gdk::ModifierType::CONTROL_MASK)
+                {
+                    focus_active_terminal_assist(&context);
+                    return glib::Propagation::Stop;
+                }
+                return glib::Propagation::Proceed;
+            }
+
+            if matches!(key, gdk::Key::k | gdk::Key::K)
+                && state.contains(gdk::ModifierType::CONTROL_MASK)
+            {
+                show_terminal_assist_prompt(&context);
                 return glib::Propagation::Stop;
             }
 
-            if focused_session.is_none() && matches!(key, gdk::Key::Return | gdk::Key::KP_Enter) {
-                if focused_embedded_terminal_session(&context).is_some() {
+            if matches!(key, gdk::Key::Return | gdk::Key::KP_Enter) {
+                if focused_visible_terminal_session(&context).is_some() {
                     return glib::Propagation::Proceed;
+                }
+                if let Some(WorkspaceItem::Group(group_id)) =
+                    context.state.borrow().selected_workspace_item()
+                {
+                    show_group_contents(&context, group_id);
+                    return glib::Propagation::Stop;
                 }
                 let selected_session = context.state.borrow().selected_session();
                 if let Some(session_id) = selected_session {
@@ -612,11 +419,9 @@ fn build_ui(app: &gtk::Application, parsed: ParsedArgs) {
                             if card.terminal.has_focus() {
                                 return glib::Propagation::Proceed;
                             }
-                            card.terminal.grab_focus();
                         }
                         refresh_card_styles(&context);
-                    } else {
-                        show_intervention(&context, session_id);
+                        focus_session_terminal(&context, session_id);
                     }
                     return glib::Propagation::Stop;
                 }
@@ -652,6 +457,11 @@ fn build_ui(app: &gtk::Application, parsed: ParsedArgs) {
     } else if let Some(beachhead) = context.beachhead.as_ref() {
         let _ = beachhead
             .commands()
+            .send(ClientMessage::SetTerminalDisplayCapabilities {
+                capabilities: terminal_display_capabilities(),
+            });
+        let _ = beachhead
+            .commands()
             .send(ClientMessage::CreateOrResumeDefaultWorkspace);
     }
 
@@ -671,7 +481,7 @@ fn build_ui(app: &gtk::Application, parsed: ParsedArgs) {
 
             let dialog = adw::AlertDialog::builder()
                 .heading("Keep terminals alive?")
-                .body("Closing Exaterm can leave the local beachhead running so you can reconnect to the same live terminal later.")
+                .body("Closing Exaterm can keep these sessions running so you can reconnect to the same live terminals later.")
                 .close_response("cancel")
                 .build();
             dialog.add_responses(&[
@@ -714,6 +524,7 @@ fn build_ui(app: &gtk::Application, parsed: ParsedArgs) {
     }
 
     window.present();
+    maybe_focus_initial_terminal(&context);
 }
 
 fn parse_rgba(hex: &str) -> gdk::RGBA {
@@ -742,7 +553,7 @@ fn apply_terminal_theme(terminal: &vte::Terminal) {
 fn present_startup_error(app: &gtk::Application, error: &str) {
     let message = gtk::Label::builder()
         .label(format!(
-            "Exaterm could not start a live beachhead connection.\n\n{error}"
+            "Exaterm could not start a host connection.\n\n{error}"
         ))
         .wrap(true)
         .xalign(0.0)
@@ -818,7 +629,7 @@ fn append_session_card_with_spawn(
         .cloned()
         .expect("new session should exist");
 
-    let card = build_battle_card_widgets(context, &session);
+    let card = build_session_terminal_widgets(context, &session);
     context
         .session_cards
         .borrow_mut()
@@ -860,13 +671,13 @@ fn seed_visual_gallery(context: &Rc<AppContext>) {
             "Agent B",
             "Checkpointed UI pass",
             transcript_script(&[
-                "• I fixed the stuck focus path and the focused terminal now accepts Return again.",
+                "• I fixed the stuck input path and the active terminal now accepts Return again.",
                 "• Verified with cargo test plus a manual smoke pass.",
-                "• Next I can tighten battlefield density and typography if you want me to keep going.",
+                "• Next I can tighten grid density and typography if you want me to keep going.",
                 "• Current state is clean and ready for the next pass.",
                 "› Continue",
-                "• Larger typography is in and focus mode keeps context now.",
-                "• Tests pass. Ready for the next instruction or a keep-going nudge.",
+                "• Larger typography is in and the terminal grid keeps context now.",
+                "• Tests pass. Ready for the next instruction.",
             ]),
         ),
         blocking_prompt_launch(
@@ -878,15 +689,15 @@ fn seed_visual_gallery(context: &Rc<AppContext>) {
             "Agent D",
             "GTK focus regression",
             transcript_script(&[
-                "• I think the next failure is still the focus handoff, so I’m trying another narrow fix.",
-                "$ cargo test focus_mode -- --nocapture",
-                "error[E0599]: no method named present on FocusHandle",
+                "• I think the next failure is still the terminal handoff, so I’m trying another narrow fix.",
+                "$ cargo test terminal_grid -- --nocapture",
+                "error[E0599]: no method named present on TerminalHandle",
                 "• That patch was wrong; I’m retrying with a different signal hookup.",
-                "$ cargo test focus_mode -- --nocapture",
-                "error[E0599]: no method named present on FocusHandle",
+                "$ cargo test terminal_grid -- --nocapture",
+                "error[E0599]: no method named present on TerminalHandle",
                 "• Still wrong. I’m going to try another approach on the same path.",
-                "$ cargo test focus_mode -- --nocapture",
-                "error[E0599]: no method named present on FocusHandle",
+                "$ cargo test terminal_grid -- --nocapture",
+                "error[E0599]: no method named present on TerminalHandle",
             ]),
         ),
         planning_stream_launch(
@@ -935,223 +746,27 @@ fn transcript_script(lines: &[&str]) -> String {
     format!("{quoted}; exec sleep 600")
 }
 
-fn build_battle_card_widgets(
+fn build_session_terminal_widgets(
     context: &Rc<AppContext>,
     session: &SessionRecord,
 ) -> SessionCardWidgets {
-    let title = gtk::Label::builder()
-        .label("")
-        .xalign(0.0)
-        .css_classes(vec!["card-title".to_string()])
-        .build();
-    title.set_single_line_mode(true);
-    title.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    title.set_max_width_chars(40);
-    let status = gtk::Label::builder()
-        .label("Active")
-        .xalign(0.5)
-        .css_classes(vec!["card-status".to_string(), "battle-active".to_string()])
-        .build();
-    let nudge_state = gtk::Label::builder()
-        .label("AUTONUDGE OFF")
-        .xalign(0.5)
-        .css_classes(vec![
-            "card-control-state".to_string(),
-            "card-control-off".to_string(),
-        ])
-        .build();
-    nudge_state.set_single_line_mode(true);
-    nudge_state.set_wrap(false);
-    nudge_state.set_hexpand(false);
-    nudge_state.set_vexpand(false);
-    nudge_state.set_halign(gtk::Align::End);
-    nudge_state.set_valign(gtk::Align::Center);
-    let nudge_row = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(8)
-        .hexpand(false)
-        .halign(gtk::Align::End)
-        .visible(false)
-        .build();
-    nudge_row.set_valign(gtk::Align::Center);
-    nudge_row.add_css_class("card-control-row");
-    nudge_row.append(&nudge_state);
-    let recency = gtk::Label::builder()
-        .label("recency unknown")
-        .xalign(1.0)
-        .css_classes(vec!["card-recency".to_string()])
-        .build();
-    recency.set_hexpand(true);
-    recency.set_halign(gtk::Align::End);
-    let headline = gtk::Label::builder()
-        .xalign(0.0)
-        .wrap(true)
-        .hexpand(true)
-        .halign(gtk::Align::Fill)
-        .visible(false)
-        .css_classes(vec!["card-headline".to_string()])
-        .build();
-    headline.set_lines(2);
-    headline.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    headline.set_max_width_chars(18);
-    let alert = gtk::Label::builder()
-        .xalign(0.0)
-        .wrap(true)
-        .hexpand(true)
-        .css_classes(vec!["card-alert".to_string()])
-        .build();
-    alert.set_halign(gtk::Align::Fill);
-    alert.set_single_line_mode(true);
-    alert.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    nudge_row.prepend(&alert);
-    let headline_row = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(8)
-        .hexpand(true)
-        .halign(gtk::Align::Fill)
-        .visible(false)
-        .build();
-    headline_row.set_valign(gtk::Align::Start);
-    headline_row.append(&headline);
-    headline_row.append(&nudge_row);
-    let attention_pill = gtk::Label::builder()
-        .xalign(0.0)
-        .visible(false)
-        .css_classes(vec![
-            "focus-attention-pill".to_string(),
-            "rail-attention-pill".to_string(),
-        ])
-        .build();
-    attention_pill.set_valign(gtk::Align::End);
-    let momentum_bar = build_segmented_bar("Attention Condition");
-    let risk_bar = build_segmented_bar("Unused");
-
-    let header_left = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(0)
-        .hexpand(true)
-        .build();
-    header_left.add_css_class("card-title-stack");
-    header_left.append(&title);
-
-    let header_right = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(0)
-        .halign(gtk::Align::End)
-        .valign(gtk::Align::Start)
-        .build();
-    header_right.add_css_class("card-status-stack");
-    header_right.append(&status);
-
-    let header = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(8)
-        .build();
-    header.add_css_class("card-header-row");
-    header.append(&header_left);
-    header.append(&header_right);
-
-    let scrollback_lines = Rc::new(RefCell::new(Vec::<String>::new()));
-    let scrollback_content = gtk::DrawingArea::builder()
-        .hexpand(true)
-        .vexpand(true)
-        .build();
-    scrollback_content.set_content_width(0);
-    scrollback_content.set_content_height(0);
-    {
-        let scrollback_lines = scrollback_lines.clone();
-        scrollback_content.set_draw_func(move |area, cr, width, height| {
-            const H_MARGIN: i32 = 10;
-            const V_MARGIN: i32 = 8;
-
-            let text = {
-                let lines = scrollback_lines.borrow();
-                if lines.is_empty() {
-                    " ".to_string()
-                } else {
-                    lines.join("\n")
-                }
-            };
-
-            let layout = area.create_pango_layout(Some(&text));
-            layout.set_font_description(Some(&gtk::pango::FontDescription::from_string(
-                "Monospace 7",
-            )));
-            layout.set_spacing(4 * gtk::pango::SCALE);
-            layout.set_width(((width - (H_MARGIN * 2)).max(0)) * gtk::pango::SCALE);
-
-            let (_, text_height) = layout.pixel_size();
-            let x = H_MARGIN as f64;
-            let y = (height - V_MARGIN - text_height) as f64;
-
-            cr.rectangle(0.0, 0.0, width as f64, height as f64);
-            cr.clip();
-            cr.move_to(x, y);
-            cr.set_source_rgba(202.0 / 255.0, 214.0 / 255.0, 227.0 / 255.0, 0.88);
-            show_layout(cr, &layout);
-        });
-    }
-    scrollback_content.add_css_class("card-scrollback-view");
-    let scrollback_band = gtk::Frame::builder()
-        .hexpand(true)
-        .vexpand(true)
-        .child(&scrollback_content)
-        .build();
-    scrollback_band.set_overflow(gtk::Overflow::Hidden);
-    scrollback_band.add_css_class("card-scrollback-frame");
     let terminal_slot = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .hexpand(true)
         .vexpand(true)
         .build();
     terminal_slot.add_css_class("card-terminal-slot");
-    let middle_stack = gtk::Stack::builder()
-        .hexpand(true)
-        .vexpand(true)
-        .transition_type(gtk::StackTransitionType::Crossfade)
-        .build();
-    middle_stack.add_named(&terminal_slot, Some("terminal"));
-    middle_stack.add_named(&scrollback_band, Some("scrollback"));
-    middle_stack.set_visible_child_name("scrollback");
-
-    let footer = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(8)
-        .build();
-    footer.add_css_class("card-bottom-stack");
-    let bars = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(8)
-        .hexpand(true)
-        .build();
-    bars.add_css_class("card-bars-row");
-    bars.append(&momentum_bar.frame);
-    bars.append(&risk_bar.frame);
-    footer.append(&bars);
-    let footer_meta = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .hexpand(true)
-        .halign(gtk::Align::Fill)
-        .build();
-    footer_meta.add_css_class("card-footer-meta");
-    footer_meta.append(&recency);
-    footer.append(&footer_meta);
 
     let content = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
-        .spacing(8)
-        .margin_top(16)
-        .margin_bottom(16)
-        .margin_start(16)
-        .margin_end(16)
+        .margin_top(8)
+        .margin_bottom(8)
+        .margin_start(8)
+        .margin_end(8)
         .hexpand(true)
         .vexpand(true)
         .build();
-    content.append(&header);
-    content.append(&headline_row);
-    content.append(&attention_pill);
-    content.append(&middle_stack);
-    content.append(&footer);
+    content.append(&terminal_slot);
 
     let frame = gtk::Frame::builder()
         .child(&content)
@@ -1160,7 +775,8 @@ fn build_battle_card_widgets(
         .halign(gtk::Align::Fill)
         .valign(gtk::Align::Fill)
         .build();
-    frame.add_css_class("battle-card");
+    frame.add_css_class("terminal-tile");
+    frame.add_css_class("terminal-card");
     frame.set_focusable(true);
 
     {
@@ -1169,22 +785,9 @@ fn build_battle_card_widgets(
         let click = gtk::GestureClick::new();
         click.set_button(1);
         click.connect_released(move |_, _, _, _| {
-            let focused_before = context.state.borrow().focused_session();
             context.state.borrow_mut().select_session(session_id);
-            if let Some(focused_session) = focused_before {
-                if focused_session == session_id {
-                    show_battlefield(&context);
-                }
-                return;
-            }
-            if battlefield_embeds_terminal(&context, session_id) {
-                if let Some(card) = context.session_cards.borrow().get(&session_id) {
-                    card.terminal.grab_focus();
-                }
-                refresh_card_styles(&context);
-            } else {
-                show_intervention(&context, session_id);
-            }
+            refresh_card_styles(&context);
+            focus_session_terminal(&context, session_id);
         });
         frame.add_controller(click);
     }
@@ -1222,7 +825,10 @@ fn build_battle_card_widgets(
                 .iter()
                 .position(|id| *id == target_session_id)
                 .unwrap_or(0);
-            context.state.borrow_mut().move_session(source_id, target_index);
+            context
+                .state
+                .borrow_mut()
+                .move_session(source_id, target_index);
             *context.cached_tiling.borrow_mut() = None;
             sync_grid_layout(&context);
             refresh_card_styles(&context);
@@ -1232,12 +838,14 @@ fn build_battle_card_widgets(
     }
 
     let terminal = vte::Terminal::builder()
+        .audible_bell(context.terminal_audible_bell)
         .scroll_on_output(false)
         .scroll_on_keystroke(true)
         .input_enabled(true)
         .hexpand(true)
         .vexpand(true)
         .build();
+    enable_terminal_image_support(&terminal);
     apply_terminal_theme(&terminal);
     terminal.set_scrollback_lines(100_000);
     terminal.connect_selection_changed(|terminal| {
@@ -1245,20 +853,138 @@ fn build_battle_card_widgets(
             terminal.copy_clipboard_format(vte::Format::Text);
         }
     });
+    let terminal_dim_overlay = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .hexpand(true)
+        .vexpand(true)
+        .visible(true)
+        .build();
+    terminal_dim_overlay.add_css_class("terminal-dim-overlay");
+    terminal_dim_overlay.set_can_target(false);
+    terminal_dim_overlay.set_focusable(false);
     {
-        let context = context.clone();
+        let enter_context = context.clone();
+        let dim_overlay_for_enter = terminal_dim_overlay.clone();
         let session_id = session.id;
         let terminal_focus = gtk::EventControllerFocus::new();
         terminal_focus.connect_enter(move |_| {
             {
-                let mut state = context.state.borrow_mut();
+                let mut state = enter_context.state.borrow_mut();
                 state.select_session(session_id);
-                state.set_terminal_focus(Some(session_id));
             }
-            refresh_card_styles(&context);
+            enter_context.focused_terminal_id.set(Some(session_id));
+            dim_overlay_for_enter.set_visible(false);
+            refresh_card_styles(&enter_context);
+        });
+        let leave_context = context.clone();
+        let dim_overlay_for_leave = terminal_dim_overlay.clone();
+        terminal_focus.connect_leave(move |_| {
+            if leave_context.focused_terminal_id.get() == Some(session_id) {
+                leave_context.focused_terminal_id.set(None);
+            }
+            dim_overlay_for_leave.set_visible(true);
+            refresh_card_styles(&leave_context);
         });
         terminal.add_controller(terminal_focus);
     }
+    let terminal_assist_status = gtk::Label::builder()
+        .label("Ask for a terminal command")
+        .xalign(0.0)
+        .hexpand(true)
+        .css_classes(vec!["terminal-assist-status".to_string()])
+        .build();
+    terminal_assist_status.set_wrap(true);
+    let terminal_assist_entry = gtk::Entry::builder()
+        .placeholder_text("Find how much disk space I'm using")
+        .hexpand(true)
+        .build();
+    terminal_assist_entry.add_css_class("terminal-assist-entry");
+    let terminal_assist_spinner = gtk::Spinner::builder().visible(false).build();
+    let terminal_assist_cancel = gtk::Button::builder().label("Cancel").build();
+    terminal_assist_cancel.add_css_class("terminal-assist-cancel");
+
+    let terminal_assist_action_row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(8)
+        .hexpand(true)
+        .build();
+    terminal_assist_action_row.append(&terminal_assist_entry);
+    terminal_assist_action_row.append(&terminal_assist_spinner);
+    terminal_assist_action_row.append(&terminal_assist_cancel);
+
+    let terminal_assist_panel = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(10)
+        .halign(gtk::Align::Fill)
+        .valign(gtk::Align::Center)
+        .hexpand(true)
+        .build();
+    terminal_assist_panel.add_css_class("terminal-assist-panel");
+    terminal_assist_panel.append(&terminal_assist_status);
+    terminal_assist_panel.append(&terminal_assist_action_row);
+
+    let terminal_assist_overlay = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .hexpand(true)
+        .vexpand(true)
+        .visible(false)
+        .build();
+    terminal_assist_overlay.add_css_class("terminal-assist-overlay");
+    terminal_assist_overlay.set_can_target(true);
+    terminal_assist_overlay.set_focusable(true);
+    terminal_assist_overlay.append(&terminal_assist_panel);
+
+    {
+        let context = context.clone();
+        let session_id = session.id;
+        terminal_assist_entry.connect_activate(move |entry| {
+            submit_terminal_assist_query(&context, session_id, entry.text().trim().to_string());
+        });
+    }
+    {
+        let context = context.clone();
+        let session_id = session.id;
+        terminal_assist_cancel.connect_clicked(move |_| {
+            cancel_terminal_assist(&context, session_id);
+        });
+    }
+    {
+        let context = context.clone();
+        let session_id = session.id;
+        let assist_keys = gtk::EventControllerKey::new();
+        assist_keys.connect_key_pressed(move |_, key, _, _| {
+            if key == gdk::Key::Escape {
+                cancel_terminal_assist(&context, session_id);
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        });
+        terminal_assist_entry.add_controller(assist_keys);
+    }
+    {
+        let context = context.clone();
+        let session_id = session.id;
+        let assist_keys = gtk::EventControllerKey::new();
+        assist_keys.connect_key_pressed(move |_, key, _, _| {
+            if key == gdk::Key::Escape {
+                cancel_terminal_assist(&context, session_id);
+            }
+            glib::Propagation::Stop
+        });
+        terminal_assist_overlay.add_controller(assist_keys);
+    }
+    {
+        let entry = terminal_assist_entry.clone();
+        let overlay_click = gtk::GestureClick::new();
+        overlay_click.set_button(1);
+        overlay_click.connect_pressed(move |_, _, _, _| {
+            if entry.is_sensitive() {
+                entry.grab_focus();
+            }
+        });
+        terminal_assist_overlay.add_controller(overlay_click);
+    }
+
     terminal.add_css_class("terminal-surface");
     let terminal_view = gtk::ScrolledWindow::builder()
         .hexpand(true)
@@ -1268,8 +994,15 @@ fn build_battle_card_widgets(
         .child(&terminal)
         .build();
     terminal_view.add_css_class("terminal-scroll");
+    let terminal_overlay = gtk::Overlay::builder()
+        .child(&terminal_view)
+        .hexpand(true)
+        .vexpand(true)
+        .build();
+    terminal_overlay.add_overlay(&terminal_dim_overlay);
+    terminal_overlay.add_overlay(&terminal_assist_overlay);
+    terminal_slot.append(&terminal_overlay);
     install_terminal_context_menu(context, &terminal, session.id);
-    install_nudge_pill_interactions(context, &nudge_state, session.id);
     {
         let terminal_for_keys = terminal.clone();
         let paste_keys = gtk::EventControllerKey::new();
@@ -1287,37 +1020,678 @@ fn build_battle_card_widgets(
 
     SessionCardWidgets {
         frame,
-        header,
-        title,
-        status,
-        headline_row,
-        attention_pill,
-        nudge_row,
-        nudge_state,
-        recency,
-        middle_stack,
-        scrollback_band,
-        scrollback_content,
-        scrollback_lines,
         terminal_slot,
-        footer,
-        bars,
-        headline,
-        alert,
-        momentum_bar,
-        risk_bar,
-        terminal_view,
+        terminal_overlay,
+        terminal_dim_overlay,
+        terminal_assist_overlay,
+        terminal_assist_entry,
+        terminal_assist_status,
+        terminal_assist_spinner,
+        terminal_assist_cancel,
         terminal,
     }
 }
 
-fn ui_display_name(session: &SessionRecord, chrome_mode: CardChromeMode) -> String {
-    match chrome_mode {
-        CardChromeMode::SparseShell => String::new(),
-        CardChromeMode::Summarized => session
-            .display_name
-            .clone()
-            .unwrap_or_else(|| "New Session".into()),
+fn build_group_card_widgets(
+    context: &Rc<AppContext>,
+    group: &SupervisedGroupRecord,
+) -> GroupCardWidgets {
+    let title = gtk::Label::builder()
+        .label(&group.name)
+        .xalign(0.0)
+        .hexpand(true)
+        .css_classes(vec!["card-title".to_string()])
+        .build();
+    title.set_single_line_mode(true);
+    title.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    title.set_max_width_chars(42);
+
+    let subtitle = gtk::Label::builder()
+        .label("")
+        .xalign(0.0)
+        .hexpand(true)
+        .css_classes(vec!["group-subtitle".to_string()])
+        .build();
+    subtitle.set_single_line_mode(true);
+    subtitle.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    subtitle.set_max_width_chars(60);
+
+    let status = gtk::Label::builder()
+        .label("Watching")
+        .xalign(0.5)
+        .css_classes(vec!["card-status".to_string()])
+        .build();
+
+    let supervisor_toggle = gtk::ToggleButton::builder()
+        .label("Supervisor")
+        .active(group.supervisor_visible)
+        .sensitive(group.supervisor_session_id.is_some())
+        .build();
+    supervisor_toggle.add_css_class("toolbar-toggle-button");
+    let supervisor_toggle_updating = Rc::new(Cell::new(false));
+
+    let header_left = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(0)
+        .hexpand(true)
+        .build();
+    header_left.add_css_class("card-title-stack");
+    header_left.append(&title);
+    header_left.append(&subtitle);
+
+    let header_right = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(8)
+        .halign(gtk::Align::End)
+        .valign(gtk::Align::Start)
+        .build();
+    header_right.add_css_class("card-status-stack");
+    header_right.append(&status);
+    header_right.append(&supervisor_toggle);
+
+    let header = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(8)
+        .build();
+    header.add_css_class("card-header-row");
+    header.append(&header_left);
+    header.append(&header_right);
+
+    let summary_content = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(9)
+        .margin_top(14)
+        .margin_bottom(14)
+        .margin_start(14)
+        .margin_end(14)
+        .hexpand(true)
+        .vexpand(true)
+        .build();
+    summary_content.add_css_class("group-summary-content");
+    let rendered_summary_markdown = Rc::new(RefCell::new(String::new()));
+
+    let summary_view = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .hexpand(true)
+        .vexpand(true)
+        .child(&summary_content)
+        .build();
+    summary_view.add_css_class("group-summary-frame");
+
+    let terminal_slot = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .hexpand(true)
+        .vexpand(true)
+        .build();
+    terminal_slot.add_css_class("card-terminal-slot");
+
+    let middle_stack = gtk::Stack::builder()
+        .hexpand(true)
+        .vexpand(true)
+        .transition_type(gtk::StackTransitionType::Crossfade)
+        .build();
+    middle_stack.add_named(&summary_view, Some("summary"));
+    middle_stack.add_named(&terminal_slot, Some("terminal"));
+    middle_stack.set_visible_child_name("summary");
+
+    let content = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(10)
+        .margin_top(12)
+        .margin_bottom(12)
+        .margin_start(12)
+        .margin_end(12)
+        .hexpand(true)
+        .vexpand(true)
+        .build();
+    content.append(&header);
+    content.append(&middle_stack);
+
+    let frame = gtk::Frame::builder()
+        .child(&content)
+        .hexpand(true)
+        .vexpand(true)
+        .halign(gtk::Align::Fill)
+        .valign(gtk::Align::Fill)
+        .build();
+    frame.add_css_class("supervised-group-card");
+    frame.set_focusable(true);
+
+    {
+        let context = context.clone();
+        let group_id = group.id;
+        let frame_for_click = frame.clone();
+        let supervisor_toggle_for_click = supervisor_toggle.clone();
+        let click = gtk::GestureClick::new();
+        click.set_button(1);
+        click.connect_released(move |_, _, x, y| {
+            if point_inside_widget(&frame_for_click, &supervisor_toggle_for_click, x, y) {
+                return;
+            }
+            context
+                .state
+                .borrow_mut()
+                .select_workspace_item(WorkspaceItem::Group(group_id));
+            let supervisor_session = {
+                let state = context.state.borrow();
+                state.group(group_id).and_then(|group| {
+                    if display_supervisor_visible(&context, group) {
+                        group.supervisor_session_id
+                    } else {
+                        None
+                    }
+                })
+            };
+            if let Some(supervisor_session) = supervisor_session {
+                refresh_card_styles(&context);
+                focus_session_terminal(&context, supervisor_session);
+                return;
+            }
+            show_group_contents(&context, group_id);
+        });
+        frame.add_controller(click);
+    }
+
+    {
+        let context = context.clone();
+        let group_id = group.id;
+        let updating = supervisor_toggle_updating.clone();
+        supervisor_toggle.connect_toggled(move |button| {
+            if updating.get() {
+                return;
+            }
+            let visible = button.is_active();
+            context
+                .pending_supervisor_visibility
+                .borrow_mut()
+                .insert(group_id, visible);
+            if let Some(beachhead) = context.beachhead.as_ref() {
+                let _ = beachhead
+                    .commands()
+                    .send(ClientMessage::SetGroupSupervisorVisible { group_id, visible });
+            }
+            if let Some(group) = context.state.borrow().group(group_id).cloned() {
+                update_group_card_widgets(&context, &group);
+            }
+            sync_terminal_parents(&context);
+            refresh_card_styles(&context);
+            schedule_runtime_size_sync(&context);
+        });
+    }
+
+    GroupCardWidgets {
+        frame,
+        title,
+        subtitle,
+        status,
+        summary_content,
+        rendered_summary_markdown,
+        supervisor_toggle,
+        supervisor_toggle_updating,
+        middle_stack,
+        summary_view,
+        terminal_slot,
+    }
+}
+
+fn update_group_card_widgets(context: &Rc<AppContext>, group: &SupervisedGroupRecord) {
+    let Some(card) = context.group_cards.borrow().get(&group.id).cloned() else {
+        return;
+    };
+    let supervisor_visible = {
+        let mut pending = context.pending_supervisor_visibility.borrow_mut();
+        if pending.get(&group.id).copied() == Some(group.supervisor_visible) {
+            pending.remove(&group.id);
+        }
+        pending
+            .get(&group.id)
+            .copied()
+            .unwrap_or(group.supervisor_visible)
+    };
+
+    let assessment = group_assessment_from_markdown(&group.summary_markdown);
+    apply_group_assessment_style(&card, assessment);
+    card.title.set_label(&group.name);
+    card.subtitle.set_label(&group_subtitle(group));
+    card.status.set_label(assessment.label());
+    card.supervisor_toggle
+        .set_sensitive(group.supervisor_session_id.is_some());
+    if card.supervisor_toggle.is_active() != supervisor_visible {
+        card.supervisor_toggle_updating.set(true);
+        card.supervisor_toggle.set_active(supervisor_visible);
+        card.supervisor_toggle_updating.set(false);
+    }
+    card.supervisor_toggle.set_label(if supervisor_visible {
+        "Summary"
+    } else {
+        "Supervisor"
+    });
+
+    let summary_markdown = group.summary_markdown.trim().to_string();
+    if *card.rendered_summary_markdown.borrow() != summary_markdown {
+        render_group_markdown(&card.summary_content, &summary_markdown);
+        *card.rendered_summary_markdown.borrow_mut() = summary_markdown;
+    }
+    card.summary_view.set_visible(!supervisor_visible);
+    card.middle_stack
+        .set_visible_child_name(if supervisor_visible {
+            "terminal"
+        } else {
+            "summary"
+        });
+}
+
+fn apply_group_assessment_style(card: &GroupCardWidgets, assessment: GroupAssessment) {
+    for class in GROUP_ASSESSMENT_CARD_CLASSES {
+        card.frame.remove_css_class(class);
+    }
+    card.frame.add_css_class(assessment.card_class());
+    for class in GROUP_STATUS_CLASSES {
+        card.status.remove_css_class(class);
+    }
+    card.status.add_css_class(assessment.status_class());
+}
+
+fn group_subtitle(group: &SupervisedGroupRecord) -> String {
+    let mut parts = vec![format!(
+        "{} worker terminal{}",
+        group.member_session_ids.len(),
+        if group.member_session_ids.len() == 1 {
+            ""
+        } else {
+            "s"
+        }
+    )];
+    if let Some(age) = group.summary_age_secs {
+        parts.push(format!("updated {}", format_age(age)));
+    } else if let Some(age) = group.latest_action_age_secs {
+        parts.push(format!("action {}", format_age(age)));
+    }
+    if let Some(goal) = group.goal.as_deref().filter(|goal| !goal.trim().is_empty()) {
+        parts.push(format!("goal: {}", goal.trim()));
+    }
+    parts.join(" · ")
+}
+
+fn group_assessment_from_markdown(markdown: &str) -> GroupAssessment {
+    let text = markdown.to_ascii_lowercase();
+    if text.trim().is_empty() || text.contains("supervisor is starting") {
+        return GroupAssessment::Watching;
+    }
+
+    if contains_any(
+        &text,
+        &[
+            "complete",
+            "completed",
+            "done",
+            "finished",
+            "ready",
+            "tests pass",
+            "all pass",
+        ],
+    ) {
+        return GroupAssessment::Complete;
+    }
+
+    if indicates_overall_blocked(&text) {
+        return GroupAssessment::Blocked;
+    }
+
+    if indicates_stalling(&text) {
+        return GroupAssessment::Stalling;
+    }
+
+    if indicates_active_work(&text) {
+        return GroupAssessment::Active;
+    }
+    GroupAssessment::Watching
+}
+
+fn indicates_overall_blocked(text: &str) -> bool {
+    if contains_any(
+        text,
+        &[
+            "not blocked",
+            "no blocked",
+            "no blocker",
+            "no blockers",
+            "blocked: none",
+            "unblocked",
+            "no human intervention",
+            "no operator intervention",
+        ],
+    ) {
+        return false;
+    }
+
+    contains_any(
+        text,
+        &[
+            "overall: blocked",
+            "overall blocked",
+            "group is blocked",
+            "group blocked",
+            "blocked overall",
+            "substantial proportion blocked",
+            "substantial share blocked",
+            "many workers blocked",
+            "most workers blocked",
+            "majority blocked",
+            "all workers blocked",
+            "all agents blocked",
+            "most agents blocked",
+            "majority of agents",
+            "substantial proportion of the agents",
+            "no worker can proceed",
+            "no workers can proceed",
+            "cannot proceed at all",
+            "can't proceed at all",
+            "cannot make useful progress",
+            "needs human",
+            "needs operator",
+            "human intervention",
+            "operator intervention",
+            "requires human",
+            "requires operator",
+            "waiting for human",
+            "waiting for operator",
+            "needs approval",
+            "requires approval",
+            "external blocker",
+            "external dependency",
+        ],
+    )
+}
+
+fn indicates_stalling(text: &str) -> bool {
+    contains_any(
+        text,
+        &[
+            "stalling",
+            "stalled",
+            "stopped",
+            "stuck",
+            "blocked",
+            "no forward progress",
+            "no meaningful progress",
+            "not making progress",
+            "circular",
+            "looping",
+            "repeated loop",
+            "same failure",
+            "idle",
+            "no output",
+            "no activity",
+            "waiting for",
+            "needs nudge",
+            "prod sent",
+            "despite supervisor",
+            "despite prods",
+        ],
+    )
+}
+
+fn indicates_active_work(text: &str) -> bool {
+    contains_any(
+        text,
+        &[
+            "active",
+            "working",
+            "running",
+            "progress",
+            "implementing",
+            "testing",
+            "building",
+            "reviewing",
+            "debugging",
+            "investigating",
+            "fixing",
+            "retrying",
+            "rerunning",
+            "editing",
+            "patching",
+            "others continue",
+            "can continue",
+            "useful work",
+        ],
+    )
+}
+
+fn contains_any(text: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| text.contains(needle))
+}
+
+fn render_group_markdown(container: &gtk::Box, markdown: &str) {
+    while let Some(child) = container.first_child() {
+        container.remove(&child);
+    }
+
+    let lines = markdown.trim().lines().collect::<Vec<_>>();
+    if lines.is_empty() {
+        container.append(&markdown_label(
+            "Waiting for supervisor summary.",
+            &["markdown-muted"],
+        ));
+        return;
+    }
+
+    let mut index = 0;
+    let mut in_code_block = false;
+    let mut code_lines = Vec::new();
+    while index < lines.len() {
+        let line = lines[index];
+        let trimmed = line.trim();
+
+        if trimmed.starts_with("```") {
+            if in_code_block {
+                container.append(&markdown_code_block(&code_lines.join("\n")));
+                code_lines.clear();
+                in_code_block = false;
+            } else {
+                in_code_block = true;
+            }
+            index += 1;
+            continue;
+        }
+
+        if in_code_block {
+            code_lines.push(line);
+            index += 1;
+            continue;
+        }
+
+        if trimmed.is_empty() {
+            index += 1;
+            continue;
+        }
+
+        if let Some((headers, rows, consumed)) = parse_markdown_table(&lines[index..]) {
+            container.append(&markdown_table(&headers, &rows));
+            index += consumed;
+            continue;
+        }
+
+        if let Some(heading) = trimmed.strip_prefix("### ") {
+            container.append(&markdown_markup_label(
+                &format!("<b>{}</b>", markdown_inline_to_pango(heading)),
+                &["markdown-heading", "markdown-heading-small"],
+            ));
+        } else if let Some(heading) = trimmed.strip_prefix("## ") {
+            container.append(&markdown_markup_label(
+                &format!("<b>{}</b>", markdown_inline_to_pango(heading)),
+                &["markdown-heading"],
+            ));
+        } else if let Some(heading) = trimmed.strip_prefix("# ") {
+            container.append(&markdown_markup_label(
+                &format!("<b>{}</b>", markdown_inline_to_pango(heading)),
+                &["markdown-heading"],
+            ));
+        } else if let Some(item) = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+        {
+            container.append(&markdown_markup_label(
+                &format!("- {}", markdown_inline_to_pango(item)),
+                &["markdown-list-item"],
+            ));
+        } else {
+            container.append(&markdown_markup_label(
+                &markdown_inline_to_pango(trimmed),
+                &["markdown-paragraph"],
+            ));
+        }
+        index += 1;
+    }
+
+    if !code_lines.is_empty() {
+        container.append(&markdown_code_block(&code_lines.join("\n")));
+    }
+}
+
+fn parse_markdown_table(lines: &[&str]) -> Option<(Vec<String>, Vec<Vec<String>>, usize)> {
+    if lines.len() < 2 {
+        return None;
+    }
+    let header = parse_markdown_table_row(lines[0])?;
+    let separator = parse_markdown_table_row(lines[1])?;
+    if !separator
+        .iter()
+        .all(|cell| is_markdown_table_separator(cell))
+    {
+        return None;
+    }
+
+    let mut rows = Vec::new();
+    let mut consumed = 2;
+    while let Some(row) = lines
+        .get(consumed)
+        .and_then(|line| parse_markdown_table_row(line))
+    {
+        rows.push(row);
+        consumed += 1;
+    }
+    Some((header, rows, consumed))
+}
+
+fn parse_markdown_table_row(line: &str) -> Option<Vec<String>> {
+    let trimmed = line.trim();
+    if !trimmed.contains('|') {
+        return None;
+    }
+    let trimmed = trimmed.trim_matches('|');
+    let cells = trimmed
+        .split('|')
+        .map(|cell| cell.trim().to_string())
+        .collect::<Vec<_>>();
+    (cells.len() >= 2).then_some(cells)
+}
+
+fn is_markdown_table_separator(cell: &str) -> bool {
+    let mut hyphens = 0;
+    for ch in cell.chars() {
+        match ch {
+            '-' => hyphens += 1,
+            ':' | ' ' => {}
+            _ => return false,
+        }
+    }
+    hyphens >= 3
+}
+
+fn markdown_table(headers: &[String], rows: &[Vec<String>]) -> gtk::Grid {
+    let table = gtk::Grid::builder()
+        .row_spacing(0)
+        .column_spacing(0)
+        .hexpand(true)
+        .build();
+    table.add_css_class("markdown-table");
+    for (col, header) in headers.iter().enumerate() {
+        let label = markdown_markup_label(
+            &format!("<b>{}</b>", markdown_inline_to_pango(header)),
+            &["markdown-table-cell", "markdown-table-header"],
+        );
+        table.attach(&label, col as i32, 0, 1, 1);
+    }
+    for (row, cells) in rows.iter().enumerate() {
+        for col in 0..headers.len().max(cells.len()) {
+            let text = cells.get(col).map(String::as_str).unwrap_or("");
+            let label =
+                markdown_markup_label(&markdown_inline_to_pango(text), &["markdown-table-cell"]);
+            table.attach(&label, col as i32, (row + 1) as i32, 1, 1);
+        }
+    }
+    table
+}
+
+fn markdown_label(text: &str, classes: &[&str]) -> gtk::Label {
+    let label = gtk::Label::builder()
+        .label(text)
+        .xalign(0.0)
+        .wrap(true)
+        .selectable(false)
+        .hexpand(true)
+        .build();
+    label.set_halign(gtk::Align::Fill);
+    label.set_valign(gtk::Align::Start);
+    label.set_ellipsize(gtk::pango::EllipsizeMode::None);
+    for class in classes {
+        label.add_css_class(class);
+    }
+    label
+}
+
+fn markdown_markup_label(markup: &str, classes: &[&str]) -> gtk::Label {
+    let label = markdown_label("", classes);
+    label.set_markup(markup);
+    label
+}
+
+fn markdown_code_block(code: &str) -> gtk::Label {
+    markdown_markup_label(
+        &format!("<tt>{}</tt>", glib::markup_escape_text(code).as_str()),
+        &["markdown-code-block"],
+    )
+}
+
+fn markdown_inline_to_pango(text: &str) -> String {
+    let mut output = String::new();
+    let mut segment = String::new();
+    let mut in_code = false;
+    for ch in text.chars() {
+        if ch == '`' {
+            let escaped = glib::markup_escape_text(&segment);
+            if in_code {
+                output.push_str("<tt>");
+                output.push_str(escaped.as_str());
+                output.push_str("</tt>");
+            } else {
+                output.push_str(escaped.as_str());
+            }
+            segment.clear();
+            in_code = !in_code;
+        } else {
+            segment.push(ch);
+        }
+    }
+    let escaped = glib::markup_escape_text(&segment);
+    if in_code {
+        output.push('`');
+        output.push_str(escaped.as_str());
+    } else {
+        output.push_str(escaped.as_str());
+    }
+    output
+}
+
+fn format_age(age_secs: u64) -> String {
+    if age_secs < 60 {
+        format!("{age_secs}s ago")
+    } else if age_secs < 60 * 60 {
+        format!("{}m ago", age_secs / 60)
+    } else {
+        format!("{}h ago", age_secs / 3600)
     }
 }
 
@@ -1391,44 +1765,7 @@ fn install_terminal_context_menu(
     terminal.add_controller(right_click);
 }
 
-fn install_nudge_pill_interactions(
-    context: &Rc<AppContext>,
-    pill: &gtk::Label,
-    session_id: SessionId,
-) {
-    let click = gtk::GestureClick::new();
-    click.set_button(1);
-    {
-        let context = context.clone();
-        click.connect_released(move |gesture, _, _, _| {
-            toggle_auto_nudge(&context, session_id);
-            gesture.set_state(gtk::EventSequenceState::Claimed);
-        });
-    }
-    pill.add_controller(click);
-
-    let motion = gtk::EventControllerMotion::new();
-    {
-        let context = context.clone();
-        motion.connect_enter(move |_, _, _| {
-            set_auto_nudge_hover(&context, session_id, true);
-        });
-    }
-    {
-        let context = context.clone();
-        motion.connect_leave(move |_| {
-            set_auto_nudge_hover(&context, session_id, false);
-        });
-    }
-    pill.add_controller(motion);
-}
-
 fn close_session(context: &Rc<AppContext>, session_id: SessionId) {
-    let was_focused = context.state.borrow().focused_session() == Some(session_id);
-    if was_focused {
-        show_battlefield(context);
-    }
-
     if daemon_backed(context) {
         if let Some(beachhead) = context.beachhead.as_ref() {
             let _ = beachhead
@@ -1445,21 +1782,12 @@ fn close_session(context: &Rc<AppContext>, session_id: SessionId) {
     context.observations.borrow_mut().remove(&session_id);
     context.runtimes.borrow_mut().remove(&session_id);
     context.display_runtimes.borrow_mut().remove(&session_id);
-    if let Ok(mut writers) = context.raw_input_writers.lock() {
-        writers.remove(&session_id);
-    }
-    context.summary_cache.borrow_mut().remove(&session_id);
-    context.naming_cache.borrow_mut().remove(&session_id);
-    context.nudge_cache.borrow_mut().remove(&session_id);
     context.state.borrow_mut().remove_session(session_id);
 
     // Select a neighbor if the closed session was selected.
     let sessions = context.state.borrow().sessions().to_vec();
     if !sessions.is_empty() && context.state.borrow().selected_session().is_none() {
-        context
-            .state
-            .borrow_mut()
-            .select_session(sessions[0].id);
+        context.state.borrow_mut().select_session(sessions[0].id);
     }
 
     sync_grid_layout(context);
@@ -1470,17 +1798,17 @@ fn close_session(context: &Rc<AppContext>, session_id: SessionId) {
 fn add_terminal_from_toolbar(context: &Rc<AppContext>) {
     if daemon_backed(context) {
         if let Some(beachhead) = context.beachhead.as_ref() {
+            context.focus_next_added_terminal.set(true);
             if let Some(source) = context.state.borrow().sessions().first() {
-                let _ = beachhead
-                    .commands()
-                    .send(ClientMessage::AddTerminals {
-                        source_session: source.id,
-                    });
+                let _ = beachhead.commands().send(ClientMessage::AddTerminals {
+                    source_session: source.id,
+                });
             } else {
                 let _ = beachhead
                     .commands()
                     .send(ClientMessage::CreateOrResumeDefaultWorkspace);
             }
+            focus_selected_visible_terminal(context);
         }
         return;
     }
@@ -1494,6 +1822,316 @@ fn add_terminal_from_toolbar(context: &Rc<AppContext>) {
     refresh_runtime_and_cards(context);
     refresh_workspace(context);
     refresh_card_styles(context);
+    focus_session_terminal(context, session_id);
+}
+
+fn create_supervised_group_from_visible_sessions(context: &Rc<AppContext>) {
+    if !daemon_backed(context) {
+        return;
+    }
+    let items = battlefield_workspace_items(context);
+    let state = context.state.borrow();
+    let session_ids = items
+        .into_iter()
+        .filter_map(|item| match item {
+            WorkspaceItem::Session(session_id) if state.session(session_id).is_some() => {
+                Some(session_id)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if session_ids.is_empty() {
+        return;
+    }
+    if let Some(beachhead) = context.beachhead.as_ref() {
+        let _ = beachhead
+            .commands()
+            .send(ClientMessage::CreateSupervisedGroup {
+                name: "Supervised Group".into(),
+                session_ids,
+                goal: None,
+            });
+    }
+}
+
+fn show_terminal_assist_prompt(context: &Rc<AppContext>) {
+    if !daemon_backed(context) {
+        return;
+    }
+    if focus_active_terminal_assist(context) {
+        return;
+    }
+    let Some(session_id) = active_terminal_assist_session(context) else {
+        return;
+    };
+    if !terminal_visible_for_focus(context, session_id) {
+        return;
+    }
+    let Some(card) = context.session_cards.borrow().get(&session_id).cloned() else {
+        return;
+    };
+
+    context.state.borrow_mut().select_session(session_id);
+    context
+        .terminal_assist_active
+        .replace(Some(TerminalAssistState {
+            session_id,
+            request_id: None,
+        }));
+    card.terminal.set_input_enabled(false);
+    card.terminal_assist_entry.set_text("");
+    card.terminal_assist_entry.set_sensitive(true);
+    card.terminal_assist_cancel.set_sensitive(true);
+    card.terminal_assist_status
+        .set_label("Ask for a terminal command");
+    card.terminal_assist_spinner.stop();
+    card.terminal_assist_spinner.set_visible(false);
+    card.terminal_assist_overlay.set_visible(true);
+    refresh_card_styles(context);
+    card.terminal_assist_entry.grab_focus();
+}
+
+fn active_terminal_assist_session(context: &Rc<AppContext>) -> Option<SessionId> {
+    focused_visible_terminal_session(context).or_else(|| context.state.borrow().selected_session())
+}
+
+fn focus_active_terminal_assist(context: &Rc<AppContext>) -> bool {
+    let Some(active) = *context.terminal_assist_active.borrow() else {
+        return false;
+    };
+    let Some(card) = context
+        .session_cards
+        .borrow()
+        .get(&active.session_id)
+        .cloned()
+    else {
+        return false;
+    };
+    if active.request_id.is_some() {
+        card.terminal_assist_overlay.grab_focus();
+    } else {
+        card.terminal_assist_entry.grab_focus();
+    }
+    true
+}
+
+fn submit_terminal_assist_query(context: &Rc<AppContext>, session_id: SessionId, text: String) {
+    let Some(active) = *context.terminal_assist_active.borrow() else {
+        return;
+    };
+    if active.session_id != session_id || active.request_id.is_some() {
+        return;
+    }
+    if text.trim().is_empty() {
+        cancel_terminal_assist(context, session_id);
+        return;
+    }
+
+    let request_id = context.terminal_assist_request_id.get();
+    context
+        .terminal_assist_request_id
+        .set(request_id.saturating_add(1));
+    context
+        .terminal_assist_active
+        .replace(Some(TerminalAssistState {
+            session_id,
+            request_id: Some(request_id),
+        }));
+
+    if let Some(card) = context.session_cards.borrow().get(&session_id).cloned() {
+        card.terminal.set_input_enabled(false);
+        card.terminal_assist_entry.set_sensitive(false);
+        card.terminal_assist_cancel.set_sensitive(false);
+        card.terminal_assist_status
+            .set_label("Finding a command...");
+        card.terminal_assist_spinner.set_visible(true);
+        card.terminal_assist_spinner.start();
+        card.terminal_assist_overlay.grab_focus();
+    }
+
+    let sent = context.beachhead.as_ref().is_some_and(|beachhead| {
+        beachhead
+            .commands()
+            .send(ClientMessage::RequestTerminalAssist {
+                request_id,
+                session_id,
+                prompt: text,
+            })
+            .is_ok()
+    });
+    if !sent {
+        terminal_assist_failed(
+            context,
+            request_id,
+            session_id,
+            "Terminal assist is unavailable",
+        );
+    }
+}
+
+fn cancel_terminal_assist(context: &Rc<AppContext>, session_id: SessionId) {
+    let Some(active) = *context.terminal_assist_active.borrow() else {
+        return;
+    };
+    if active.session_id != session_id {
+        return;
+    }
+    if active.request_id.is_some() {
+        if let Some(card) = context.session_cards.borrow().get(&session_id) {
+            card.terminal_assist_status
+                .set_label("Finding a command...");
+            card.terminal_assist_overlay.grab_focus();
+        }
+        return;
+    }
+    hide_terminal_assist(context, session_id, true);
+}
+
+fn handle_terminal_assist_completed(
+    context: &Rc<AppContext>,
+    request_id: u64,
+    session_id: SessionId,
+    inserted: bool,
+    error: Option<String>,
+) {
+    let active = *context.terminal_assist_active.borrow();
+    if active
+        != Some(TerminalAssistState {
+            session_id,
+            request_id: Some(request_id),
+        })
+    {
+        if let Some(error) = error {
+            eprintln!("terminal assist {request_id} failed for {session_id:?}: {error}");
+        } else if !inserted {
+            eprintln!("terminal assist {request_id} produced no insertion for {session_id:?}");
+        }
+        return;
+    }
+
+    if let Some(error) = error {
+        terminal_assist_failed(context, request_id, session_id, &error);
+    } else if !inserted {
+        terminal_assist_failed(context, request_id, session_id, "No command was inserted");
+    } else {
+        hide_terminal_assist(context, session_id, true);
+    }
+}
+
+fn terminal_assist_failed(
+    context: &Rc<AppContext>,
+    _request_id: u64,
+    session_id: SessionId,
+    message: &str,
+) {
+    context
+        .terminal_assist_active
+        .replace(Some(TerminalAssistState {
+            session_id,
+            request_id: None,
+        }));
+    if let Some(card) = context.session_cards.borrow().get(&session_id).cloned() {
+        card.terminal.set_input_enabled(false);
+        card.terminal_assist_entry.set_sensitive(true);
+        card.terminal_assist_cancel.set_sensitive(true);
+        card.terminal_assist_status.set_label(message);
+        card.terminal_assist_spinner.stop();
+        card.terminal_assist_spinner.set_visible(false);
+        card.terminal_assist_overlay.set_visible(true);
+        card.terminal_assist_entry.grab_focus();
+    }
+}
+
+fn hide_terminal_assist(context: &Rc<AppContext>, session_id: SessionId, focus_terminal: bool) {
+    if context
+        .terminal_assist_active
+        .borrow()
+        .is_some_and(|active| active.session_id == session_id)
+    {
+        context.terminal_assist_active.replace(None);
+    }
+    let Some(card) = context.session_cards.borrow().get(&session_id).cloned() else {
+        return;
+    };
+    card.terminal_assist_overlay.set_visible(false);
+    card.terminal_assist_spinner.stop();
+    card.terminal_assist_spinner.set_visible(false);
+    card.terminal_assist_entry.set_sensitive(true);
+    card.terminal_assist_cancel.set_sensitive(true);
+    card.terminal.set_input_enabled(true);
+    if focus_terminal && terminal_visible_for_focus(context, session_id) {
+        focus_session_terminal(context, session_id);
+    }
+}
+
+fn show_group_contents(context: &Rc<AppContext>, group_id: GroupId) {
+    if context.state.borrow().group(group_id).is_none() {
+        return;
+    }
+    remember_pre_group_window_size(context);
+    context.expanded_group.set(Some(group_id));
+    context.cards.set_column_homogeneous(true);
+    context.cards.set_row_homogeneous(true);
+    context.cards.set_halign(gtk::Align::Fill);
+    context.battlefield_panel.set_vexpand(true);
+    context.battlefield_panel.set_height_request(-1);
+    context
+        .battlefield_panel
+        .set_hscrollbar_policy(gtk::PolicyType::Never);
+    *context.cached_tiling.borrow_mut() = None;
+    context.cached_layout_items.borrow_mut().clear();
+    sync_grid_layout(context);
+    sync_terminal_parents(context);
+    sync_input_scope_with_daemon(context);
+    if context.sync_inputs_enabled.get() {
+        focus_sync_input_anchor(context);
+    }
+    refresh_card_styles(context);
+    refresh_workspace(context);
+    schedule_runtime_size_sync(context);
+}
+
+fn show_top_level_battlefield(context: &Rc<AppContext>) {
+    context.expanded_group.set(None);
+    *context.cached_tiling.borrow_mut() = None;
+    context.cached_layout_items.borrow_mut().clear();
+    reset_battlefield_view(context);
+    restore_pre_group_window_size(context);
+    sync_input_scope_with_daemon(context);
+    if context.sync_inputs_enabled.get() {
+        focus_sync_input_anchor(context);
+    }
+}
+
+fn remember_pre_group_window_size(context: &Rc<AppContext>) {
+    if context.expanded_group.get().is_some() || context.pre_group_window_size.get().is_some() {
+        return;
+    }
+    let Some(window) = workspace_window(context) else {
+        return;
+    };
+    let width = window.width();
+    let height = window.height();
+    if width > 0 && height > 0 {
+        context.pre_group_window_size.set(Some((width, height)));
+    }
+}
+
+fn restore_pre_group_window_size(context: &Rc<AppContext>) {
+    let Some((width, height)) = context.pre_group_window_size.take() else {
+        return;
+    };
+    let Some(window) = workspace_window(context) else {
+        return;
+    };
+    window.set_default_size(width, height);
+    glib::idle_add_local_once(move || {
+        window.set_default_size(width, height);
+    });
+}
+
+fn workspace_window(context: &Rc<AppContext>) -> Option<gtk::Window> {
+    context.cards.root()?.downcast::<gtk::Window>().ok()
 }
 
 fn spawn_session(
@@ -1525,51 +2163,6 @@ fn spawn_session(
     refresh_runtime_and_cards(context);
 }
 
-fn spawn_summary_worker() -> Option<SummaryWorker> {
-    let registry = SynthesisBackendRegistry::from_env()?;
-    let (request_tx, request_rx) = mpsc::channel::<SummaryJob>();
-    let (result_tx, result_rx) = mpsc::channel::<SummaryResult>();
-
-    thread::spawn(move || {
-        while let Ok(job) = request_rx.recv() {
-            let summary = registry.summarize_blocking(&job.preferences, &job.evidence);
-            let _ = result_tx.send(SummaryResult {
-                session_id: job.session_id,
-                signature: job.signature,
-                substantive_signature: job.substantive_signature,
-                summary,
-            });
-        }
-    });
-
-    Some(SummaryWorker {
-        requests: request_tx,
-        responses: result_rx,
-    })
-}
-
-fn spawn_naming_worker() -> Option<NamingWorker> {
-    let registry = SynthesisBackendRegistry::from_env()?;
-    let (request_tx, request_rx) = mpsc::channel::<NamingJob>();
-    let (result_tx, result_rx) = mpsc::channel::<NamingResult>();
-
-    thread::spawn(move || {
-        while let Ok(job) = request_rx.recv() {
-            let suggestion = registry.suggest_name_blocking(&job.preferences, &job.evidence);
-            let _ = result_tx.send(NamingResult {
-                session_id: job.session_id,
-                signature: job.signature,
-                suggestion,
-            });
-        }
-    });
-
-    Some(NamingWorker {
-        requests: request_tx,
-        responses: result_rx,
-    })
-}
-
 fn drain_daemon_events(context: &Rc<AppContext>) {
     let Some(beachhead) = context.beachhead.as_ref() else {
         return;
@@ -1582,36 +2175,63 @@ fn drain_daemon_events(context: &Rc<AppContext>) {
                 apply_workspace_snapshot(context, snapshot);
                 changed = true;
             }
+            ServerMessage::TerminalAssistCompleted {
+                request_id,
+                session_id,
+                inserted,
+                error,
+            } => {
+                handle_terminal_assist_completed(context, request_id, session_id, inserted, error);
+            }
             ServerMessage::Error { message } => {
-                eprintln!("beachhead error: {message}");
+                eprintln!("host connection error: {message}");
             }
         }
     }
 
     if changed {
-        let sessions = context.state.borrow().sessions().to_vec();
-        for session in &sessions {
-            update_battle_card_widgets(context, session);
-        }
         refresh_workspace(context);
         refresh_card_styles(context);
-        refresh_focus_panel(context);
     }
 }
 
 fn apply_workspace_snapshot(context: &Rc<AppContext>, snapshot: WorkspaceSnapshot) {
+    let previous_session_ids = context
+        .state
+        .borrow()
+        .sessions()
+        .iter()
+        .map(|session| session.id)
+        .collect::<Vec<_>>();
+    let previous_focused_terminal = context.focused_terminal_id.get();
     let session_ids = snapshot
         .sessions
         .iter()
         .map(|session| session.record.id)
         .collect::<Vec<_>>();
+    if context
+        .terminal_assist_active
+        .borrow()
+        .is_some_and(|active| !session_ids.contains(&active.session_id))
+    {
+        context.terminal_assist_active.replace(None);
+    }
+    let added_session_to_focus = context.focus_next_added_terminal.get().then(|| {
+        session_ids
+            .iter()
+            .copied()
+            .filter(|session_id| !previous_session_ids.contains(session_id))
+            .next_back()
+    });
 
-    context.state.borrow_mut().replace_sessions(
+    context.state.borrow_mut().replace_workspace(
         snapshot
             .sessions
             .iter()
             .map(|session| session.record.clone())
             .collect(),
+        snapshot.groups.clone(),
+        snapshot.items.clone(),
     );
 
     let existing_ids = context
@@ -1633,12 +2253,41 @@ fn apply_workspace_snapshot(context: &Rc<AppContext>, snapshot: WorkspaceSnapsho
             .borrow_mut()
             .remove(&session_id);
         context.display_runtimes.borrow_mut().remove(&session_id);
-        if let Ok(mut writers) = context.raw_input_writers.lock() {
-            writers.remove(&session_id);
+    }
+
+    let group_ids = snapshot
+        .groups
+        .iter()
+        .map(|group| group.id)
+        .collect::<Vec<_>>();
+    let existing_group_ids = context
+        .group_cards
+        .borrow()
+        .keys()
+        .copied()
+        .collect::<Vec<_>>();
+    for group_id in existing_group_ids {
+        if group_ids.contains(&group_id) {
+            continue;
         }
-        context.summary_cache.borrow_mut().remove(&session_id);
-        context.naming_cache.borrow_mut().remove(&session_id);
-        context.nudge_cache.borrow_mut().remove(&session_id);
+        if let Some(card) = context.group_cards.borrow_mut().remove(&group_id) {
+            context.cards.remove(&card.frame);
+        }
+        context
+            .pending_supervisor_visibility
+            .borrow_mut()
+            .remove(&group_id);
+        if context.expanded_group.get() == Some(group_id) {
+            context.expanded_group.set(None);
+        }
+    }
+
+    for group in &snapshot.groups {
+        if !context.group_cards.borrow().contains_key(&group.id) {
+            let card = build_group_card_widgets(context, group);
+            context.group_cards.borrow_mut().insert(group.id, card);
+        }
+        update_group_card_widgets(context, group);
     }
 
     for session in snapshot.sessions {
@@ -1652,7 +2301,7 @@ fn apply_workspace_snapshot(context: &Rc<AppContext>, snapshot: WorkspaceSnapsho
             .borrow()
             .contains_key(&session.record.id)
         {
-            let card = build_battle_card_widgets(context, &session.record);
+            let card = build_session_terminal_widgets(context, &session.record);
             context
                 .session_cards
                 .borrow_mut()
@@ -1679,26 +2328,37 @@ fn apply_workspace_snapshot(context: &Rc<AppContext>, snapshot: WorkspaceSnapsho
             session.record.id,
             observation_from_snapshot(&session.observation),
         );
-        {
-            let mut summary_cache = context.summary_cache.borrow_mut();
-            let cache = summary_cache
-                .entry(session.record.id)
-                .or_insert_with(SummaryCacheEntry::new);
-            cache.last_summary = session.summary;
-        }
-        {
-            let mut nudge_cache = context.nudge_cache.borrow_mut();
-            let nudge = nudge_cache
-                .entry(session.record.id)
-                .or_insert_with(NudgeCacheEntry::new);
-            nudge.enabled = session.auto_nudge_enabled;
-            nudge.last_sent = session
-                .last_sent_age_secs
-                .map(|age| Instant::now() - Duration::from_secs(age));
-        }
     }
 
+    // Workspace snapshots also carry volatile observation/terminal activity.
+    // Keep the layout cache intact so unchanged snapshots do not remove and
+    // reattach terminal frames, which drops VTE focus during typing.
+    sync_terminal_parents(context);
     sync_grid_layout(context);
+    sync_input_scope_with_daemon(context);
+    match added_session_to_focus {
+        Some(Some(session_id)) => {
+            context.focus_next_added_terminal.set(false);
+            context.state.borrow_mut().select_session(session_id);
+            refresh_card_styles(context);
+            focus_session_terminal(context, session_id);
+        }
+        _ => {
+            if let Some(session_id) = previous_focused_terminal {
+                if context.session_cards.borrow().contains_key(&session_id)
+                    && (battlefield_embeds_terminal(context, session_id)
+                        || session_visible_as_group_supervisor(context, session_id))
+                {
+                    focus_session_terminal(context, session_id);
+                }
+            }
+        }
+    }
+    if context.sync_inputs_enabled.get() {
+        focus_sync_input_anchor(context);
+    }
+    sync_group_navigation_chrome(context);
+    maybe_focus_initial_terminal(context);
 }
 
 fn update_raw_stream_socket_name(
@@ -1727,25 +2387,14 @@ fn update_raw_stream_socket_name(
 
 fn reset_daemon_display_runtime(context: &Rc<AppContext>, session_id: SessionId) {
     context.display_runtimes.borrow_mut().remove(&session_id);
-    if let Ok(mut writers) = context.raw_input_writers.lock() {
-        writers.remove(&session_id);
-    }
 }
 
 fn observation_from_snapshot(snapshot: &ObservationSnapshot) -> SessionObservation {
-    SessionObservation {
-        last_change: Instant::now() - Duration::from_secs(snapshot.last_change_age_secs),
-        recent_lines: snapshot.recent_lines.clone(),
-        terminal_activity: Vec::new(),
-        painted_line: snapshot.painted_line.clone(),
-        shell_child_command: snapshot.shell_child_command.clone(),
-        active_command: snapshot.active_command.clone(),
-        dominant_process: snapshot.dominant_process.clone(),
-        process_tree_excerpt: snapshot.process_tree_excerpt.clone(),
-        recent_files: snapshot.recent_files.clone(),
-        recent_file_activity: BTreeMap::new(),
-        work_output_excerpt: snapshot.work_output_excerpt.clone(),
-    }
+    let mut observation = SessionObservation::new();
+    observation.last_change = Instant::now() - Duration::from_secs(snapshot.last_change_age_secs);
+    observation.recent_lines = snapshot.recent_lines.clone();
+    observation.painted_line = snapshot.painted_line.clone();
+    observation
 }
 
 fn attach_daemon_display_runtime(
@@ -1767,9 +2416,7 @@ fn attach_daemon_display_runtime(
             session_id,
             socket_name.to_string(),
             runtime.output_writer.clone(),
-            context.raw_input_writers.clone(),
-            context.sync_inputs_enabled.clone(),
-            context.sync_inputs_permitted.clone(),
+            runtime.output_filter.clone(),
             input_events,
         );
     }
@@ -1781,57 +2428,16 @@ fn attach_daemon_display_runtime(
 
 pub(crate) fn refresh_runtime_and_cards(context: &Rc<AppContext>) {
     drain_daemon_events(context);
-    drain_summary_results(context);
-    drain_naming_results(context);
     drain_runtime_events(context);
     sync_grid_layout(context);
     let sessions = context.state.borrow().sessions().to_vec();
     for session in &sessions {
         refresh_observation(context, session);
     }
-    for session in &sessions {
-        update_battle_card_widgets(context, session);
-    }
     sync_terminal_parents(context);
     refresh_workspace(context);
     refresh_card_styles(context);
-    refresh_focus_panel(context);
     sync_runtime_sizes(context);
-}
-
-fn drain_naming_results(context: &Rc<AppContext>) {
-    let Some(worker) = context.naming_worker.as_ref() else {
-        return;
-    };
-
-    while let Ok(result) = worker.responses.try_recv() {
-        let mut cache = context.naming_cache.borrow_mut();
-        let entry = cache
-            .entry(result.session_id)
-            .or_insert_with(NamingCacheEntry::new);
-        entry.in_flight = false;
-        entry.requested_signature = None;
-        entry.last_attempt = Some(Instant::now());
-        if let Some(provider) = result.suggestion.demoted_provider {
-            record_provider_demotion(&mut entry.skipped_providers, provider);
-        }
-        match result.suggestion.value {
-            Ok(suggestion) => {
-                entry.completed_signature = Some(result.signature);
-                if !suggestion.name.is_empty() {
-                    entry.last_name = Some(suggestion.name.clone());
-                    context
-                        .state
-                        .borrow_mut()
-                        .set_display_name(result.session_id, Some(suggestion.name));
-                }
-                entry.last_error = None;
-            }
-            Err(error) => {
-                entry.last_error = Some(error);
-            }
-        }
-    }
 }
 
 fn drain_runtime_events(context: &Rc<AppContext>) {
@@ -1863,18 +2469,17 @@ fn drain_runtime_events(context: &Rc<AppContext>) {
 }
 
 fn sync_runtime_sizes(context: &Rc<AppContext>) {
-    let focused_size = predicted_focus_terminal_size(context);
     let sizes = context
         .session_cards
         .borrow()
         .iter()
         .map(|(session_id, card)| {
-            let size = if context.state.borrow().focused_session() == Some(*session_id)
-                || battlefield_embeds_terminal(context, *session_id)
+            let size = if battlefield_embeds_terminal(context, *session_id)
+                || session_visible_as_group_supervisor(context, *session_id)
             {
                 measured_terminal_size_hint(&card.terminal)
             } else {
-                focused_size
+                Some(terminal_size_hint(&card.terminal))
             };
             (*session_id, size)
         })
@@ -1932,13 +2537,6 @@ fn sync_runtime_sizes(context: &Rc<AppContext>) {
     }
 }
 
-fn predicted_focus_terminal_size(context: &Rc<AppContext>) -> Option<PtySize> {
-    let focused = context.state.borrow().focused_session()?;
-    let cards = context.session_cards.borrow();
-    let card = cards.get(&focused)?;
-    measured_terminal_size_hint(&card.terminal).or_else(|| Some(terminal_size_hint(&card.terminal)))
-}
-
 fn resize_display_pty(fd: i32, size: PtySize) -> std::io::Result<()> {
     let winsize = libc::winsize {
         ws_row: size.rows,
@@ -1953,36 +2551,6 @@ fn resize_display_pty(fd: i32, size: PtySize) -> std::io::Result<()> {
     Ok(())
 }
 
-fn drain_summary_results(context: &Rc<AppContext>) {
-    let Some(worker) = context.summary_worker.as_ref() else {
-        return;
-    };
-
-    while let Ok(result) = worker.responses.try_recv() {
-        let mut cache = context.summary_cache.borrow_mut();
-        let entry = cache
-            .entry(result.session_id)
-            .or_insert_with(SummaryCacheEntry::new);
-        entry.in_flight = false;
-        entry.requested_signature = None;
-        entry.last_attempt = Some(Instant::now());
-        if let Some(provider) = result.summary.demoted_provider {
-            record_provider_demotion(&mut entry.skipped_providers, provider);
-        }
-        match result.summary.value {
-            Ok(summary) => {
-                entry.completed_signature = Some(result.signature);
-                entry.completed_substantive_signature = Some(result.substantive_signature);
-                entry.last_summary = Some(summary);
-                entry.last_error = None;
-            }
-            Err(error) => {
-                entry.last_error = Some(error);
-            }
-        }
-    }
-}
-
 fn refresh_observation(context: &Rc<AppContext>, session: &SessionRecord) {
     if daemon_backed(context) {
         return;
@@ -1993,698 +2561,216 @@ fn refresh_observation(context: &Rc<AppContext>, session: &SessionRecord) {
     refresh_session_observation(observation, session, remote_mode);
 }
 
-fn update_battle_card_widgets(context: &Rc<AppContext>, session: &SessionRecord) {
-    let Some(card) = context.session_cards.borrow().get(&session.id).cloned() else {
-        return;
-    };
-    let observations = context.observations.borrow();
-    let Some(observation) = observations.get(&session.id) else {
-        return;
-    };
-
-    let observed = ObservedActivity {
-        active_command: observation.active_command.clone(),
-        dominant_process: observation.dominant_process.clone(),
-        recent_files: observation.recent_files.clone(),
-        work_output_excerpt: observation.work_output_excerpt.clone(),
-        idle_seconds: Some(observation.last_change.elapsed().as_secs()),
-    };
-    let mut card_model = build_battle_card(session, &observed);
-    let should_synthesize = !is_bare_waiting_shell(session, observation);
-    let evidence = build_tactical_evidence(session, observation);
-    if should_synthesize {
-        maybe_queue_summary(context, session.id, &evidence);
-        let naming = build_naming_evidence(session, observation);
-        maybe_queue_name(context, session.id, &naming);
-    }
-    let live_summary = if should_synthesize {
-        current_summary(context, session.id, &evidence)
-    } else {
-        None
-    };
-    let chrome_mode = CardChromeMode::from_summary(live_summary.as_ref());
-    if let Some(summary) = live_summary.clone() {
-        card_model = apply_tactical_synthesis(card_model, summary);
-    }
-    let visual_status = if chrome_mode.summarized() {
-        card_model.status
-    } else {
-        BattleCardStatus::Idle
-    };
-
-    let display_name = ui_display_name(session, chrome_mode);
-    card.title.set_label(&display_name);
-    apply_battle_status_style(&card.status, visual_status);
-    apply_battle_card_surface_style(&card.frame, visual_status);
-    card.status.set_label(&status_chip_label(
-        card_model.status,
-        &card_model.recency_label,
-    ));
-    card.recency.set_label("");
-    card.recency.set_visible(false);
-    card.headline.set_label(&card_model.headline);
-
-    let scrollback = scrollback_fragments(
-        observation,
-        visible_scrollback_line_capacity(card.scrollback_band.height()),
-    );
-    repopulate_scrollback_band(
-        &card.scrollback_content,
-        &card.scrollback_lines,
-        &scrollback,
-    );
-    card.scrollback_band.set_visible(true);
-
-    apply_metric_widgets(
-        &card,
-        live_summary.as_ref(),
-        Some(observation.last_change.elapsed().as_secs()),
-    );
-    apply_metric_bar_layout(&card, battlefield_embeds_terminal(context, session.id));
-
-    card.alert.set_label("");
-    card.alert.set_visible(false);
-    let in_focus_mode = context.state.borrow().focused_session().is_some();
-    if !in_focus_mode && chrome_mode.summarized() {
-        apply_nudge_pill(&context.nudge_cache.borrow(), session.id, &card.nudge_state);
-    }
-    apply_summary_chrome_visibility(
-        &card,
-        card_chrome_visibility(chrome_mode, in_focus_mode, false),
-    );
-}
-
-fn maybe_queue_summary(
-    context: &Rc<AppContext>,
-    session_id: SessionId,
-    evidence: &TacticalEvidence,
-) {
-    if daemon_backed(context) {
-        return;
-    }
-    if visual_gallery_enabled() {
-        return;
-    }
-
-    let Some(worker) = context.summary_worker.as_ref() else {
-        return;
-    };
-
-    let signature = summary_signature(evidence);
-    let substantive_signature = summary_substantive_signature(evidence);
-    let mut cache = context.summary_cache.borrow_mut();
-    let entry = cache
-        .entry(session_id)
-        .or_insert_with(SummaryCacheEntry::new);
-
-    if entry.completed_signature.as_deref() == Some(signature.as_str())
-        || entry.requested_signature.as_deref() == Some(signature.as_str())
-        || entry.in_flight
-    {
-        return;
-    }
-    if should_skip_repeated_paused_summary(
-        entry.last_summary.as_ref(),
-        entry.completed_substantive_signature.as_deref(),
-        &substantive_signature,
-    ) {
-        return;
-    }
-
-    let refresh_interval = summary_refresh_interval(entry.first_seen.elapsed());
-    if entry
-        .last_attempt
-        .is_some_and(|attempt| attempt.elapsed() < refresh_interval)
-    {
-        return;
-    }
-
-    entry.in_flight = true;
-    entry.last_attempt = Some(Instant::now());
-    entry.requested_signature = Some(signature.clone());
-    let _ = worker.requests.send(SummaryJob {
-        session_id,
-        signature,
-        substantive_signature,
-        evidence: evidence.clone(),
-        preferences: active_provider_preferences(&entry.skipped_providers),
-    });
-}
-
-fn maybe_queue_name(context: &Rc<AppContext>, session_id: SessionId, evidence: &NamingEvidence) {
-    if daemon_backed(context) {
-        return;
-    }
-    if visual_gallery_enabled() {
-        return;
-    }
-
-    let Some(worker) = context.naming_worker.as_ref() else {
-        return;
-    };
-
-    let signature = name_signature(evidence);
-    let mut cache = context.naming_cache.borrow_mut();
-    let entry = cache
-        .entry(session_id)
-        .or_insert_with(NamingCacheEntry::new);
-
-    if entry.completed_signature.as_deref() == Some(signature.as_str())
-        || entry.requested_signature.as_deref() == Some(signature.as_str())
-        || entry.in_flight
-    {
-        return;
-    }
-
-    if entry
-        .last_attempt
-        .is_some_and(|attempt| attempt.elapsed() < Duration::from_secs(20))
-    {
-        return;
-    }
-
-    entry.in_flight = true;
-    entry.last_attempt = Some(Instant::now());
-    entry.requested_signature = Some(signature.clone());
-    let _ = worker.requests.send(NamingJob {
-        session_id,
-        signature,
-        evidence: evidence.clone(),
-        preferences: active_provider_preferences(&entry.skipped_providers),
-    });
-}
-
-fn active_provider_preferences(
-    skipped_providers: &BTreeMap<SynthesisProvider, Instant>,
-) -> ProviderPreferences {
-    let skipped_providers = skipped_providers
-        .iter()
-        .filter_map(|(provider, demoted_at)| {
-            (demoted_at.elapsed() < PROVIDER_DEMOTION_COOLDOWN).then_some(*provider)
-        })
-        .collect();
-    ProviderPreferences { skipped_providers }
-}
-
-fn record_provider_demotion(
-    skipped_providers: &mut BTreeMap<SynthesisProvider, Instant>,
-    provider: SynthesisProvider,
-) {
-    skipped_providers.insert(provider, Instant::now());
-}
-
-fn current_summary(
-    context: &Rc<AppContext>,
-    session_id: SessionId,
-    _evidence: &TacticalEvidence,
-) -> Option<TacticalSynthesis> {
-    if daemon_backed(context) {
-        return context
-            .summary_cache
-            .borrow()
-            .get(&session_id)
-            .and_then(|entry| entry.last_summary.clone());
-    }
-    if visual_gallery_enabled() {
-        return gallery_mock_summary(context, session_id);
-    }
-
-    let cache = context.summary_cache.borrow();
-    let entry = cache.get(&session_id)?;
-    entry.last_summary.clone()
-}
-
-fn should_show_summary(context: &Rc<AppContext>, session_id: SessionId) -> bool {
-    let state = context.state.borrow();
-    let observations = context.observations.borrow();
-    let Some(session) = state.session(session_id) else {
-        return false;
-    };
-    let Some(observation) = observations.get(&session_id) else {
-        return false;
-    };
-    !is_bare_waiting_shell(session, observation)
-}
-
-fn card_chrome_mode_for_session(context: &Rc<AppContext>, session_id: SessionId) -> CardChromeMode {
-    if visual_gallery_enabled() {
-        return CardChromeMode::Summarized;
-    }
-    if !should_show_summary(context, session_id) {
-        return CardChromeMode::SparseShell;
-    }
-    let has_summary = context
-        .summary_cache
-        .borrow()
-        .get(&session_id)
-        .and_then(|entry| entry.last_summary.as_ref())
-        .is_some();
-    if has_summary {
-        CardChromeMode::Summarized
-    } else {
-        CardChromeMode::SparseShell
-    }
-}
-
-fn gallery_mock_summary(
-    context: &Rc<AppContext>,
-    session_id: SessionId,
-) -> Option<TacticalSynthesis> {
-    let state = context.state.borrow();
-    let session = state.session(session_id)?;
-    let name = session.launch.name.as_str();
-    Some(match name {
-        "Agent A" => TacticalSynthesis {
-            tactical_state: TacticalState::Working,
-            tactical_state_brief: Some("Narrowing the parser failure with focused reruns".into()),
-            attention_level: AttentionLevel::Monitor,
-            attention_brief: Some(
-                "The loop is healthy and converging, but it is still worth watching.".into(),
-            ),
-            headline: Some("Tight edit-test loop, still failing but converging.".into()),
-            tool_not_likely_coding_agent: false,
-        },
-        "Agent B" => TacticalSynthesis {
-            tactical_state: TacticalState::Stopped,
-            tactical_state_brief: Some("Paused after a clean checkpoint".into()),
-            attention_level: AttentionLevel::Guide,
-            attention_brief: Some(
-                "A simple continue prompt is probably enough to restart useful work.".into(),
-            ),
-            headline: Some("Looks done with this pass and waiting for a nudge.".into()),
-            tool_not_likely_coding_agent: false,
-        },
-        "Agent C" => TacticalSynthesis {
-            tactical_state: TacticalState::Blocked,
-            tactical_state_brief: Some("Waiting on explicit approval".into()),
-            attention_level: AttentionLevel::Intervene,
-            attention_brief: Some("The next step is blocked on real operator approval.".into()),
-            headline: Some("Hard stop on approval boundary; operator input required.".into()),
-            tool_not_likely_coding_agent: false,
-        },
-        "Agent D" => TacticalSynthesis {
-            tactical_state: TacticalState::Working,
-            tactical_state_brief: Some("Retrying the same failing path".into()),
-            attention_level: AttentionLevel::Guide,
-            attention_brief: Some(
-                "The loop is repeating without a decisive new clue and may need redirection soon."
-                    .into(),
-            ),
-            headline: Some("Retry loop is repeating without a decisive new clue.".into()),
-            tool_not_likely_coding_agent: false,
-        },
-        "Agent E" => TacticalSynthesis {
-            tactical_state: TacticalState::Idle,
-            tactical_state_brief: Some("Stable after validation with nothing to resume".into()),
-            attention_level: AttentionLevel::Autopilot,
-            attention_brief: Some(
-                "This looks stably parked with no meaningful next step pending.".into(),
-            ),
-            headline: Some("Looks stably parked after validation, not suspiciously idle.".into()),
-            tool_not_likely_coding_agent: false,
-        },
-        "Agent F" => TacticalSynthesis {
-            tactical_state: TacticalState::Working,
-            tactical_state_brief: Some(
-                "Escalating from disk pressure into risky cleanup ideas".into(),
-            ),
-            attention_level: AttentionLevel::Takeover,
-            attention_brief: Some(
-                "Risky cleanup ideas and frustration mean the operator should take direct control."
-                    .into(),
-            ),
-            headline: Some(
-                "Blocked on disk space and drifting toward risky cleanup actions.".into(),
-            ),
-            tool_not_likely_coding_agent: false,
-        },
-        _ => return None,
-    })
-}
-
-fn apply_tactical_synthesis(
-    mut card_model: BattleCardViewModel,
-    summary: TacticalSynthesis,
-) -> BattleCardViewModel {
-    card_model.status = match summary.tactical_state {
-        TacticalState::Idle => BattleCardStatus::Idle,
-        TacticalState::Stopped => BattleCardStatus::Stopped,
-        TacticalState::Thinking => BattleCardStatus::Thinking,
-        TacticalState::Working => BattleCardStatus::Working,
-        TacticalState::Blocked => BattleCardStatus::Blocked,
-        TacticalState::Failed => BattleCardStatus::Failed,
-        TacticalState::Complete => BattleCardStatus::Complete,
-        TacticalState::Detached => BattleCardStatus::Detached,
-    };
-    card_model.recency_label = match card_model.status {
-        BattleCardStatus::Idle | BattleCardStatus::Stopped => card_model.recency_label,
-        _ if card_model.recency_label.starts_with("idle ") => "active now".into(),
-        _ => card_model.recency_label,
-    };
-
-    if let Some(headline) = summary.headline.clone() {
-        card_model.headline = headline;
-    }
-    if let Some(text) = summary.attention_brief.clone() {
-        card_model.alignment.text = text;
-        card_model.alignment.tone = if matches!(
-            summary.attention_level,
-            AttentionLevel::Intervene | AttentionLevel::Takeover
-        ) {
-            SignalTone::Alert
-        } else if matches!(
-            summary.attention_level,
-            AttentionLevel::Monitor | AttentionLevel::Guide
-        ) {
-            SignalTone::Watch
-        } else {
-            SignalTone::Calm
-        };
-    }
-
-    card_model
-}
-
-fn apply_metric_widgets(
-    card: &SessionCardWidgets,
-    summary: Option<&TacticalSynthesis>,
-    _idle_seconds: Option<u64>,
-) {
-    let attention = attention_bar_presentation(summary);
-    apply_segmented_bar(&card.momentum_bar, attention.as_ref(), summary.is_some());
-    apply_segmented_bar(&card.risk_bar, None, false);
-}
-
-fn metric_bar_layout(shows_terminal: bool, visible_bar_count: usize) -> (gtk::Orientation, bool) {
-    if shows_terminal && visible_bar_count > 1 {
-        (gtk::Orientation::Horizontal, true)
-    } else {
-        (gtk::Orientation::Vertical, false)
-    }
-}
-
-fn apply_metric_bar_layout(card: &SessionCardWidgets, shows_terminal: bool) {
-    let visible_bar_count = usize::from(card.momentum_bar.frame.is_visible())
-        + usize::from(card.risk_bar.frame.is_visible());
-    let (orientation, homogeneous) = metric_bar_layout(shows_terminal, visible_bar_count);
-    card.bars.set_orientation(orientation);
-    card.bars.set_homogeneous(homogeneous);
-}
-
-fn apply_segmented_bar(
-    bar: &SegmentedBarWidgets,
-    value: Option<&(
-        exaterm_ui::presentation::SegmentedBarPresentation,
-        Option<String>,
-    )>,
-    show_when_empty: bool,
-) {
-    let Some((presentation, reason)) = value else {
-        bar.frame.set_visible(show_when_empty);
-        bar.reason.set_label("");
-        bar.frame.set_tooltip_text(None::<&str>);
-        for segment in &bar.segments {
-            for css in [
-                "bar-attention-1",
-                "bar-attention-2",
-                "bar-attention-3",
-                "bar-attention-4",
-                "bar-attention-5",
-                "bar-empty",
-            ] {
-                segment.remove_css_class(css);
-            }
-            segment.add_css_class("bar-empty");
-        }
-        return;
-    };
-
-    bar.frame.set_visible(true);
-    bar.reason.set_label(reason.as_deref().unwrap_or(""));
-    bar.reason
-        .set_visible(reason.as_deref().is_some_and(|reason| !reason.is_empty()));
-    bar.frame.set_tooltip_text(reason.as_deref());
-
-    for (index, segment) in bar.segments.iter().enumerate() {
-        for css in [
-            "bar-attention-1",
-            "bar-attention-2",
-            "bar-attention-3",
-            "bar-attention-4",
-            "bar-attention-5",
-            "bar-empty",
-        ] {
-            segment.remove_css_class(css);
-        }
-        if index < presentation.fill {
-            segment.add_css_class(presentation.css_class);
-        } else {
-            segment.add_css_class("bar-empty");
-        }
-    }
-}
-
-fn apply_focus_attention_pill(pill: &gtk::Label, summary: Option<&TacticalSynthesis>) {
-    for css in [
-        "focus-attention-1",
-        "focus-attention-2",
-        "focus-attention-3",
-        "focus-attention-4",
-        "focus-attention-5",
-    ] {
-        pill.remove_css_class(css);
-    }
-
-    let Some(summary) = summary else {
-        pill.set_visible(false);
-        pill.set_label("");
-        pill.set_tooltip_text(None::<&str>);
-        return;
-    };
-
-    let (label, css) = match summary.attention_level {
-        AttentionLevel::Autopilot => ("AUTOPILOT", "focus-attention-1"),
-        AttentionLevel::Monitor => ("MONITOR", "focus-attention-2"),
-        AttentionLevel::Guide => ("GUIDE", "focus-attention-3"),
-        AttentionLevel::Intervene => ("INTERVENE", "focus-attention-4"),
-        AttentionLevel::Takeover => ("TAKEOVER", "focus-attention-5"),
-    };
-    pill.set_label(label);
-    pill.add_css_class(css);
-    pill.set_tooltip_text(summary.attention_brief.as_deref());
-    pill.set_visible(true);
-}
-
-fn apply_attention_pill(pill: &gtk::Label, summary: Option<&TacticalSynthesis>) {
-    for css in [
-        "focus-attention-1",
-        "focus-attention-2",
-        "focus-attention-3",
-        "focus-attention-4",
-        "focus-attention-5",
-    ] {
-        pill.remove_css_class(css);
-    }
-
-    let Some(summary) = summary else {
-        pill.set_visible(false);
-        pill.set_label("");
-        pill.set_tooltip_text(None::<&str>);
-        return;
-    };
-
-    let (label, css) = match summary.attention_level {
-        AttentionLevel::Autopilot => ("AUTOPILOT", "focus-attention-1"),
-        AttentionLevel::Monitor => ("MONITOR", "focus-attention-2"),
-        AttentionLevel::Guide => ("GUIDE", "focus-attention-3"),
-        AttentionLevel::Intervene => ("INTERVENE", "focus-attention-4"),
-        AttentionLevel::Takeover => ("TAKEOVER", "focus-attention-5"),
-    };
-    pill.set_label(label);
-    pill.add_css_class(css);
-    pill.set_tooltip_text(summary.attention_brief.as_deref());
-    pill.set_visible(true);
-}
-
 fn refresh_workspace(context: &Rc<AppContext>) {
-    let sessions = context.state.borrow().sessions().to_vec();
-    let mut idle = 0usize;
-    let mut active = 0usize;
-    let mut failed = 0usize;
-
-    for session in &sessions {
-        if let Some(observation) = context.observations.borrow().get(&session.id) {
-            let observed = ObservedActivity {
-                active_command: observation.active_command.clone(),
-                dominant_process: observation.dominant_process.clone(),
-                recent_files: observation.recent_files.clone(),
-                work_output_excerpt: observation.work_output_excerpt.clone(),
-                idle_seconds: Some(observation.last_change.elapsed().as_secs()),
-            };
-            let status = build_battle_card(session, &observed).status;
-            match status {
-                BattleCardStatus::Idle => idle += 1,
-                BattleCardStatus::Stopped => active += 1,
-                BattleCardStatus::Active
-                | BattleCardStatus::Thinking
-                | BattleCardStatus::Working => active += 1,
-                BattleCardStatus::Blocked => active += 1,
-                BattleCardStatus::Failed => failed += 1,
-                BattleCardStatus::Complete | BattleCardStatus::Detached => {}
-            }
-        }
-    }
-
-    let is_empty = sessions.is_empty();
+    let is_empty = context.state.borrow().sessions().is_empty();
     context.empty_state.set_visible(is_empty);
     context.battlefield_panel.set_visible(!is_empty);
-    let state = context.state.borrow();
-    let _ = (sessions, idle, active, failed, state);
     context.title.set_subtitle("");
+    sync_group_navigation_chrome(context);
+}
+
+fn sync_group_navigation_chrome(context: &Rc<AppContext>) {
+    context
+        .back_to_root_button
+        .set_visible(context.expanded_group.get().is_some());
 }
 
 fn refresh_card_styles(context: &Rc<AppContext>) {
-    const FOCUS_RAIL_CARD_WIDTH: i32 = 168;
-
-    let selected = context.state.borrow().selected_session();
-    let focused = context.state.borrow().focused_session();
-    let focus_mode = focused.is_some();
-    let single_card_mode = !focus_mode && context.session_cards.borrow().len() == 1;
+    let selected_item = context.state.borrow().selected_workspace_item();
+    let single_card_mode = visible_workspace_item_count(context) == 1;
+    let focused_terminal_id = context.focused_terminal_id.get();
+    let sync_targets = if context.sync_inputs_enabled.get() {
+        input_sync_target_session_ids(context)
+    } else {
+        Vec::new()
+    };
     for (session_id, card) in context.session_cards.borrow().iter() {
         card.frame.remove_css_class("selected-card");
-        card.frame.remove_css_class("focused-card");
         card.frame.remove_css_class("single-card");
-        if focus_mode && selected == Some(*session_id) {
+        if selected_item == Some(WorkspaceItem::Session(*session_id)) {
             card.frame.add_css_class("selected-card");
         }
-        if focused == Some(*session_id) {
-            card.frame.add_css_class("focused-card");
+        if single_card_mode {
+            card.frame.add_css_class("single-card");
         }
-        if focus_mode {
-            card.frame.set_hexpand(false);
-            card.frame.set_halign(gtk::Align::Start);
-            card.frame.set_width_request(FOCUS_RAIL_CARD_WIDTH);
-        } else {
-            card.frame.set_hexpand(true);
-            card.frame.set_halign(gtk::Align::Fill);
-            card.frame.set_width_request(-1);
-        }
-        let chrome_visibility = card_chrome_visibility(
-            card_chrome_mode_for_session(context, *session_id),
-            focus_mode,
-            !card.alert.label().is_empty(),
+        sync_terminal_dim_overlay(
+            card,
+            focused_terminal_id == Some(*session_id) || sync_targets.contains(session_id),
         );
-        card.headline
-            .set_visible(chrome_visibility.headline_visible);
-        card.alert.set_wrap(focus_mode);
-        card.alert.set_single_line_mode(!focus_mode);
-        card.alert.set_ellipsize(if focus_mode {
-            gtk::pango::EllipsizeMode::None
-        } else {
-            gtk::pango::EllipsizeMode::End
-        });
-        let summary = if focus_mode {
-            let evidence = context
-                .observations
-                .borrow()
-                .get(session_id)
-                .map(|observation| {
-                    build_tactical_evidence(
-                        context
-                            .state
-                            .borrow()
-                            .session(*session_id)
-                            .expect("session should exist"),
-                        observation,
-                    )
-                });
-            evidence.and_then(|evidence| current_summary(context, *session_id, &evidence))
-        } else {
-            None
-        };
-        if focus_mode {
-            let combined_headline = combined_focus_summary_text(
-                summary
-                    .as_ref()
-                    .and_then(|s| s.headline.as_deref())
-                    .unwrap_or(""),
-                summary.as_ref().and_then(|s| s.attention_brief.as_deref()),
-            );
-            card.headline.set_label(&combined_headline);
+        card.frame.set_hexpand(true);
+        card.frame.set_halign(gtk::Align::Fill);
+        card.frame.set_width_request(-1);
+    }
+
+    for (group_id, card) in context.group_cards.borrow().iter() {
+        card.frame.remove_css_class("selected-card");
+        card.frame.remove_css_class("single-card");
+        if selected_item == Some(WorkspaceItem::Group(*group_id)) {
+            card.frame.add_css_class("selected-card");
         }
-        card.headline.set_vexpand(focus_mode);
-        card.headline_row.set_vexpand(focus_mode);
-        card.headline_row.set_valign(if focus_mode {
-            gtk::Align::Fill
-        } else {
-            gtk::Align::Start
-        });
-        card.headline.set_valign(gtk::Align::Start);
-        card.headline.set_lines(if focus_mode { 4 } else { 2 });
-        apply_attention_pill(
-            &card.attention_pill,
-            if focus_mode { summary.as_ref() } else { None },
-        );
-        card.attention_pill
-            .set_visible(focus_mode && summary.is_some());
-        apply_summary_chrome_visibility(card, chrome_visibility);
-        let shows_terminal = battlefield_embeds_terminal(context, *session_id);
-        apply_metric_bar_layout(card, shows_terminal);
-        if shows_terminal {
-            card.frame.remove_css_class("scrollback-card");
-            card.terminal_slot
-                .remove_css_class("scrollback-terminal-hidden");
-        } else {
-            card.frame.add_css_class("scrollback-card");
-            card.terminal_slot
-                .add_css_class("scrollback-terminal-hidden");
+        if single_card_mode {
+            card.frame.add_css_class("single-card");
         }
-        if focus_mode {
-            card.middle_stack.set_visible_child_name("scrollback");
-            card.middle_stack.set_visible(false);
-        } else {
-            card.middle_stack.set_visible(true);
-            card.middle_stack.set_visible_child_name(if shows_terminal {
-                "terminal"
-            } else {
-                "scrollback"
-            });
-            card.scrollback_band.set_visible(!shows_terminal);
-            if single_card_mode {
-                card.frame.add_css_class("single-card");
-            }
-        }
+        card.frame.set_hexpand(true);
+        card.frame.set_halign(gtk::Align::Fill);
+        card.frame.set_width_request(-1);
     }
 }
 
-fn show_intervention(context: &Rc<AppContext>, session_id: SessionId) {
-    context.state.borrow_mut().enter_focus_mode(session_id);
-    context
-        .sync_inputs_permitted
-        .store(false, Ordering::Relaxed);
-    context.focus.panel.set_visible(true);
-    context.content_root.add_css_class("focus-mode");
-    context.cards.set_column_homogeneous(false);
-    context.cards.set_row_homogeneous(false);
-    context.cards.set_halign(gtk::Align::Start);
-    context.battlefield_panel.set_vexpand(false);
-    context.battlefield_panel.set_height_request(240);
-    context
-        .battlefield_panel
-        .set_hscrollbar_policy(gtk::PolicyType::Automatic);
-    sync_grid_layout(context);
-    sync_terminal_parents(context);
-    refresh_card_styles(context);
-    refresh_focus_panel(context);
-    refresh_workspace(context);
-    schedule_runtime_size_sync(context);
+fn sync_terminal_dim_overlay(card: &SessionCardWidgets, focused: bool) {
+    card.terminal_dim_overlay.set_visible(!focused);
 }
 
-fn show_battlefield(context: &Rc<AppContext>) {
-    context.state.borrow_mut().return_to_battlefield();
-    context.sync_inputs_permitted.store(true, Ordering::Relaxed);
-    context.focus.panel.set_visible(false);
-    context.content_root.remove_css_class("focus-mode");
+fn point_inside_widget<S: IsA<gtk::Widget>, T: IsA<gtk::Widget>>(
+    source: &S,
+    target: &T,
+    x: f64,
+    y: f64,
+) -> bool {
+    source
+        .compute_point(target, &gtk::graphene::Point::new(x as f32, y as f32))
+        .is_some_and(|point| {
+            point.x() >= 0.0
+                && point.y() >= 0.0
+                && point.x() < target.width() as f32
+                && point.y() < target.height() as f32
+        })
+}
+
+fn display_supervisor_visible(context: &Rc<AppContext>, group: &SupervisedGroupRecord) -> bool {
+    context
+        .pending_supervisor_visibility
+        .borrow()
+        .get(&group.id)
+        .copied()
+        .unwrap_or(group.supervisor_visible)
+}
+
+fn current_input_sync_scope(context: &Rc<AppContext>) -> InputSyncScope {
+    context
+        .expanded_group
+        .get()
+        .map(|group_id| InputSyncScope::GroupMembers { group_id })
+        .unwrap_or(InputSyncScope::RootVisible)
+}
+
+fn sync_input_scope_with_daemon(context: &Rc<AppContext>) {
+    if let Some(beachhead) = context.beachhead.as_ref() {
+        let _ = beachhead.commands().send(ClientMessage::SetInputSync {
+            enabled: context.sync_inputs_enabled.get(),
+            scope: current_input_sync_scope(context),
+        });
+    }
+}
+
+fn input_sync_target_session_ids(context: &Rc<AppContext>) -> Vec<SessionId> {
+    let state = context.state.borrow();
+    if let Some(group_id) = context.expanded_group.get() {
+        return state
+            .group(group_id)
+            .map(|group| {
+                group
+                    .member_session_ids
+                    .iter()
+                    .copied()
+                    .filter(|session_id| state.session(*session_id).is_some())
+                    .collect()
+            })
+            .unwrap_or_default();
+    }
+
+    let supervisor_ids = state
+        .groups()
+        .iter()
+        .filter_map(|group| group.supervisor_session_id)
+        .collect::<Vec<_>>();
+    state
+        .ordered_visible_items()
+        .iter()
+        .filter_map(|item| match *item {
+            WorkspaceItem::Session(session_id)
+                if state.session(session_id).is_some() && !supervisor_ids.contains(&session_id) =>
+            {
+                Some(session_id)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn focus_sync_input_anchor(context: &Rc<AppContext>) -> bool {
+    let targets = input_sync_target_session_ids(context);
+    if targets.is_empty() {
+        return false;
+    }
+    if context
+        .focused_terminal_id
+        .get()
+        .is_some_and(|session_id| targets.contains(&session_id))
+    {
+        refresh_card_styles(context);
+        return true;
+    }
+    let session_id = targets[0];
+    context.state.borrow_mut().select_session(session_id);
+    focus_session_terminal(context, session_id)
+}
+
+fn focus_session_terminal(context: &Rc<AppContext>, session_id: SessionId) -> bool {
+    let Some(card) = context.session_cards.borrow().get(&session_id).cloned() else {
+        return false;
+    };
+    context.focused_terminal_id.set(Some(session_id));
+    refresh_card_styles(context);
+    card.terminal.grab_focus();
+    card.terminal_dim_overlay.set_visible(false);
+    let context = context.clone();
+    glib::idle_add_local_once(move || {
+        card.terminal.grab_focus();
+        context.focused_terminal_id.set(Some(session_id));
+        refresh_card_styles(&context);
+    });
+    true
+}
+
+fn maybe_focus_initial_terminal(context: &Rc<AppContext>) {
+    if context.initial_terminal_focus_done.get() || context.session_cards.borrow().is_empty() {
+        return;
+    }
+    context.initial_terminal_focus_done.set(true);
+    let context = context.clone();
+    glib::idle_add_local_once(move || {
+        if !focus_selected_visible_terminal(&context) {
+            context.initial_terminal_focus_done.set(false);
+        }
+    });
+}
+
+fn focus_selected_visible_terminal(context: &Rc<AppContext>) -> bool {
+    let session_id = context
+        .state
+        .borrow()
+        .selected_session()
+        .or_else(|| visible_battlefield_session_ids(context).first().copied());
+    let Some(session_id) = session_id else {
+        return false;
+    };
+    if !battlefield_embeds_terminal(context, session_id)
+        && !session_visible_as_group_supervisor(context, session_id)
+    {
+        return false;
+    }
+    context.state.borrow_mut().select_session(session_id);
+    refresh_card_styles(context);
+    focus_session_terminal(context, session_id)
+}
+
+fn terminal_visible_for_focus(context: &Rc<AppContext>, session_id: SessionId) -> bool {
+    battlefield_embeds_terminal(context, session_id)
+        || session_visible_as_group_supervisor(context, session_id)
+}
+
+fn reset_battlefield_view(context: &Rc<AppContext>) {
     context.cards.set_column_homogeneous(true);
     context.cards.set_row_homogeneous(true);
     context.cards.set_halign(gtk::Align::Fill);
@@ -2700,190 +2786,152 @@ fn show_battlefield(context: &Rc<AppContext>) {
     schedule_runtime_size_sync(context);
 }
 
-fn refresh_focus_panel(context: &Rc<AppContext>) {
-    let Some(session_id) = context.state.borrow().focused_session() else {
-        return;
-    };
+fn battlefield_workspace_items(context: &Rc<AppContext>) -> Vec<WorkspaceItem> {
     let state = context.state.borrow();
-    let Some(session) = state.session(session_id) else {
-        return;
-    };
-    let observations = context.observations.borrow();
-    let Some(observation) = observations.get(&session_id) else {
-        return;
-    };
-    let observed = ObservedActivity {
-        active_command: observation.active_command.clone(),
-        dominant_process: observation.dominant_process.clone(),
-        recent_files: observation.recent_files.clone(),
-        work_output_excerpt: observation.work_output_excerpt.clone(),
-        idle_seconds: Some(observation.last_change.elapsed().as_secs()),
-    };
-    let mut card_model = build_battle_card(session, &observed);
-    let evidence = build_tactical_evidence(session, observation);
-    let live_summary = if should_show_summary(context, session_id) {
-        current_summary(context, session_id, &evidence)
-    } else {
-        None
-    };
-    if let Some(summary) = live_summary.clone() {
-        card_model = apply_tactical_synthesis(card_model, summary);
+    if let Some(group_id) = context.expanded_group.get() {
+        if let Some(group) = state.group(group_id) {
+            return group
+                .member_session_ids
+                .iter()
+                .copied()
+                .filter(|session_id| state.session(*session_id).is_some())
+                .map(WorkspaceItem::Session)
+                .collect();
+        }
     }
-    let chrome_mode = CardChromeMode::from_summary(live_summary.as_ref());
-    let visual_status = if chrome_mode.summarized() {
-        card_model.status
-    } else {
-        BattleCardStatus::Idle
-    };
 
-    context
-        .focus
-        .title
-        .set_label(&ui_display_name(session, chrome_mode));
-    context.focus.title.set_visible(chrome_mode.summarized());
-    apply_battle_status_style(&context.focus.status, visual_status);
-    apply_battle_card_surface_style(&context.focus.frame, visual_status);
-    context.focus.status.set_label(&status_chip_label(
-        card_model.status,
-        &card_model.recency_label,
-    ));
-    context.focus.status.set_visible(chrome_mode.summarized());
-    context
-        .focus
-        .header
-        .set_visible(context.focus.title.is_visible() || context.focus.status.is_visible());
-    context.focus.headline.set_label(&card_model.headline);
-    context
-        .focus
-        .headline
-        .set_label(&combined_focus_summary_text(
-            &card_model.headline,
-            live_summary
-                .as_ref()
-                .and_then(|summary| summary.attention_brief.as_deref()),
-        ));
-    context.focus.headline.set_lines(4);
-    context.focus.headline.set_vexpand(true);
-    context.focus.headline.set_valign(gtk::Align::Start);
-    context
-        .focus
-        .headline
-        .set_visible(chrome_mode.summarized() && !context.focus.headline.label().is_empty());
-    apply_focus_attention_pill(&context.focus.attention_pill, live_summary.as_ref());
-    context.focus.summary_box.set_visible(
-        context.focus.headline.is_visible() || context.focus.attention_pill.is_visible(),
-    );
-    context.focus.alert.set_label("");
-    context.focus.alert.set_visible(false);
-    context
-        .focus
-        .bars
-        .set_orientation(gtk::Orientation::Horizontal);
-    context.focus.bars.set_visible(false);
-    apply_segmented_bar(
-        &context.focus.momentum_bar,
-        attention_bar_presentation(live_summary.as_ref()).as_ref(),
-        live_summary.is_some(),
-    );
-    apply_segmented_bar(&context.focus.risk_bar, None, false);
+    state.ordered_visible_items().to_vec()
 }
 
 fn sync_grid_layout(context: &Rc<AppContext>) {
-    let order = context.state.borrow().ordered_session_ids().to_vec();
+    let order = battlefield_workspace_items(context);
     let total = order.len();
     if total == 0 {
-        *context.cached_tiling.borrow_mut() = None;
-        return;
-    }
-
-    let focused = context.state.borrow().focused_session().is_some();
-    let available_width = context.battlefield_panel.width();
-    let tiling = compute_tiling(total, available_width, focused);
-
-    if context.cached_tiling.borrow().as_ref() == Some(&tiling) {
-        return;
-    }
-
-    let cards = context.session_cards.borrow();
-    for session_id in &order {
-        if let Some(card) = cards.get(session_id) {
+        for card in context.session_cards.borrow().values() {
             if card.frame.parent().is_some() {
                 context.cards.remove(&card.frame);
             }
         }
-    }
-    for (i, placement) in tiling.placements.iter().enumerate() {
-        if let Some(session_id) = order.get(i) {
-            if let Some(card) = cards.get(session_id) {
-                context.cards.attach(
-                    &card.frame,
-                    placement.col as i32,
-                    placement.row as i32,
-                    placement.col_span as i32,
-                    1,
-                );
+        for card in context.group_cards.borrow().values() {
+            if card.frame.parent().is_some() {
+                context.cards.remove(&card.frame);
             }
         }
+        *context.cached_tiling.borrow_mut() = None;
+        context.cached_layout_items.borrow_mut().clear();
+        return;
     }
+
+    let available_width = context.battlefield_panel.width();
+    let tiling = compute_tiling(total, available_width);
+
+    if context.cached_tiling.borrow().as_ref() == Some(&tiling)
+        && context.cached_layout_items.borrow().as_slice() == order.as_slice()
+    {
+        return;
+    }
+
+    let cards = context.session_cards.borrow();
+    for card in cards.values() {
+        if card.frame.parent().is_some() {
+            context.cards.remove(&card.frame);
+        }
+    }
+    let group_cards = context.group_cards.borrow();
+    for card in group_cards.values() {
+        if card.frame.parent().is_some() {
+            context.cards.remove(&card.frame);
+        }
+    }
+    for (i, placement) in tiling.placements.iter().enumerate() {
+        match order.get(i).copied() {
+            Some(WorkspaceItem::Session(session_id)) => {
+                if let Some(card) = cards.get(&session_id) {
+                    context.cards.attach(
+                        &card.frame,
+                        placement.col as i32,
+                        placement.row as i32,
+                        placement.col_span as i32,
+                        1,
+                    );
+                }
+            }
+            Some(WorkspaceItem::Group(group_id)) => {
+                if let Some(card) = group_cards.get(&group_id) {
+                    context.cards.attach(
+                        &card.frame,
+                        placement.col as i32,
+                        placement.row as i32,
+                        placement.col_span as i32,
+                        1,
+                    );
+                }
+            }
+            None => {}
+        }
+    }
+    drop(group_cards);
     drop(cards);
 
     *context.cached_tiling.borrow_mut() = Some(tiling);
+    *context.cached_layout_items.borrow_mut() = order;
 }
 
-fn battlefield_embeds_terminal(context: &Rc<AppContext>, _session_id: SessionId) -> bool {
-    if context.state.borrow().focused_session().is_some() {
+fn session_visible_as_group_supervisor(context: &Rc<AppContext>, session_id: SessionId) -> bool {
+    if context.expanded_group.get().is_some() {
         return false;
     }
 
-    let total = context.session_cards.borrow().len();
-    if total == 0 {
-        return false;
-    }
-
-    let columns = current_battlefield_columns(context).max(1);
-    let available_width = context.battlefield_panel.width();
-    let available_height = context.battlefield_panel.height();
-    battlefield_can_embed_terminals(total, columns, available_width, available_height)
+    context.state.borrow().groups().iter().any(|group| {
+        display_supervisor_visible(context, group)
+            && group.supervisor_session_id == Some(session_id)
+    })
 }
 
-fn current_battlefield_columns(context: &Rc<AppContext>) -> usize {
+fn group_supervisor_terminal_slot(
+    context: &Rc<AppContext>,
+    session_id: SessionId,
+) -> Option<gtk::Box> {
+    let state = context.state.borrow();
+    let group_id = state.groups().iter().find_map(|group| {
+        (display_supervisor_visible(context, group)
+            && group.supervisor_session_id == Some(session_id))
+        .then_some(group.id)
+    })?;
     context
-        .cached_tiling
+        .group_cards
         .borrow()
-        .as_ref()
-        .map_or(0, |t| t.columns)
-        .max(1)
+        .get(&group_id)
+        .map(|card| card.terminal_slot.clone())
 }
 
-fn focused_embedded_terminal_session(context: &Rc<AppContext>) -> Option<SessionId> {
+fn visible_battlefield_session_ids(context: &Rc<AppContext>) -> Vec<SessionId> {
+    battlefield_workspace_items(context)
+        .into_iter()
+        .filter_map(|item| match item {
+            WorkspaceItem::Session(session_id) => Some(session_id),
+            WorkspaceItem::Group(_) => None,
+        })
+        .collect()
+}
+
+fn visible_workspace_item_count(context: &Rc<AppContext>) -> usize {
+    battlefield_workspace_items(context).len()
+}
+
+fn battlefield_embeds_terminal(context: &Rc<AppContext>, session_id: SessionId) -> bool {
+    visible_battlefield_session_ids(context).contains(&session_id)
+}
+
+fn focused_visible_terminal_session(context: &Rc<AppContext>) -> Option<SessionId> {
     context
         .session_cards
         .borrow()
         .iter()
         .find_map(|(session_id, card)| {
-            (battlefield_embeds_terminal(context, *session_id) && card.terminal.has_focus())
+            (terminal_visible_for_focus(context, *session_id) && card.terminal.has_focus())
                 .then_some(*session_id)
         })
-}
-
-pub(crate) fn update_nudge_widgets(context: &Rc<AppContext>, session_id: SessionId) {
-    if let Some(card) = context.session_cards.borrow().get(&session_id) {
-        apply_nudge_pill(&context.nudge_cache.borrow(), session_id, &card.nudge_state);
-    }
-}
-
-fn apply_summary_chrome_visibility(card: &SessionCardWidgets, visibility: CardChromeVisibility) {
-    card.title.set_visible(visibility.title_visible);
-    card.headline.set_visible(visibility.headline_visible);
-    card.status.set_visible(visibility.status_visible);
-    card.header.set_visible(visibility.header_visible);
-    card.headline_row
-        .set_visible(visibility.headline_visible || visibility.nudge_row_visible);
-    card.bars.set_visible(visibility.bars_visible);
-    card.nudge_state.set_visible(visibility.nudge_state_visible);
-    card.nudge_row.set_visible(visibility.nudge_row_visible);
-    card.footer
-        .set_visible(visibility.bars_visible || card.recency.is_visible());
 }
 
 fn schedule_runtime_size_sync(context: &Rc<AppContext>) {
@@ -2894,58 +2942,16 @@ fn schedule_runtime_size_sync(context: &Rc<AppContext>) {
     });
 }
 
-fn visible_scrollback_line_capacity(height: i32) -> usize {
-    layout_visible_scrollback_line_capacity(height)
-}
-
-fn repopulate_scrollback_band(
-    scrollback_band: &gtk::DrawingArea,
-    scrollback_lines: &Rc<RefCell<Vec<String>>>,
-    lines: &[String],
-) {
-    let items = if lines.is_empty() {
-        vec![" ".to_string()]
-    } else {
-        lines.to_vec()
-    };
-    *scrollback_lines.borrow_mut() = items;
-    scrollback_band.queue_draw();
-}
-
-fn apply_nudge_pill(
-    cache: &BTreeMap<SessionId, NudgeCacheEntry>,
-    session_id: SessionId,
-    state: &gtk::Label,
-) {
-    let cooldown_active = cache
-        .get(&session_id)
-        .and_then(|entry| entry.last_sent)
-        .is_some_and(|sent| sent.elapsed() < Duration::from_secs(120));
-    let hovered = cache.get(&session_id).is_some_and(|entry| entry.hovered);
-    let enabled = cache.get(&session_id).is_some_and(|entry| entry.enabled);
-    let presentation = nudge_state_presentation(enabled, cooldown_active, hovered);
-
-    for candidate in [
-        "card-control-off",
-        "card-control-armed",
-        "card-control-nudged",
-        "card-control-cooldown",
-    ] {
-        state.remove_css_class(candidate);
-    }
-    state.add_css_class(presentation.css_class);
-    state.set_label(presentation.label);
-    state.set_visible(true);
-}
-
 fn sync_terminal_parents(context: &Rc<AppContext>) {
-    let focused = context.state.borrow().focused_session();
     for (session_id, card) in context.session_cards.borrow().iter() {
-        if focused == Some(*session_id) {
-            reparent_widget_to_box(&card.terminal_view, &context.focus.terminal_slot);
-            card.terminal.grab_focus();
+        if session_visible_as_group_supervisor(context, *session_id) {
+            if let Some(slot) = group_supervisor_terminal_slot(context, *session_id) {
+                reparent_widget_to_box(&card.terminal_overlay, &slot);
+            } else {
+                reparent_widget_to_box(&card.terminal_overlay, &card.terminal_slot);
+            }
         } else {
-            reparent_widget_to_box(&card.terminal_view, &card.terminal_slot);
+            reparent_widget_to_box(&card.terminal_overlay, &card.terminal_slot);
         }
     }
 }
@@ -2973,14 +2979,11 @@ fn reparent_widget_to_box<W: IsA<gtk::Widget>>(widget: &W, target: &gtk::Box) {
 #[cfg(test)]
 mod tests {
     use super::{
-        active_provider_preferences, card_chrome_visibility, metric_bar_layout, parse_run_mode,
-        record_provider_demotion, summary_refresh_interval, CardChromeMode,
-        PROVIDER_DEMOTION_COOLDOWN, RunMode, SummaryCacheEntry,
+        group_assessment_from_markdown, is_markdown_table_separator, markdown_inline_to_pango,
+        parse_markdown_table, parse_run_mode, GroupAssessment, RunMode,
+        TERMINATOR_AMBIENCE_BACKGROUND, TERMINATOR_AMBIENCE_FOREGROUND,
+        TERMINATOR_AMBIENCE_PALETTE,
     };
-    use exaterm_core::synthesis::SynthesisProvider;
-    use gtk::Orientation;
-    use std::collections::BTreeMap;
-    use std::time::Duration;
 
     #[test]
     fn parses_ssh_run_mode() {
@@ -3000,102 +3003,65 @@ mod tests {
     }
 
     #[test]
-    fn summary_refresh_interval_is_fixed_at_five_minutes() {
+    fn terminal_theme_uses_full_palette() {
+        assert_eq!(TERMINATOR_AMBIENCE_PALETTE.len(), 16);
+        assert_eq!(TERMINATOR_AMBIENCE_FOREGROUND, "#ffffff");
+        assert_eq!(TERMINATOR_AMBIENCE_BACKGROUND, "#000000");
+    }
+
+    #[test]
+    fn group_assessment_uses_summary_language() {
         assert_eq!(
-            summary_refresh_interval(Duration::from_secs(0)),
-            Duration::from_secs(300)
+            group_assessment_from_markdown(
+                "| Worker | State |\n|---|---|\n| 1 | blocked on auth error |"
+            ),
+            GroupAssessment::Stalling
         );
         assert_eq!(
-            summary_refresh_interval(Duration::from_secs(59)),
-            Duration::from_secs(300)
+            group_assessment_from_markdown(
+                "Blocked: most agents cannot proceed at all because credentials are unavailable."
+            ),
+            GroupAssessment::Blocked
         );
         assert_eq!(
-            summary_refresh_interval(Duration::from_secs(60)),
-            Duration::from_secs(300)
+            group_assessment_from_markdown(
+                "Stalling: despite supervisor prods, the workers are looping on the same failure."
+            ),
+            GroupAssessment::Stalling
         );
         assert_eq!(
-            summary_refresh_interval(Duration::from_secs(179)),
-            Duration::from_secs(300)
+            group_assessment_from_markdown(
+                "Workers are running tests and making progress despite compile errors."
+            ),
+            GroupAssessment::Active
         );
         assert_eq!(
-            summary_refresh_interval(Duration::from_secs(180)),
-            Duration::from_secs(300)
-        );
-        assert_eq!(
-            summary_refresh_interval(Duration::from_secs(299)),
-            Duration::from_secs(300)
-        );
-        assert_eq!(
-            summary_refresh_interval(Duration::from_secs(300)),
-            Duration::from_secs(300)
-        );
-        assert_eq!(
-            summary_refresh_interval(Duration::from_secs(900)),
-            Duration::from_secs(300)
+            group_assessment_from_markdown("All tests pass; task complete."),
+            GroupAssessment::Complete
         );
     }
 
     #[test]
-    fn sparse_shell_hides_all_summary_chrome() {
-        let visibility = card_chrome_visibility(CardChromeMode::SparseShell, false, false);
+    fn markdown_table_parser_accepts_common_table_shape() {
+        let lines = [
+            "| Worker | State | Next |",
+            "|---|---|---|",
+            "| 1 | Working | monitor |",
+            "| 2 | Stalling | prod sent |",
+        ];
+        let (headers, rows, consumed) = parse_markdown_table(&lines).expect("parse table");
 
-        assert!(!visibility.title_visible);
-        assert!(!visibility.status_visible);
-        assert!(!visibility.header_visible);
-        assert!(!visibility.bars_visible);
-        assert!(!visibility.nudge_state_visible);
-        assert!(!visibility.nudge_row_visible);
+        assert_eq!(headers, vec!["Worker", "State", "Next"]);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(consumed, 4);
+        assert!(is_markdown_table_separator("---"));
     }
 
     #[test]
-    fn summarized_mode_shows_full_card_chrome() {
-        let visibility = card_chrome_visibility(CardChromeMode::Summarized, false, true);
-
-        assert!(visibility.title_visible);
-        assert!(visibility.status_visible);
-        assert!(visibility.header_visible);
-        assert!(visibility.bars_visible);
-        assert!(visibility.nudge_state_visible);
-        assert!(visibility.nudge_row_visible);
-    }
-
-    #[test]
-    fn active_provider_preferences_excludes_expired_demotions() {
-        let mut skipped_providers = BTreeMap::new();
-        skipped_providers.insert(
-            SynthesisProvider::OpenAi,
-            std::time::Instant::now() - PROVIDER_DEMOTION_COOLDOWN - Duration::from_secs(1),
+    fn markdown_inline_renderer_escapes_markup_and_code() {
+        assert_eq!(
+            markdown_inline_to_pango("run `cargo test` <now>"),
+            "run <tt>cargo test</tt> &lt;now&gt;"
         );
-        skipped_providers.insert(SynthesisProvider::CodexCli, std::time::Instant::now());
-
-        let preferences = active_provider_preferences(&skipped_providers);
-
-        assert!(!preferences
-            .skipped_providers
-            .contains(&SynthesisProvider::OpenAi));
-        assert!(preferences
-            .skipped_providers
-            .contains(&SynthesisProvider::CodexCli));
-    }
-
-    #[test]
-    fn record_provider_demotion_updates_summary_cache_preferences() {
-        let mut entry = SummaryCacheEntry::new();
-        record_provider_demotion(&mut entry.skipped_providers, SynthesisProvider::ClaudeCli);
-
-        let preferences = active_provider_preferences(&entry.skipped_providers);
-        assert!(preferences
-            .skipped_providers
-            .contains(&SynthesisProvider::ClaudeCli));
-    }
-
-    #[test]
-    fn single_visible_metric_bar_stacks_even_with_terminal() {
-        assert_eq!(metric_bar_layout(true, 1), (Orientation::Vertical, false));
-    }
-
-    #[test]
-    fn two_visible_metric_bars_share_horizontal_terminal_row() {
-        assert_eq!(metric_bar_layout(true, 2), (Orientation::Horizontal, true));
     }
 }
