@@ -34,6 +34,18 @@ use objc2_foundation::{NSPoint, NSRect, NSSize};
 #[cfg(target_os = "macos")]
 fn main() {
     let argv = std::env::args().collect::<Vec<_>>();
+    if argv.get(1).map(|s| s.as_str()) == Some("--mcp-stdio-bridge") {
+        let Some(socket_path) = argv.get(2) else {
+            eprintln!("usage: exaterm-macos --mcp-stdio-bridge <socket-path>");
+            std::process::exit(2);
+        };
+        let code = exaterm_core::run_mcp_stdio_bridge(std::path::Path::new(socket_path));
+        std::process::exit(if code == std::process::ExitCode::SUCCESS {
+            0
+        } else {
+            1
+        });
+    }
     if argv.get(1).map(|s| s.as_str()) == Some("--beachhead-daemon") {
         let code = exaterm_core::run_local_daemon();
         std::process::exit(if code == std::process::ExitCode::SUCCESS {
@@ -88,6 +100,12 @@ fn run_app(mode: exaterm_ui::beachhead::RunMode) {
             std::process::exit(1);
         }
     };
+
+    if let Ok(origin) = exaterm_core::pet::load_or_create_client_pet_origin() {
+        let _ = beachhead
+            .commands()
+            .send(exaterm_types::proto::ClientMessage::SetPetOrigin { origin });
+    }
 
     // Request the default workspace.
     let _ = beachhead
@@ -209,6 +227,7 @@ fn run_app(mode: exaterm_ui::beachhead::RunMode) {
                         timer_state.borrow_mut().apply_snapshot(&snapshot);
                     }
                     exaterm_types::proto::ServerMessage::TerminalAssistCompleted { .. } => {}
+                    exaterm_types::proto::ServerMessage::PetComment { .. } => {}
                     exaterm_types::proto::ServerMessage::Error { message } => {
                         eprintln!("exaterm: daemon error: {message}");
                     }

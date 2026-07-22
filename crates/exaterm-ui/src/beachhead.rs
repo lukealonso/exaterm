@@ -1,4 +1,3 @@
-use exaterm_core::config::{apply_app_config_environment, load_app_config, AppConfig};
 use exaterm_core::daemon::{connect_session_stream_socket, LocalBeachheadClient};
 use exaterm_types::model::SessionId;
 use exaterm_types::proto::{ClientMessage, ServerMessage};
@@ -6,6 +5,7 @@ use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsString;
 use std::fs;
+use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -17,6 +17,44 @@ const REMOTE_STATE_SUBDIR: &str = ".local/state/exaterm";
 const REMOTE_RUNTIME_SUBDIR: &str = ".local/state/exaterm/runtime";
 const REMOTE_BIN_SUBDIR: &str = ".local/state/exaterm/bin";
 const CONTROL_SOCKET_NAME: &str = "beachhead-control.sock";
+const REMOTE_WORKSPACE_SCAN_SCRIPT: &str = r#"
+set -eu
+base="$HOME/.local/state/exaterm/runtime/exaterm"
+
+socket_is_live() {
+  socket_path=$1
+  [ -S "$socket_path" ] || return 1
+  [ -r /proc/net/unix ] || return 0
+  awk -v socket_path="$socket_path" 'substr($0, length($0) - length(socket_path) + 1) == socket_path { found=1 } END { exit !found }' /proc/net/unix
+}
+
+control="$base/beachhead-control.sock"
+if [ -S "$control" ]; then
+  if socket_is_live "$control"; then
+    printf '%s\t%s\n' '' 'Default'
+  else
+    for socket in "$base"/*.sock; do
+      [ -S "$socket" ] || continue
+      rm -f "$socket"
+    done
+  fi
+fi
+
+if [ -d "$base" ]; then
+  for dir in "$base"/*; do
+    [ -d "$dir" ] || continue
+    control="$dir/beachhead-control.sock"
+    [ -S "$control" ] || continue
+    if ! socket_is_live "$control"; then
+      rm -rf "$dir"
+      continue
+    fi
+    id=$(basename "$dir")
+    [ -n "$id" ] || continue
+    printf '%s\t%s\n' "$id" "$id"
+  done
+fi
+"#;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LiveWorkspace {
@@ -123,9 +161,15 @@ pub fn parse_run_mode(args: impl IntoIterator<Item = String>) -> Result<ParsedAr
 
 pub fn list_local_live_workspaces() -> Vec<LiveWorkspace> {
     let base = local_daemon_socket_base_dir();
+    list_local_live_workspaces_in(&base)
+}
+
+fn list_local_live_workspaces_in(base: &Path) -> Vec<LiveWorkspace> {
     let mut workspaces = Vec::new();
-    if base.join(CONTROL_SOCKET_NAME).exists() {
-        workspaces.push(LiveWorkspace::new(None));
+    match probe_control_socket(&base.join(CONTROL_SOCKET_NAME)) {
+        ControlSocketProbe::Live => workspaces.push(LiveWorkspace::new(None)),
+        ControlSocketProbe::Stale => remove_socket_files_in(base),
+        ControlSocketProbe::Missing => {}
     }
 
     let Ok(entries) = fs::read_dir(&base) else {
@@ -142,11 +186,15 @@ pub fn list_local_live_workspaces() -> Vec<LiveWorkspace> {
             if id.is_empty() {
                 return None;
             }
-            entry
-                .path()
-                .join(CONTROL_SOCKET_NAME)
-                .exists()
-                .then(|| LiveWorkspace::new(Some(id)))
+            let path = entry.path();
+            match probe_control_socket(&path.join(CONTROL_SOCKET_NAME)) {
+                ControlSocketProbe::Live => Some(LiveWorkspace::new(Some(id))),
+                ControlSocketProbe::Stale => {
+                    let _ = fs::remove_dir_all(path);
+                    None
+                }
+                ControlSocketProbe::Missing => None,
+            }
         })
         .collect::<Vec<_>>();
     named.sort_by(|a, b| a.label.cmp(&b.label));
@@ -154,24 +202,50 @@ pub fn list_local_live_workspaces() -> Vec<LiveWorkspace> {
     workspaces
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ControlSocketProbe {
+    Missing,
+    Live,
+    Stale,
+}
+
+fn probe_control_socket(path: &Path) -> ControlSocketProbe {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return ControlSocketProbe::Missing;
+    };
+    if !metadata.file_type().is_socket() {
+        return ControlSocketProbe::Missing;
+    }
+    match UnixStream::connect(path) {
+        Ok(_) => ControlSocketProbe::Live,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+            ) =>
+        {
+            ControlSocketProbe::Stale
+        }
+        Err(_) => ControlSocketProbe::Live,
+    }
+}
+
+fn remove_socket_files_in(directory: &Path) {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        if entry
+            .file_type()
+            .is_ok_and(|file_type| file_type.is_socket())
+        {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
 pub fn list_remote_live_workspaces(target: &str) -> Result<Vec<LiveWorkspace>, String> {
-    let script = r#"
-set -eu
-base="$HOME/.local/state/exaterm/runtime/exaterm"
-if [ -S "$base/beachhead-control.sock" ]; then
-  printf '%s\t%s\n' '' 'Default'
-fi
-if [ -d "$base" ]; then
-  for dir in "$base"/*; do
-    [ -d "$dir" ] || continue
-    [ -S "$dir/beachhead-control.sock" ] || continue
-    id=$(basename "$dir")
-    [ -n "$id" ] || continue
-    printf '%s\t%s\n' "$id" "$id"
-  done
-fi
-"#;
-    let output = run_remote_shell(target, script)?;
+    let output = run_remote_shell(target, REMOTE_WORKSPACE_SCAN_SCRIPT)?;
     if !output.status.success() {
         return Err(format!(
             "remote workspace scan failed: {}",
@@ -240,9 +314,6 @@ pub struct BeachheadConnection {
 
 impl BeachheadConnection {
     pub fn connect(target: &BeachheadTarget) -> Result<Self, String> {
-        let app_config = load_app_config();
-        apply_app_config_environment(&app_config);
-
         let connection = match target {
             BeachheadTarget::Local => Self {
                 client: LocalBeachheadClient::connect_or_spawn()?,
@@ -258,7 +329,6 @@ impl BeachheadConnection {
                 }
             }
         };
-        configure_terminal_assist(&connection.client, &app_config);
         Ok(connection)
     }
 
@@ -281,19 +351,6 @@ impl BeachheadConnection {
     pub fn raw_session_connector(&self) -> RawSessionConnector {
         self.raw_sessions.clone()
     }
-}
-
-fn configure_terminal_assist(client: &LocalBeachheadClient, config: &AppConfig) {
-    let terminal_assist = config.clone().normalized().terminal_assist;
-    let openai_api_key =
-        (!terminal_assist.openai_api_key.is_empty()).then_some(terminal_assist.openai_api_key);
-    let _ = client
-        .commands
-        .send(ClientMessage::ConfigureTerminalAssist {
-            openai_api_key,
-            openai_base_url: terminal_assist.openai_base_url,
-            model: terminal_assist.model,
-        });
 }
 
 pub struct RemoteBeachheadBridge {
@@ -356,6 +413,7 @@ pub fn connect_remote(
     let local_control = local_socket_dir.join("control.sock");
 
     let mut forward = Command::new("ssh");
+    configure_long_lived_ssh(&mut forward);
     forward
         .arg("-o")
         .arg("ExitOnForwardFailure=yes")
@@ -463,6 +521,7 @@ impl RemoteRawSessionConnector {
             }
 
             let mut forward = Command::new("ssh");
+            configure_long_lived_ssh(&mut forward);
             forward
                 .arg("-o")
                 .arg("ExitOnForwardFailure=yes")
@@ -702,6 +761,16 @@ fn run_remote_shell(target: &str, script: &str) -> Result<std::process::Output, 
     Ok(output)
 }
 
+fn configure_long_lived_ssh(command: &mut Command) {
+    command
+        .arg("-o")
+        .arg("ConnectTimeout=5")
+        .arg("-o")
+        .arg("ServerAliveInterval=5")
+        .arg("-o")
+        .arg("ServerAliveCountMax=2");
+}
+
 fn ssh_shell_command(script: &str) -> String {
     format!("sh -lc {}", shell_quote(script))
 }
@@ -737,8 +806,12 @@ fn wait_for_forwarded_control_socket(
                     "timed out waiting for forwarded remote host connection: {error}"
                 ));
             }
-            Err(_) => {
-                let _ = process.try_wait();
+            Err(error) => {
+                if let Ok(Some(status)) = process.try_wait() {
+                    return Err(format!(
+                        "SSH forwarder exited before the remote host connection was ready ({status}): {error}"
+                    ));
+                }
                 std::thread::sleep(Duration::from_millis(100));
             }
         }
@@ -747,7 +820,98 @@ fn wait_for_forwarded_control_socket(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_run_mode, shell_quote, ssh_shell_command, RunMode, WorkspaceArg};
+    use super::{
+        configure_long_lived_ssh, list_local_live_workspaces_in, parse_run_mode, shell_quote,
+        ssh_shell_command, unique_local_socket_dir, RunMode, WorkspaceArg, CONTROL_SOCKET_NAME,
+        REMOTE_WORKSPACE_SCAN_SCRIPT,
+    };
+    use std::fs;
+    use std::os::unix::net::UnixListener;
+    use std::process::Command;
+
+    #[test]
+    fn local_workspace_scan_excludes_and_cleans_stale_sockets() {
+        let base = unique_local_socket_dir("local-workspace-scan");
+        let named_dir = base.join("named-workspace");
+        fs::create_dir_all(&named_dir).expect("workspace dirs");
+        let default_listener =
+            UnixListener::bind(base.join(CONTROL_SOCKET_NAME)).expect("default listener");
+        let named_listener =
+            UnixListener::bind(named_dir.join(CONTROL_SOCKET_NAME)).expect("named listener");
+        let stale_session_socket = base.join("session-1.sock");
+        drop(UnixListener::bind(&stale_session_socket).expect("session listener"));
+
+        let live = list_local_live_workspaces_in(&base);
+        assert_eq!(live.len(), 2);
+        assert_eq!(live[0].id, None);
+        assert_eq!(live[1].id.as_deref(), Some("named-workspace"));
+
+        drop(default_listener);
+        drop(named_listener);
+        let after_exit = list_local_live_workspaces_in(&base);
+        assert!(after_exit.is_empty());
+        assert!(!base.join(CONTROL_SOCKET_NAME).exists());
+        assert!(!stale_session_socket.exists());
+        assert!(!named_dir.exists());
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn remote_workspace_scan_uses_kernel_liveness_and_cleans_stale_directory() {
+        let home = std::env::temp_dir().join(format!("xrw-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        let workspace_dir = home
+            .join(".local/state/exaterm/runtime/exaterm")
+            .join("remote-workspace");
+        fs::create_dir_all(&workspace_dir).expect("remote workspace dir");
+        let listener = UnixListener::bind(workspace_dir.join(CONTROL_SOCKET_NAME))
+            .expect("remote control listener");
+
+        let live = Command::new("sh")
+            .arg("-c")
+            .arg(REMOTE_WORKSPACE_SCAN_SCRIPT)
+            .env("HOME", &home)
+            .output()
+            .expect("run live remote scan");
+        assert!(live.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&live.stdout).trim(),
+            "remote-workspace\tremote-workspace"
+        );
+
+        drop(listener);
+        let stale = Command::new("sh")
+            .arg("-c")
+            .arg(REMOTE_WORKSPACE_SCAN_SCRIPT)
+            .env("HOME", &home)
+            .output()
+            .expect("run stale remote scan");
+        assert!(stale.status.success());
+        assert!(stale.stdout.is_empty());
+        assert!(!workspace_dir.exists());
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn long_lived_ssh_forwards_detect_dead_hosts() {
+        let mut command = Command::new("ssh");
+        configure_long_lived_ssh(&mut command);
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["-o", "ConnectTimeout=5"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["-o", "ServerAliveInterval=5"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["-o", "ServerAliveCountMax=2"]));
+    }
 
     #[test]
     fn parses_local_run_mode_without_args() {

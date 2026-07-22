@@ -1,12 +1,12 @@
 use crate::beachhead::BeachheadConnection;
 use crate::style::{configure_app_icons, load_css};
 use crate::terminal_adapter::{
-    attach_display_runtime, enable_terminal_image_support, measured_terminal_size_hint,
-    spawn_daemon_display_bridge, spawn_runtime, terminal_display_capabilities, terminal_size_hint,
-    ClientDisplayRuntime,
+    attach_display_runtime, dewrap_terminal_selection, enable_terminal_image_support,
+    measured_terminal_size_hint, spawn_daemon_display_bridge, spawn_runtime,
+    terminal_display_capabilities, terminal_size_hint, ClientDisplayRuntime,
 };
 use crate::widgets::{GroupCardWidgets, SessionCardWidgets};
-use exaterm_core::config::{apply_app_config_environment, load_app_config};
+use exaterm_core::config::load_app_config;
 use exaterm_core::model::{
     blocking_prompt_launch, planning_stream_launch, running_stream_launch, ssh_shell_launch,
     user_shell_launch,
@@ -19,7 +19,8 @@ use exaterm_types::model::{
     GroupId, SessionId, SessionLaunch, SessionRecord, SupervisedGroupRecord, WorkspaceItem,
 };
 use exaterm_types::proto::{
-    ClientMessage, InputSyncScope, ObservationSnapshot, ServerMessage, WorkspaceSnapshot,
+    ClientMessage, InputSyncScope, ObservationSnapshot, PetComment, ServerMessage,
+    WorkspaceSnapshot,
 };
 use exaterm_ui::beachhead::{parse_run_mode, BeachheadTarget, ParsedArgs, RunMode};
 use exaterm_ui::layout::{compute_tiling, GridTiling};
@@ -122,6 +123,8 @@ pub(crate) struct AppContext {
     focus_next_added_terminal: Cell<bool>,
     sync_inputs_enabled: Cell<bool>,
     pending_supervisor_visibility: RefCell<BTreeMap<GroupId, bool>>,
+    active_pet_comments: RefCell<BTreeMap<SessionId, u64>>,
+    active_pet_comment_shown_at: RefCell<BTreeMap<SessionId, Instant>>,
     terminal_audible_bell: bool,
     session_cards: RefCell<BTreeMap<SessionId, SessionCardWidgets>>,
     group_cards: RefCell<BTreeMap<GroupId, GroupCardWidgets>>,
@@ -129,6 +132,7 @@ pub(crate) struct AppContext {
     raw_stream_socket_names: RefCell<BTreeMap<SessionId, String>>,
     pub(crate) runtimes: RefCell<BTreeMap<SessionId, SessionRuntime>>,
     display_runtimes: RefCell<BTreeMap<SessionId, ClientDisplayRuntime>>,
+    connection_error: RefCell<Option<String>>,
     closing_confirmed: Cell<bool>,
 }
 
@@ -176,7 +180,6 @@ pub(crate) fn daemon_backed(context: &AppContext) -> bool {
 }
 
 pub(crate) fn launch_workspace(app: &gtk::Application, parsed: ParsedArgs) {
-    apply_app_config_environment(&load_app_config());
     match parsed.workspace.as_ref() {
         Some(workspace) => std::env::set_var("EXATERM_WORKSPACE", workspace.id()),
         None => std::env::remove_var("EXATERM_WORKSPACE"),
@@ -336,6 +339,8 @@ pub(crate) fn build_ui(app: &gtk::Application, parsed: ParsedArgs) {
         focus_next_added_terminal: Cell::new(false),
         sync_inputs_enabled: Cell::new(false),
         pending_supervisor_visibility: RefCell::new(BTreeMap::new()),
+        active_pet_comments: RefCell::new(BTreeMap::new()),
+        active_pet_comment_shown_at: RefCell::new(BTreeMap::new()),
         terminal_audible_bell: load_app_config().terminal.audible_bell,
         session_cards: RefCell::new(BTreeMap::new()),
         group_cards: RefCell::new(BTreeMap::new()),
@@ -343,6 +348,7 @@ pub(crate) fn build_ui(app: &gtk::Application, parsed: ParsedArgs) {
         raw_stream_socket_names: RefCell::new(BTreeMap::new()),
         runtimes: RefCell::new(BTreeMap::new()),
         display_runtimes: RefCell::new(BTreeMap::new()),
+        connection_error: RefCell::new(None),
         closing_confirmed: Cell::new(false),
     });
 
@@ -455,6 +461,11 @@ pub(crate) fn build_ui(app: &gtk::Application, parsed: ParsedArgs) {
     if visual_gallery_enabled() {
         seed_visual_gallery(&context);
     } else if let Some(beachhead) = context.beachhead.as_ref() {
+        if let Ok(origin) = exaterm_core::pet::load_or_create_client_pet_origin() {
+            let _ = beachhead
+                .commands()
+                .send(ClientMessage::SetPetOrigin { origin });
+        }
         let _ = beachhead
             .commands()
             .send(ClientMessage::SetTerminalDisplayCapabilities {
@@ -850,7 +861,7 @@ fn build_session_terminal_widgets(
     terminal.set_scrollback_lines(100_000);
     terminal.connect_selection_changed(|terminal| {
         if terminal.has_selection() {
-            terminal.copy_clipboard_format(vte::Format::Text);
+            copy_terminal_selection(terminal);
         }
     });
     let terminal_dim_overlay = gtk::Box::builder()
@@ -862,6 +873,36 @@ fn build_session_terminal_widgets(
     terminal_dim_overlay.add_css_class("terminal-dim-overlay");
     terminal_dim_overlay.set_can_target(false);
     terminal_dim_overlay.set_focusable(false);
+    let pet_art = gtk::Label::builder()
+        .label("")
+        .xalign(0.0)
+        .yalign(1.0)
+        .css_classes(vec!["pet-art".to_string()])
+        .build();
+    pet_art.set_selectable(false);
+    let pet_message = gtk::Label::builder()
+        .label("")
+        .xalign(0.0)
+        .yalign(1.0)
+        .wrap(true)
+        .max_width_chars(58)
+        .css_classes(vec!["pet-message".to_string()])
+        .build();
+    pet_message.set_selectable(false);
+    let pet_overlay = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(8)
+        .halign(gtk::Align::Start)
+        .valign(gtk::Align::End)
+        .margin_bottom(18)
+        .margin_start(18)
+        .visible(false)
+        .build();
+    pet_overlay.add_css_class("pet-overlay");
+    pet_overlay.set_can_target(false);
+    pet_overlay.set_focusable(false);
+    pet_overlay.append(&pet_art);
+    pet_overlay.append(&pet_message);
     {
         let enter_context = context.clone();
         let dim_overlay_for_enter = terminal_dim_overlay.clone();
@@ -874,6 +915,7 @@ fn build_session_terminal_widgets(
             }
             enter_context.focused_terminal_id.set(Some(session_id));
             dim_overlay_for_enter.set_visible(false);
+            hide_pet_comment(&enter_context, session_id);
             refresh_card_styles(&enter_context);
         });
         let leave_context = context.clone();
@@ -1000,6 +1042,7 @@ fn build_session_terminal_widgets(
         .vexpand(true)
         .build();
     terminal_overlay.add_overlay(&terminal_dim_overlay);
+    terminal_overlay.add_overlay(&pet_overlay);
     terminal_overlay.add_overlay(&terminal_assist_overlay);
     terminal_slot.append(&terminal_overlay);
     install_terminal_context_menu(context, &terminal, session.id);
@@ -1023,6 +1066,9 @@ fn build_session_terminal_widgets(
         terminal_slot,
         terminal_overlay,
         terminal_dim_overlay,
+        pet_overlay,
+        pet_art,
+        pet_message,
         terminal_assist_overlay,
         terminal_assist_entry,
         terminal_assist_status,
@@ -1701,12 +1747,22 @@ fn install_terminal_context_menu(
     source_session: SessionId,
 ) {
     let actions = gtk::gio::SimpleActionGroup::new();
+    let menu = gtk::gio::Menu::new();
+    let popover = gtk::PopoverMenu::from_model(Some(&menu));
+    popover.set_has_arrow(false);
+    popover.set_autohide(true);
+    popover.set_halign(gtk::Align::Start);
+    popover.set_valign(gtk::Align::Start);
+    popover.set_parent(terminal);
+    popover.set_position(gtk::PositionType::Bottom);
+    popover.add_css_class("menu");
+    popover.add_css_class("context-menu");
 
     let copy_action = gtk::gio::SimpleAction::new("copy", None);
     {
         let terminal = terminal.clone();
         copy_action.connect_activate(move |_, _| {
-            terminal.copy_clipboard_format(vte::Format::Text);
+            copy_terminal_selection(&terminal);
         });
     }
     actions.add_action(&copy_action);
@@ -1723,24 +1779,18 @@ fn install_terminal_context_menu(
     let close_session_action = gtk::gio::SimpleAction::new("close_session", None);
     {
         let context = context.clone();
+        let popover = popover.clone();
         close_session_action.connect_activate(move |_, _| {
-            close_session(&context, source_session);
+            popover.popdown();
+            let context = context.clone();
+            glib::idle_add_local_once(move || {
+                close_session(&context, source_session);
+            });
         });
     }
     actions.add_action(&close_session_action);
 
     terminal.insert_action_group("terminal", Some(&actions));
-
-    let menu = gtk::gio::Menu::new();
-    let popover = gtk::PopoverMenu::from_model(Some(&menu));
-    popover.set_has_arrow(false);
-    popover.set_autohide(true);
-    popover.set_halign(gtk::Align::Start);
-    popover.set_valign(gtk::Align::Start);
-    popover.set_parent(terminal);
-    popover.set_position(gtk::PositionType::Bottom);
-    popover.add_css_class("menu");
-    popover.add_css_class("context-menu");
 
     let right_click = gtk::GestureClick::new();
     right_click.set_button(3);
@@ -1765,6 +1815,16 @@ fn install_terminal_context_menu(
     terminal.add_controller(right_click);
 }
 
+fn copy_terminal_selection(terminal: &vte::Terminal) {
+    let Some(text) = terminal.text_selected(vte::Format::Text) else {
+        return;
+    };
+    let text = dewrap_terminal_selection(text.as_str(), terminal.column_count().max(0) as usize);
+    if let Some(display) = gdk::Display::default() {
+        display.clipboard().set_text(&text);
+    }
+}
+
 fn close_session(context: &Rc<AppContext>, session_id: SessionId) {
     if daemon_backed(context) {
         if let Some(beachhead) = context.beachhead.as_ref() {
@@ -1780,6 +1840,11 @@ fn close_session(context: &Rc<AppContext>, session_id: SessionId) {
         context.cards.remove(&card.frame);
     }
     context.observations.borrow_mut().remove(&session_id);
+    context.active_pet_comments.borrow_mut().remove(&session_id);
+    context
+        .active_pet_comment_shown_at
+        .borrow_mut()
+        .remove(&session_id);
     context.runtimes.borrow_mut().remove(&session_id);
     context.display_runtimes.borrow_mut().remove(&session_id);
     context.state.borrow_mut().remove_session(session_id);
@@ -2183,8 +2248,13 @@ fn drain_daemon_events(context: &Rc<AppContext>) {
             } => {
                 handle_terminal_assist_completed(context, request_id, session_id, inserted, error);
             }
+            ServerMessage::PetComment { comment } => {
+                handle_pet_comment(context, comment);
+            }
             ServerMessage::Error { message } => {
                 eprintln!("host connection error: {message}");
+                handle_connection_error(context, message);
+                changed = true;
             }
         }
     }
@@ -2192,6 +2262,108 @@ fn drain_daemon_events(context: &Rc<AppContext>) {
     if changed {
         refresh_workspace(context);
         refresh_card_styles(context);
+    }
+}
+
+fn handle_connection_error(context: &Rc<AppContext>, message: String) {
+    if context.connection_error.borrow().is_some() {
+        return;
+    }
+    let message = if matches!(context.mode, RunMode::Ssh { .. }) {
+        format!("Remote connection lost: {message}")
+    } else {
+        format!("Host connection lost: {message}")
+    };
+    context.connection_error.replace(Some(message.clone()));
+    for card in context.session_cards.borrow().values() {
+        card.terminal.set_input_enabled(false);
+        card.terminal_dim_overlay.set_visible(true);
+    }
+    let active_assist = *context.terminal_assist_active.borrow();
+    if let Some(active) = active_assist {
+        terminal_assist_failed(
+            context,
+            active.request_id.unwrap_or_default(),
+            active.session_id,
+            &message,
+        );
+    }
+}
+
+fn handle_pet_comment(context: &Rc<AppContext>, comment: PetComment) {
+    let Some(card) = context
+        .session_cards
+        .borrow()
+        .get(&comment.session_id)
+        .cloned()
+    else {
+        return;
+    };
+    if comment.message.trim().is_empty() {
+        return;
+    }
+
+    let art = comment.appearance_ascii.trim();
+    card.pet_art.set_label(art);
+    card.pet_art.set_visible(!art.is_empty());
+    card.pet_message.set_label(&format!(
+        "{}> {}",
+        comment.name.trim(),
+        comment.message.trim()
+    ));
+    card.pet_overlay.set_visible(true);
+    context
+        .active_pet_comments
+        .borrow_mut()
+        .insert(comment.session_id, comment.id);
+    context
+        .active_pet_comment_shown_at
+        .borrow_mut()
+        .insert(comment.session_id, Instant::now());
+
+    let context = context.clone();
+    let session_id = comment.session_id;
+    let comment_id = comment.id;
+    glib::timeout_add_local(Duration::from_secs(comment.ttl_secs), move || {
+        if context
+            .active_pet_comments
+            .borrow()
+            .get(&session_id)
+            .copied()
+            == Some(comment_id)
+        {
+            hide_pet_comment(&context, session_id);
+        }
+        glib::ControlFlow::Break
+    });
+}
+
+fn hide_pet_comment(context: &Rc<AppContext>, session_id: SessionId) {
+    context.active_pet_comments.borrow_mut().remove(&session_id);
+    context
+        .active_pet_comment_shown_at
+        .borrow_mut()
+        .remove(&session_id);
+    if let Some(card) = context.session_cards.borrow().get(&session_id) {
+        card.pet_overlay.set_visible(false);
+    }
+}
+
+fn maybe_hide_pet_comment_for_activity(
+    context: &Rc<AppContext>,
+    session_id: SessionId,
+    last_change_age_secs: u64,
+) {
+    if last_change_age_secs > 1 {
+        return;
+    }
+    let should_hide = context
+        .active_pet_comment_shown_at
+        .borrow()
+        .get(&session_id)
+        .is_some_and(|shown_at| shown_at.elapsed() > Duration::from_secs(2));
+    if should_hide {
+        hide_pet_comment(context, session_id);
     }
 }
 
@@ -2247,6 +2419,11 @@ fn apply_workspace_snapshot(context: &Rc<AppContext>, snapshot: WorkspaceSnapsho
         if let Some(card) = context.session_cards.borrow_mut().remove(&session_id) {
             context.cards.remove(&card.frame);
         }
+        context.active_pet_comments.borrow_mut().remove(&session_id);
+        context
+            .active_pet_comment_shown_at
+            .borrow_mut()
+            .remove(&session_id);
         context.observations.borrow_mut().remove(&session_id);
         context
             .raw_stream_socket_names
@@ -2327,6 +2504,11 @@ fn apply_workspace_snapshot(context: &Rc<AppContext>, snapshot: WorkspaceSnapsho
         context.observations.borrow_mut().insert(
             session.record.id,
             observation_from_snapshot(&session.observation),
+        );
+        maybe_hide_pet_comment_for_activity(
+            context,
+            session.record.id,
+            session.observation.last_change_age_secs,
         );
     }
 
@@ -2457,6 +2639,8 @@ fn drain_runtime_events(context: &Rc<AppContext>) {
                 let mut observations = context.observations.borrow_mut();
                 let observation = observations.entry(session_id).or_default();
                 apply_stream_update(observation, update);
+                drop(observations);
+                hide_pet_comment(context, session_id);
             }
             RuntimeEvent::Exited(exit_code) => {
                 context
@@ -2565,7 +2749,10 @@ fn refresh_workspace(context: &Rc<AppContext>) {
     let is_empty = context.state.borrow().sessions().is_empty();
     context.empty_state.set_visible(is_empty);
     context.battlefield_panel.set_visible(!is_empty);
-    context.title.set_subtitle("");
+    let connection_error = context.connection_error.borrow();
+    context
+        .title
+        .set_subtitle(connection_error.as_deref().unwrap_or(""));
     sync_group_navigation_chrome(context);
 }
 
@@ -2579,6 +2766,7 @@ fn refresh_card_styles(context: &Rc<AppContext>) {
     let selected_item = context.state.borrow().selected_workspace_item();
     let single_card_mode = visible_workspace_item_count(context) == 1;
     let focused_terminal_id = context.focused_terminal_id.get();
+    let connection_available = context.connection_error.borrow().is_none();
     let sync_targets = if context.sync_inputs_enabled.get() {
         input_sync_target_session_ids(context)
     } else {
@@ -2595,7 +2783,8 @@ fn refresh_card_styles(context: &Rc<AppContext>) {
         }
         sync_terminal_dim_overlay(
             card,
-            focused_terminal_id == Some(*session_id) || sync_targets.contains(session_id),
+            connection_available
+                && (focused_terminal_id == Some(*session_id) || sync_targets.contains(session_id)),
         );
         card.frame.set_hexpand(true);
         card.frame.set_halign(gtk::Align::Fill);

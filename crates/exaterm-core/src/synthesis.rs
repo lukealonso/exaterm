@@ -1,46 +1,31 @@
-use crate::config::DEFAULT_TERMINAL_ASSIST_MODEL;
-pub use exaterm_types::synthesis::TerminalAssistSuggestion;
-use serde::de::DeserializeOwned;
-use serde::Serialize;
+use crate::model::SessionId;
+use exaterm_types::synthesis::TerminalAssistSuggestion;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::BTreeSet;
-use std::env;
-use std::error::Error;
-use std::time::Duration;
+use std::collections::{BTreeMap, VecDeque};
+use std::net::{TcpListener, TcpStream};
+use std::process::{Child, Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
+use tungstenite::stream::MaybeTlsStream;
+use tungstenite::{Message, WebSocket};
 
-const OPENAI_TERMINAL_ASSIST_TIMEOUT: Duration = Duration::from_secs(20);
-const TERMINAL_ASSIST_MAX_TOKENS: u16 = 160;
+const APP_SERVER_START_TIMEOUT: Duration = Duration::from_secs(8);
+const APP_SERVER_RPC_TIMEOUT: Duration = Duration::from_secs(120);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum SynthesisProvider {
-    OpenAi,
-}
+const TERMINAL_ASSIST_DEVELOPER_INSTRUCTIONS: &str = r#"
+You are the Ctrl-K terminal command assistant inside Exaterm.
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ProviderPreferences {
-    pub skipped_providers: BTreeSet<SynthesisProvider>,
-}
+For every turn, return exactly one JSON object matching the supplied output schema. The insert_text value is inserted at the cursor in a real terminal but is never executed automatically.
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct OpenAiBackend {
-    api_key: String,
-    base_url: String,
-}
+Use the current terminal evidence in the user message and the preceding turns in this thread. Treat follow-up requests as corrections or refinements of earlier suggestions. Return one shell command or compact one-line shell snippet. Do not include markdown, code fences, prose, labels, comments, or a trailing newline in insert_text.
 
-#[derive(Clone, Debug)]
-pub struct SynthesisBackendRegistry {
-    openai: Option<OpenAiBackend>,
-    terminal_assist_model: String,
-}
+Prefer non-destructive inspection, search, validation, and test commands. Do not propose destructive commands such as rm -rf, git reset --hard, force push, broad chmod or chown, killall, destructive sudo operations, package removal, or data deletion unless the operator explicitly requests that exact action and the target is unambiguous. If the request is unsafe, unrelated to terminal work, or cannot be answered reliably, return an empty insert_text.
 
-#[derive(Debug)]
-pub struct ProviderCallResult<T> {
-    pub provider: Option<SynthesisProvider>,
-    pub value: Result<T, String>,
-    pub demoted_provider: Option<SynthesisProvider>,
-}
+You may inspect the working tree when useful, but never edit files or run commands that change repository or system state.
+"#;
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TerminalAssistEvidence {
     pub session_name: String,
     pub operator_prompt: String,
@@ -55,739 +40,411 @@ pub struct TerminalAssistEvidence {
     pub recent_terminal_history: Vec<String>,
 }
 
-impl SynthesisBackendRegistry {
-    pub fn from_env() -> Option<Self> {
-        let openai = env::var("OPENAI_API_KEY")
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .map(|api_key| OpenAiBackend {
-                api_key,
-                base_url: openai_chat_completions_url(),
-            });
-        let registry = Self {
-            openai,
-            terminal_assist_model: normalize_terminal_assist_model(
-                &env::var("EXATERM_TERMINAL_ASSIST_MODEL").unwrap_or_default(),
-            ),
-        };
-        registry.is_available().then_some(registry)
-    }
+pub struct CodexAppServerClient {
+    socket: WebSocket<MaybeTlsStream<TcpStream>>,
+    child: Child,
+    next_request_id: u64,
+    pending_messages: VecDeque<Value>,
+    terminal_threads: BTreeMap<SessionId, String>,
+}
 
-    pub fn suggest_terminal_assist_blocking(
-        &self,
-        preferences: &ProviderPreferences,
-        evidence: &TerminalAssistEvidence,
-    ) -> ProviderCallResult<TerminalAssistSuggestion> {
-        self.run_with_fallback(preferences, |provider| match provider {
-            SynthesisProvider::OpenAi => suggest_terminal_assist_openai_blocking(
-                self.openai.as_ref().expect("openai backend must exist"),
-                &self.terminal_assist_model,
-                evidence,
-            ),
-        })
-    }
+impl CodexAppServerClient {
+    pub fn launch() -> Result<Self, String> {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .map_err(|error| format!("failed to reserve Codex app-server port: {error}"))?;
+        let port = listener
+            .local_addr()
+            .map_err(|error| format!("failed to read Codex app-server port: {error}"))?
+            .port();
+        drop(listener);
 
-    fn is_available(&self) -> bool {
-        self.openai.is_some()
-    }
+        let url = format!("ws://127.0.0.1:{port}");
+        let mut child = Command::new("codex")
+            .args(["app-server", "--listen", &url])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| format!("failed to start `codex app-server`: {error}"))?;
 
-    fn preferred_provider_order(
-        &self,
-        preferences: &ProviderPreferences,
-    ) -> Vec<SynthesisProvider> {
-        let mut providers = Vec::new();
-        if self.openai.is_some()
-            && !preferences
-                .skipped_providers
-                .contains(&SynthesisProvider::OpenAi)
-        {
-            providers.push(SynthesisProvider::OpenAi);
-        }
-        providers
-    }
-
-    fn run_with_fallback<T, F>(
-        &self,
-        preferences: &ProviderPreferences,
-        mut call: F,
-    ) -> ProviderCallResult<T>
-    where
-        F: FnMut(SynthesisProvider) -> Result<T, String>,
-    {
-        let providers = self.preferred_provider_order(preferences);
-        if providers.is_empty() {
-            return ProviderCallResult {
-                provider: None,
-                value: Err(
-                    "no synthesis provider available after applying provider preferences".into(),
-                ),
-                demoted_provider: None,
-            };
-        }
-
-        let mut first_failed_provider = None::<SynthesisProvider>;
-        let mut last_error = None::<String>;
-        for provider in providers {
-            match call(provider) {
-                Ok(value) => {
-                    return ProviderCallResult {
-                        provider: Some(provider),
-                        value: Ok(value),
-                        demoted_provider: first_failed_provider,
-                    };
-                }
+        let deadline = Instant::now() + APP_SERVER_START_TIMEOUT;
+        let socket = loop {
+            match tungstenite::connect(url.as_str()) {
+                Ok((socket, _)) => break socket,
                 Err(error) => {
-                    if first_failed_provider.is_none() {
-                        first_failed_provider = Some(provider);
-                        last_error = Some(error);
-                    } else {
-                        let previous_error = last_error.take().unwrap_or_default();
-                        last_error = Some(format!(
-                            "{} failed: {previous_error}; {} failed: {error}",
-                            provider_label(
-                                first_failed_provider.expect("first failure should exist")
-                            ),
-                            provider_label(provider),
+                    if let Ok(Some(status)) = child.try_wait() {
+                        return Err(format!(
+                            "`codex app-server` exited during startup: {status}"
                         ));
                     }
+                    if Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(format!(
+                            "timed out connecting to `codex app-server` at {url}: {error}"
+                        ));
+                    }
+                    thread::sleep(Duration::from_millis(40));
                 }
             }
-        }
-
-        let failed_provider = first_failed_provider.expect("provider order was non-empty");
-        ProviderCallResult {
-            provider: Some(failed_provider),
-            value: Err(last_error.expect("failed provider should have an error")),
-            demoted_provider: None,
-        }
-    }
-}
-
-fn provider_label(provider: SynthesisProvider) -> &'static str {
-    match provider {
-        SynthesisProvider::OpenAi => "openai",
-    }
-}
-
-fn openai_chat_completions_url() -> String {
-    let base = env::var("EXATERM_OPENAI_BASE_URL")
-        .or_else(|_| env::var("OPENAI_BASE_URL"))
-        .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
-    let trimmed = base.trim_end_matches('/');
-    if trimmed.ends_with("/chat/completions") {
-        trimmed.to_string()
-    } else {
-        format!("{trimmed}/chat/completions")
-    }
-}
-
-pub fn normalize_terminal_assist_model(model: &str) -> String {
-    let model = model.trim();
-    if model.is_empty() {
-        DEFAULT_TERMINAL_ASSIST_MODEL.into()
-    } else {
-        model.into()
-    }
-}
-
-fn suggest_terminal_assist_openai_blocking(
-    config: &OpenAiBackend,
-    model: &str,
-    evidence: &TerminalAssistEvidence,
-) -> Result<TerminalAssistSuggestion, String> {
-    let request_body = terminal_assist_openai_request_body(model, evidence);
-
-    let client = reqwest::blocking::Client::builder()
-        .http1_only()
-        .connect_timeout(Duration::from_secs(4))
-        .timeout(OPENAI_TERMINAL_ASSIST_TIMEOUT)
-        .build()
-        .map_err(format_error_chain)?;
-
-    let response = client
-        .post(&config.base_url)
-        .bearer_auth(&config.api_key)
-        .header("Content-Type", "application/json")
-        .json(&request_body)
-        .send()
-        .map_err(format_error_chain)?;
-
-    let status = response.status();
-    let payload: Value = response.json().map_err(format_error_chain)?;
-    if !status.is_success() {
-        return Err(payload.to_string());
-    }
-
-    let text = extract_response_text(&payload)
-        .ok_or_else(|| format!("response did not include parseable text: {payload}"))?;
-    parse_json_output::<TerminalAssistSuggestion>(&text, "model terminal assist response")
-        .map(TerminalAssistSuggestion::sanitize)
-}
-
-fn terminal_assist_openai_request_body(model: &str, evidence: &TerminalAssistEvidence) -> Value {
-    json!({
-        "model": model,
-        "max_completion_tokens": TERMINAL_ASSIST_MAX_TOKENS,
-        "messages": [
-            {
-                "role": "system",
-                "content": terminal_assist_system_prompt(),
-            },
-            {
-                "role": "user",
-                "content": terminal_assist_user_prompt(evidence),
-            }
-        ],
-        "response_format": {
-            "type": "json_schema",
-            "json_schema": {
-                "name": "exaterm_terminal_assist",
-                "strict": true,
-                "schema": terminal_assist_schema(),
-            }
-        }
-    })
-}
-
-fn parse_json_output<T>(text: &str, label: &str) -> Result<T, String>
-where
-    T: DeserializeOwned,
-{
-    let candidates = json_output_candidates(text);
-    let mut last_error = None;
-    for candidate in &candidates {
-        match serde_json::from_str::<T>(candidate) {
-            Ok(value) => return Ok(value),
-            Err(error) => last_error = Some(error),
-        }
-    }
-    let error = last_error
-        .map(|error| error.to_string())
-        .unwrap_or_else(|| "no JSON candidate found".into());
-    Err(format!(
-        "failed to parse {label} as JSON: {error}; output: {text}"
-    ))
-}
-
-fn json_output_candidates(text: &str) -> Vec<String> {
-    let trimmed = text.trim();
-    let mut candidates = Vec::new();
-    let fenced_blocks = extract_fenced_json_blocks(trimmed);
-    for fenced in fenced_blocks.into_iter().rev() {
-        push_unique_candidate(&mut candidates, fenced);
-    }
-    if trimmed.starts_with('{') {
-        push_unique_candidate(&mut candidates, trimmed.to_string());
-    }
-    let json_objects = extract_json_objects(trimmed);
-    for object in json_objects.into_iter().rev() {
-        push_unique_candidate(&mut candidates, object);
-    }
-    if candidates.is_empty() {
-        candidates.push(trimmed.to_string());
-    }
-    candidates
-}
-
-fn push_unique_candidate(candidates: &mut Vec<String>, candidate: String) {
-    let candidate = candidate.trim().to_string();
-    if !candidate.is_empty() && !candidates.iter().any(|existing| existing == &candidate) {
-        candidates.push(candidate);
-    }
-}
-
-fn extract_fenced_json_blocks(text: &str) -> Vec<String> {
-    let mut blocks = Vec::new();
-    let mut remaining = text;
-    while let Some(fence_start) = remaining.find("```") {
-        let after_fence = &remaining[fence_start + 3..];
-        let body_start = after_fence
-            .find(|ch| ch == '\n' || ch == '\r')
-            .map(|index| index + 1)
-            .unwrap_or(0);
-        let body = &after_fence[body_start..];
-        let Some(fence_end) = body.find("```") else {
-            break;
         };
-        blocks.push(body[..fence_end].trim().to_string());
-        remaining = &body[fence_end + 3..];
+
+        let mut client = Self {
+            socket,
+            child,
+            next_request_id: 1,
+            pending_messages: VecDeque::new(),
+            terminal_threads: BTreeMap::new(),
+        };
+        client.set_socket_timeout(Duration::from_secs(15))?;
+        client.request(
+            "initialize",
+            json!({
+                "clientInfo": {
+                    "name": "exaterm",
+                    "title": "Exaterm",
+                    "version": env!("CARGO_PKG_VERSION"),
+                },
+            }),
+        )?;
+        client.send(json!({"method": "initialized", "params": {}}))?;
+        client.set_socket_timeout(APP_SERVER_RPC_TIMEOUT)?;
+        Ok(client)
     }
-    blocks
-}
 
-fn extract_json_objects(text: &str) -> Vec<String> {
-    let mut objects = Vec::new();
-    let mut start = None;
-    let mut depth = 0usize;
-    let mut in_string = false;
-    let mut escaped = false;
-
-    for (index, ch) in text.char_indices() {
-        if in_string {
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == '"' {
-                in_string = false;
+    pub fn suggest_terminal_assist(
+        &mut self,
+        session_id: SessionId,
+        evidence: &TerminalAssistEvidence,
+    ) -> Result<TerminalAssistSuggestion, String> {
+        let thread_id = match self.terminal_threads.get(&session_id) {
+            Some(thread_id) => thread_id.clone(),
+            None => {
+                let thread_id = self.start_terminal_thread(evidence)?;
+                self.terminal_threads.insert(session_id, thread_id.clone());
+                thread_id
             }
-            continue;
+        };
+
+        let result = self.request(
+            "turn/start",
+            json!({
+                "threadId": thread_id,
+                "input": [{
+                    "type": "text",
+                    "text": terminal_assist_user_prompt(evidence),
+                }],
+                "outputSchema": terminal_assist_output_schema(),
+            }),
+        )?;
+        let turn_id = result
+            .pointer("/turn/id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("Codex turn/start response had no turn id: {result}"))?
+            .to_string();
+
+        self.wait_for_terminal_assist(&thread_id, &turn_id)
+    }
+
+    fn start_terminal_thread(
+        &mut self,
+        evidence: &TerminalAssistEvidence,
+    ) -> Result<String, String> {
+        let mut params = json!({
+            "approvalPolicy": "never",
+            "sandbox": "read-only",
+            "personality": "pragmatic",
+            "ephemeral": true,
+            "developerInstructions": TERMINAL_ASSIST_DEVELOPER_INSTRUCTIONS,
+        });
+        if let Some(cwd) = evidence
+            .working_directory
+            .as_deref()
+            .filter(|cwd| !cwd.trim().is_empty())
+        {
+            params["cwd"] = Value::String(cwd.to_string());
         }
+        let result = self.request("thread/start", params)?;
+        result
+            .pointer("/thread/id")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| format!("Codex thread/start response had no thread id: {result}"))
+    }
 
-        match ch {
-            '"' if depth > 0 => in_string = true,
-            '{' => {
-                if depth == 0 {
-                    start = Some(index);
-                }
-                depth += 1;
+    fn wait_for_terminal_assist(
+        &mut self,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> Result<TerminalAssistSuggestion, String> {
+        let mut completed_agent_message = None::<String>;
+        let mut streamed_agent_message = String::new();
+
+        loop {
+            let message = match self.pending_messages.pop_front() {
+                Some(message) => message,
+                None => self.read()?,
+            };
+
+            if message.get("id").is_some() && message.get("method").is_some() {
+                self.reject_server_request(&message)?;
+                continue;
             }
-            '}' if depth > 0 => {
-                depth -= 1;
-                if depth == 0 {
-                    if let Some(start) = start.take() {
-                        objects.push(text[start..index + ch.len_utf8()].trim().to_string());
+
+            let method = message.get("method").and_then(Value::as_str);
+            let params = message.get("params").unwrap_or(&Value::Null);
+            match method {
+                Some("item/agentMessage/delta")
+                    if notification_matches(params, thread_id, turn_id) =>
+                {
+                    if let Some(delta) = params.get("delta").and_then(Value::as_str) {
+                        streamed_agent_message.push_str(delta);
                     }
                 }
+                Some("item/completed") if notification_matches(params, thread_id, turn_id) => {
+                    if params.pointer("/item/type").and_then(Value::as_str) == Some("agentMessage")
+                    {
+                        completed_agent_message = params
+                            .pointer("/item/text")
+                            .and_then(Value::as_str)
+                            .map(ToOwned::to_owned);
+                    }
+                }
+                Some("turn/completed") if notification_matches(params, thread_id, turn_id) => {
+                    let status = params.pointer("/turn/status").and_then(Value::as_str);
+                    if status != Some("completed") {
+                        let error = params
+                            .pointer("/turn/error/message")
+                            .and_then(Value::as_str)
+                            .unwrap_or("turn did not complete");
+                        return Err(format!(
+                            "Codex terminal assist failed ({status:?}): {error}"
+                        ));
+                    }
+                    let final_message = completed_turn_agent_message(params)
+                        .or(completed_agent_message)
+                        .filter(|message| !message.trim().is_empty())
+                        .unwrap_or(streamed_agent_message);
+                    return parse_terminal_assist_response(&final_message);
+                }
+                _ => {}
             }
-            _ => {}
         }
     }
 
-    objects
+    fn request(&mut self, method: &str, params: Value) -> Result<Value, String> {
+        for attempt in 0..=4u32 {
+            let id = self.next_request_id;
+            self.next_request_id = self.next_request_id.saturating_add(1);
+            self.send(json!({"method": method, "id": id, "params": params.clone()}))?;
+
+            loop {
+                let message = self.read()?;
+                if message.get("id").and_then(Value::as_u64) == Some(id)
+                    && message.get("method").is_none()
+                {
+                    if let Some(error) = message.get("error") {
+                        if error.get("code").and_then(Value::as_i64) == Some(-32001) && attempt < 4
+                        {
+                            let backoff_ms = 50u64 * (1u64 << attempt) + (id % 23);
+                            thread::sleep(Duration::from_millis(backoff_ms));
+                            break;
+                        }
+                        return Err(format!("Codex app-server {method} failed: {error}"));
+                    }
+                    return message
+                        .get("result")
+                        .cloned()
+                        .ok_or_else(|| format!("Codex app-server {method} returned no result"));
+                }
+                self.pending_messages.push_back(message);
+            }
+        }
+        unreachable!("Codex app-server overload retry loop always returns")
+    }
+
+    fn reject_server_request(&mut self, request: &Value) -> Result<(), String> {
+        let Some(id) = request.get("id").cloned() else {
+            return Ok(());
+        };
+        self.send(json!({
+            "id": id,
+            "error": {
+                "code": -32601,
+                "message": "Exaterm terminal assist does not handle interactive server requests",
+            },
+        }))
+    }
+
+    fn send(&mut self, value: Value) -> Result<(), String> {
+        self.socket
+            .send(Message::text(value.to_string()))
+            .map_err(|error| format!("failed to write Codex app-server WebSocket: {error}"))
+    }
+
+    fn read(&mut self) -> Result<Value, String> {
+        loop {
+            let message = self
+                .socket
+                .read()
+                .map_err(|error| format!("failed to read Codex app-server WebSocket: {error}"))?;
+            match message {
+                Message::Text(text) => {
+                    return serde_json::from_str(text.as_str())
+                        .map_err(|error| format!("invalid Codex app-server JSON: {error}"));
+                }
+                Message::Binary(bytes) => {
+                    return serde_json::from_slice(&bytes)
+                        .map_err(|error| format!("invalid Codex app-server JSON: {error}"));
+                }
+                Message::Close(frame) => {
+                    return Err(format!("Codex app-server closed its WebSocket: {frame:?}"));
+                }
+                Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {}
+            }
+        }
+    }
+
+    fn set_socket_timeout(&mut self, timeout: Duration) -> Result<(), String> {
+        if let MaybeTlsStream::Plain(stream) = self.socket.get_mut() {
+            stream
+                .set_read_timeout(Some(timeout))
+                .and_then(|()| stream.set_write_timeout(Some(timeout)))
+                .map_err(|error| format!("failed to configure Codex app-server socket: {error}"))?;
+        }
+        Ok(())
+    }
 }
 
-fn terminal_assist_system_prompt() -> &'static str {
-    r#"
-You write one terminal insertion for Exaterm Ctrl-K assist.
+impl Drop for CodexAppServerClient {
+    fn drop(&mut self) {
+        let _ = self.socket.close(None);
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
 
-The operator is editing a real terminal input line. Your output will be inserted into that terminal, not executed automatically.
+fn notification_matches(params: &Value, thread_id: &str, turn_id: &str) -> bool {
+    params.get("threadId").and_then(Value::as_str) == Some(thread_id)
+        && (params.get("turnId").and_then(Value::as_str) == Some(turn_id)
+            || params.pointer("/turn/id").and_then(Value::as_str) == Some(turn_id))
+}
 
-Use only the provided evidence.
-Return one compact JSON object only.
-The final structured object in your response must be:
-{"insert_text":"<one command or shell snippet>"}
-Do not use markdown.
-Do not wrap the command in code fences.
-Do not explain your reasoning.
-Do not ask questions.
-Do not claim you ran anything.
-Do not include surrounding prose, bullets, labels, or comments.
-
-The insert_text field must contain exactly one shell command or shell snippet suitable for insertion at the cursor.
-Prefer a single command line.
-Use a multi-command shell snippet only when the operator explicitly asks for it and it still belongs on one terminal input line.
-Default to non-destructive commands: inspect, search, print, validate, test, or stage-free local edits only when the operator explicitly asks for an edit.
-Do not suggest destructive commands such as rm -rf, git reset --hard, force push, broad chmod/chown, killall, destructive sudo operations, package removal, or data deletion unless the operator explicitly asks for that exact action and the evidence makes the target unambiguous.
-If the operator request is unsafe, unclear, unrelated to terminal work, or cannot be answered from the evidence, return an empty insert_text string.
-
-Respect the working_directory and recent_files evidence when choosing paths.
-Do not invent files or directories that are not present in the evidence unless the operator explicitly asks to create them.
-Prefer relative paths already visible in recent_files over absolute paths.
-Return insertion text only; never include markdown or explanatory text inside insert_text.
-"#
-    .trim()
+fn completed_turn_agent_message(params: &Value) -> Option<String> {
+    params
+        .pointer("/turn/items")?
+        .as_array()?
+        .iter()
+        .rev()
+        .find(|item| item.get("type").and_then(Value::as_str) == Some("agentMessage"))?
+        .get("text")?
+        .as_str()
+        .map(ToOwned::to_owned)
 }
 
 fn terminal_assist_user_prompt(evidence: &TerminalAssistEvidence) -> String {
     format!(
-        "Return one shell command/snippet for this Ctrl-K terminal assist request. End with a compact JSON object containing only insert_text; insert_text must be insertion-only text for the originating terminal input line:\n{}",
-        serde_json::to_string_pretty(evidence)
-            .map_err(|error| error.to_string())
-            .unwrap_or_default()
+        "Suggest the terminal insertion requested by the operator. Current terminal evidence:\n{}",
+        serde_json::to_string_pretty(evidence).unwrap_or_else(|_| "{}".into())
     )
 }
 
-fn terminal_assist_schema() -> Value {
+fn terminal_assist_output_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "insert_text": { "type": "string" }
+            "insert_text": {"type": "string"},
         },
         "required": ["insert_text"],
-        "additionalProperties": false
+        "additionalProperties": false,
     })
 }
 
-pub fn extract_response_text(payload: &Value) -> Option<String> {
-    if let Some(text) = payload
-        .get("choices")
-        .and_then(Value::as_array)
-        .and_then(|choices| choices.first())
-        .and_then(|choice| choice.get("message"))
-        .and_then(|message| message.get("content"))
-        .and_then(Value::as_str)
-    {
-        return Some(text.to_string());
-    }
-
-    if let Some(text) = payload.get("output_text").and_then(Value::as_str) {
-        return Some(text.to_string());
-    }
-
-    payload
-        .get("output")
-        .and_then(Value::as_array)
-        .and_then(|items| {
-            items.iter().find_map(|item| {
-                item.get("content")
-                    .and_then(Value::as_array)
-                    .and_then(|content| {
-                        content.iter().find_map(|part| {
-                            part.get("text")
-                                .and_then(Value::as_str)
-                                .map(ToOwned::to_owned)
-                                .or_else(|| {
-                                    part.get("output_text")
-                                        .and_then(Value::as_str)
-                                        .map(ToOwned::to_owned)
-                                })
-                        })
-                    })
-            })
-        })
-}
-
-fn format_error_chain(error: impl Error) -> String {
-    let mut message = error.to_string();
-    let mut source = error.source();
-    while let Some(error) = source {
-        message.push_str(": ");
-        message.push_str(&error.to_string());
-        source = error.source();
-    }
-    message
+fn parse_terminal_assist_response(text: &str) -> Result<TerminalAssistSuggestion, String> {
+    let trimmed = text.trim();
+    let suggestion = serde_json::from_str::<TerminalAssistSuggestion>(trimmed).or_else(|_| {
+        let start = trimmed.find('{').ok_or(())?;
+        let end = trimmed.rfind('}').ok_or(())?;
+        serde_json::from_str::<TerminalAssistSuggestion>(&trimmed[start..=end]).map_err(|_| ())
+    });
+    suggestion
+        .map(TerminalAssistSuggestion::sanitize)
+        .map_err(|()| format!("Codex terminal assist returned invalid output: {trimmed}"))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        extract_response_text, normalize_terminal_assist_model, openai_chat_completions_url,
-        terminal_assist_openai_request_body, terminal_assist_schema, terminal_assist_system_prompt,
-        terminal_assist_user_prompt, OpenAiBackend, ProviderPreferences, SynthesisBackendRegistry,
-        SynthesisProvider, TerminalAssistEvidence, TerminalAssistSuggestion,
-        DEFAULT_TERMINAL_ASSIST_MODEL, TERMINAL_ASSIST_MAX_TOKENS,
-    };
-    use serde_json::json;
-    use std::collections::BTreeSet;
-    use std::sync::Mutex;
+    use super::*;
 
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
-
-    fn test_registry() -> SynthesisBackendRegistry {
-        SynthesisBackendRegistry {
-            openai: None,
-            terminal_assist_model: DEFAULT_TERMINAL_ASSIST_MODEL.into(),
+    fn evidence() -> TerminalAssistEvidence {
+        TerminalAssistEvidence {
+            session_name: "Shell 2".into(),
+            operator_prompt: "find the largest Rust files".into(),
+            current_input: "rg".into(),
+            working_directory: Some("/tmp/repo".into()),
+            shell_child_command: Some("bash".into()),
+            active_command: None,
+            dominant_process: None,
+            process_tree_excerpt: Some("bash".into()),
+            recent_files: vec!["src/main.rs".into()],
+            terminal_status_line: Some("$ rg".into()),
+            recent_terminal_history: vec!["$ cargo test".into()],
         }
     }
 
     #[test]
-    fn terminal_assist_model_defaults_and_preserves_exact_name() {
-        assert_eq!(
-            normalize_terminal_assist_model("gpt-5.5-nano"),
-            "gpt-5.5-nano"
-        );
-        assert_eq!(DEFAULT_TERMINAL_ASSIST_MODEL, "gpt-5.5-nano");
-        assert_eq!(
-            normalize_terminal_assist_model(""),
-            DEFAULT_TERMINAL_ASSIST_MODEL
-        );
-        assert_eq!(normalize_terminal_assist_model("gpt-5.4"), "gpt-5.4");
-    }
-
-    #[test]
-    fn terminal_assist_schema_requires_insert_text_only() {
-        let schema = terminal_assist_schema();
-
-        assert_eq!(schema["properties"]["insert_text"]["type"], "string");
+    fn terminal_assist_uses_strict_insert_text_schema() {
+        let schema = terminal_assist_output_schema();
         assert_eq!(schema["required"], json!(["insert_text"]));
         assert_eq!(schema["additionalProperties"], false);
     }
 
     #[test]
-    fn terminal_assist_prompt_requires_json_insertion_only_and_non_destructive_default() {
-        let prompt = terminal_assist_system_prompt();
-
-        assert!(prompt.contains("Return one compact JSON object only."));
-        assert!(prompt.contains(r#"{"insert_text":"<one command or shell snippet>"}"#));
-        assert!(prompt.contains("Do not use markdown."));
-        assert!(prompt.contains("exactly one shell command or shell snippet"));
-        assert!(prompt.contains("suitable for insertion at the cursor"));
-        assert!(prompt.contains("Default to non-destructive commands"));
-        assert!(prompt.contains("Do not suggest destructive commands"));
-        assert!(prompt.contains("rm -rf"));
-        assert!(prompt.contains("git reset --hard"));
+    fn terminal_assist_prompt_includes_current_evidence_and_operator_request() {
+        let prompt = terminal_assist_user_prompt(&evidence());
+        assert!(prompt.contains("find the largest Rust files"));
+        assert!(prompt.contains("src/main.rs"));
+        assert!(prompt.contains("/tmp/repo"));
     }
 
     #[test]
-    fn terminal_assist_user_prompt_includes_relevant_evidence_fields() {
-        let evidence = TerminalAssistEvidence {
-            session_name: "Parser".into(),
-            operator_prompt: "rerun the parser test".into(),
-            current_input: "cargo test ".into(),
-            working_directory: Some("/home/luke/projects/exaterm".into()),
-            shell_child_command: Some("codex".into()),
-            active_command: Some("cargo test parser".into()),
-            dominant_process: Some("cargo".into()),
-            process_tree_excerpt: Some("bash | codex | cargo".into()),
-            recent_files: vec!["crates/exaterm-core/src/synthesis.rs".into()],
-            terminal_status_line: Some("parser tests failed".into()),
-            recent_terminal_history: vec!["error: parser snapshot changed".into()],
-        };
-
-        let prompt = terminal_assist_user_prompt(&evidence);
-
-        assert!(prompt.contains("\"operator_prompt\": \"rerun the parser test\""));
-        assert!(prompt.contains("\"current_input\": \"cargo test \""));
-        assert!(prompt.contains("\"working_directory\": \"/home/luke/projects/exaterm\""));
-        assert!(prompt.contains("\"shell_child_command\": \"codex\""));
-        assert!(prompt.contains("\"active_command\": \"cargo test parser\""));
-        assert!(prompt.contains("\"dominant_process\": \"cargo\""));
-        assert!(prompt.contains("\"process_tree_excerpt\": \"bash | codex | cargo\""));
-        assert!(prompt.contains("\"recent_files\""));
-        assert!(prompt.contains("crates/exaterm-core/src/synthesis.rs"));
-        assert!(prompt.contains("\"terminal_status_line\": \"parser tests failed\""));
-        assert!(prompt.contains("\"recent_terminal_history\""));
-        assert!(prompt.contains("originating terminal input line"));
-        assert!(prompt.contains("insert_text must be insertion-only text"));
-    }
-
-    #[test]
-    fn terminal_assist_openai_request_uses_fast_json_only_model_call() {
-        let evidence = TerminalAssistEvidence {
-            session_name: "Shell".into(),
-            operator_prompt: "disk usage".into(),
-            current_input: String::new(),
-            working_directory: Some("/tmp/project".into()),
-            shell_child_command: None,
-            active_command: None,
-            dominant_process: None,
-            process_tree_excerpt: None,
-            recent_files: Vec::new(),
-            terminal_status_line: None,
-            recent_terminal_history: Vec::new(),
-        };
-
-        let body = terminal_assist_openai_request_body(DEFAULT_TERMINAL_ASSIST_MODEL, &evidence);
-
-        assert_eq!(body["model"], DEFAULT_TERMINAL_ASSIST_MODEL);
-        assert_eq!(body["max_completion_tokens"], TERMINAL_ASSIST_MAX_TOKENS);
-        assert!(body.get("reasoning_effort").is_none());
-        assert_eq!(
-            body["response_format"]["json_schema"]["schema"]["required"],
-            json!(["insert_text"])
-        );
-    }
-
-    #[test]
-    fn openai_chat_completions_url_defaults_to_openai() {
-        let _guard = ENV_MUTEX
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        std::env::remove_var("EXATERM_OPENAI_BASE_URL");
-        std::env::remove_var("OPENAI_BASE_URL");
-        assert_eq!(
-            openai_chat_completions_url(),
-            "https://api.openai.com/v1/chat/completions"
-        );
-    }
-
-    #[test]
-    fn openai_chat_completions_url_uses_configured_base() {
-        let _guard = ENV_MUTEX
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        std::env::set_var("EXATERM_OPENAI_BASE_URL", "https://example.test/v1/");
-        assert_eq!(
-            openai_chat_completions_url(),
-            "https://example.test/v1/chat/completions"
-        );
-        std::env::remove_var("EXATERM_OPENAI_BASE_URL");
-    }
-
-    #[test]
-    fn extracts_text_from_chat_completions_payload() {
-        let payload = json!({
-            "choices": [
-                {
-                    "message": {
-                        "content": "{\"insert_text\":\"du -sh .\"}"
-                    }
-                }
-            ]
-        });
-
-        let text = extract_response_text(&payload).expect("text should be extracted");
-        assert!(text.contains("\"insert_text\":\"du -sh .\""));
-    }
-
-    #[test]
-    fn extracts_text_from_responses_payload() {
-        let payload = json!({
-            "output": [
-                {
-                    "content": [
-                        {
-                            "type": "output_text",
-                            "text": "{\"insert_text\":\"cargo test\"}"
-                        }
-                    ]
-                }
-            ]
-        });
-
-        let text = extract_response_text(&payload).expect("text should be extracted");
-        assert!(text.contains("\"insert_text\":\"cargo test\""));
-    }
-
-    #[test]
-    fn parse_json_output_accepts_fenced_json() {
-        let parsed = super::parse_json_output::<TerminalAssistSuggestion>(
-            "```json\n{\"insert_text\":\"du -sh .\"}\n```",
-            "fenced",
+    fn terminal_assist_response_is_sanitized_before_insertion() {
+        let suggestion = parse_terminal_assist_response(
+            r#"{"insert_text":"rg --files -g '*.rs' | xargs wc -l\nexplanation"}"#,
         )
-        .expect("fenced json should parse");
-        assert_eq!(parsed.insert_text, "du -sh .");
+        .expect("valid response");
+        assert_eq!(suggestion.insert_text, "rg --files -g '*.rs' | xargs wc -l");
     }
 
     #[test]
-    fn parse_json_output_accepts_fenced_json_with_leading_text() {
-        let parsed = super::parse_json_output::<TerminalAssistSuggestion>(
-            "Here is the result:\n```json\n{\"insert_text\":\"cargo test\"}\n```",
-            "fenced-leading",
-        )
-        .expect("fenced json with leading text should parse");
-        assert_eq!(parsed.insert_text, "cargo test");
-    }
-
-    #[test]
-    fn parse_json_output_prefers_final_structured_object() {
-        let parsed = super::parse_json_output::<TerminalAssistSuggestion>(
-            "Need to inspect disk usage.\n{\"insert_text\":\"echo wrong\"}\nFinal:\n{\"insert_text\":\"du -sh .\"}",
-            "final-json",
-        )
-        .expect("final json should parse");
-        assert_eq!(parsed.insert_text, "du -sh .");
-    }
-
-    #[test]
-    fn backend_registry_uses_openai_when_configured() {
-        let _guard = ENV_MUTEX
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        std::env::set_var("OPENAI_API_KEY", "test-key");
-
-        let registry = SynthesisBackendRegistry::from_env().expect("registry should exist");
-        assert_eq!(
-            registry.preferred_provider_order(&ProviderPreferences::default()),
-            vec![SynthesisProvider::OpenAi]
-        );
-
-        std::env::remove_var("OPENAI_API_KEY");
-    }
-
-    #[test]
-    fn backend_registry_requires_openai_for_terminal_assist() {
-        let _guard = ENV_MUTEX
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        std::env::remove_var("OPENAI_API_KEY");
-
-        assert!(SynthesisBackendRegistry::from_env().is_none());
-    }
-
-    #[test]
-    fn backend_registry_skips_openai_when_previously_demoted() {
-        let registry = SynthesisBackendRegistry {
-            openai: Some(OpenAiBackend {
-                api_key: "test-key".into(),
-                base_url: "https://example.invalid/v1/chat/completions".into(),
-            }),
-            terminal_assist_model: DEFAULT_TERMINAL_ASSIST_MODEL.into(),
-        };
-
-        let skipped = BTreeSet::from([SynthesisProvider::OpenAi]);
-        assert_eq!(
-            registry.preferred_provider_order(&ProviderPreferences {
-                skipped_providers: skipped,
-            }),
-            Vec::<SynthesisProvider>::new()
-        );
-    }
-
-    #[test]
-    fn backend_registry_is_none_when_no_provider_exists() {
-        let _guard = ENV_MUTEX
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        std::env::remove_var("OPENAI_API_KEY");
-        assert!(SynthesisBackendRegistry::from_env().is_none());
-    }
-
-    #[test]
-    fn run_with_fallback_does_not_use_cli_without_openai() {
-        let registry = test_registry();
-        let mut calls = Vec::new();
-        let result = registry.run_with_fallback(&ProviderPreferences::default(), |provider| {
-            calls.push(provider);
-            Ok("ok".to_string())
+    fn completed_turn_uses_last_agent_message() {
+        let params = json!({
+            "turn": {
+                "items": [
+                    {"type": "agentMessage", "text": "first"},
+                    {"type": "reasoning", "summary": []},
+                    {"type": "agentMessage", "text": "final"},
+                ]
+            }
         });
-
-        assert!(calls.is_empty());
-        assert_eq!(result.provider, None);
-        assert_eq!(result.demoted_provider, None);
-        assert!(result.value.is_err());
-    }
-
-    #[test]
-    fn run_with_fallback_returns_openai_error_without_cli_fallback() {
-        let registry = SynthesisBackendRegistry {
-            openai: Some(OpenAiBackend {
-                api_key: "test-key".into(),
-                base_url: "https://example.invalid/v1/chat/completions".into(),
-            }),
-            terminal_assist_model: DEFAULT_TERMINAL_ASSIST_MODEL.into(),
-        };
-        let mut calls = Vec::new();
-        let result: super::ProviderCallResult<String> =
-            registry.run_with_fallback(&ProviderPreferences::default(), |provider| {
-                calls.push(provider);
-                match provider {
-                    SynthesisProvider::OpenAi => Err("openai failed".into()),
-                }
-            });
-
-        assert_eq!(calls, vec![SynthesisProvider::OpenAi]);
-        assert_eq!(result.provider, Some(SynthesisProvider::OpenAi));
-        assert_eq!(result.demoted_provider, None);
-        assert!(result.value.is_err());
-    }
-
-    #[test]
-    fn run_with_fallback_skips_openai_when_preference_is_set() {
-        let registry = SynthesisBackendRegistry {
-            openai: Some(OpenAiBackend {
-                api_key: "test-key".into(),
-                base_url: "https://example.invalid/v1/chat/completions".into(),
-            }),
-            terminal_assist_model: DEFAULT_TERMINAL_ASSIST_MODEL.into(),
-        };
-        let mut calls = Vec::new();
-        let skipped = BTreeSet::from([SynthesisProvider::OpenAi]);
-        let result = registry.run_with_fallback(
-            &ProviderPreferences {
-                skipped_providers: skipped,
-            },
-            |provider| {
-                calls.push(provider);
-                Ok("ok".to_string())
-            },
+        assert_eq!(
+            completed_turn_agent_message(&params).as_deref(),
+            Some("final")
         );
+    }
 
-        assert!(calls.is_empty());
-        assert_eq!(result.provider, None);
-        assert_eq!(result.demoted_provider, None);
-        assert!(result.value.is_err());
+    #[test]
+    #[ignore = "requires an installed Codex CLI"]
+    fn codex_app_server_websocket_initializes() {
+        let mut client =
+            CodexAppServerClient::launch().expect("Codex app-server should initialize");
+        let mut evidence = evidence();
+        evidence.working_directory = std::env::current_dir()
+            .ok()
+            .map(|path| path.display().to_string());
+        let thread_id = client
+            .start_terminal_thread(&evidence)
+            .expect("Codex app-server should start a terminal thread");
+        assert!(!thread_id.is_empty());
     }
 }

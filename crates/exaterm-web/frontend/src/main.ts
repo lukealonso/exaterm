@@ -30,6 +30,8 @@ function connectControl() {
           pendingRestart = false;
           sendCommand({ type: "create_or_resume_default_workspace" });
         }
+      } else if (msg.type === "pet_comment") {
+        // The browser UI currently does not render pet overlays.
       }
     } catch (e) {
       console.error("failed to parse server message:", e);

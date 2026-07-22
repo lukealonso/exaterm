@@ -8,6 +8,9 @@ pub enum ClientMessage {
     SetTerminalDisplayCapabilities {
         capabilities: TerminalDisplayCapabilities,
     },
+    SetPetOrigin {
+        origin: PetOrigin,
+    },
     CreateOrResumeDefaultWorkspace,
     AddTerminals {
         source_session: SessionId,
@@ -49,11 +52,6 @@ pub enum ClientMessage {
         group_id: GroupId,
         markdown: String,
     },
-    ConfigureTerminalAssist {
-        openai_api_key: Option<String>,
-        openai_base_url: String,
-        model: String,
-    },
     RequestTerminalAssist {
         request_id: u64,
         session_id: SessionId,
@@ -76,6 +74,21 @@ pub struct TerminalDisplayCapabilities {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PetOrigin {
+    pub seed_hash: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PetComment {
+    pub id: u64,
+    pub session_id: SessionId,
+    pub name: String,
+    pub appearance_ascii: String,
+    pub message: String,
+    pub ttl_secs: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum InputSyncScope {
     RootVisible,
@@ -93,6 +106,9 @@ pub enum ServerMessage {
         session_id: SessionId,
         inserted: bool,
         error: Option<String>,
+    },
+    PetComment {
+        comment: PetComment,
     },
     Error {
         message: String,
@@ -189,6 +205,23 @@ mod tests {
     }
 
     #[test]
+    fn pet_origin_round_trips_through_json() {
+        let message = ClientMessage::SetPetOrigin {
+            origin: PetOrigin {
+                seed_hash: "abc123".into(),
+            },
+        };
+        let json = serde_json::to_string(&message).expect("serialize pet origin");
+        let decoded: ClientMessage = serde_json::from_str(&json).expect("deserialize pet origin");
+        match decoded {
+            ClientMessage::SetPetOrigin { origin } => {
+                assert_eq!(origin.seed_hash, "abc123");
+            }
+            other => panic!("unexpected decoded message: {other:?}"),
+        }
+    }
+
+    #[test]
     fn create_group_round_trips_through_json() {
         let message = ClientMessage::CreateSupervisedGroup {
             name: "Research".into(),
@@ -259,6 +292,31 @@ mod tests {
                 assert!(error.is_none());
             }
             other => panic!("unexpected decoded message: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pet_comment_round_trips_through_json() {
+        let message = ServerMessage::PetComment {
+            comment: PetComment {
+                id: 12,
+                session_id: SessionId(3),
+                name: "Termite".into(),
+                appearance_ascii: "/\\_/\\\n( o.o )".into(),
+                message: "still compiling, allegedly".into(),
+                ttl_secs: 8,
+            },
+        };
+        let json = serde_json::to_string(&message).expect("serialize pet comment");
+        let decoded: ServerMessage = serde_json::from_str(&json).expect("deserialize pet comment");
+        match decoded {
+            ServerMessage::PetComment { comment } => {
+                assert_eq!(comment.id, 12);
+                assert_eq!(comment.session_id, SessionId(3));
+                assert_eq!(comment.name, "Termite");
+                assert_eq!(comment.ttl_secs, 8);
+            }
+            other => panic!("unexpected decoded server message: {other:?}"),
         }
     }
 

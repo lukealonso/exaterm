@@ -13,6 +13,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
+use unicode_width::UnicodeWidthStr;
 use vte4 as vte;
 use vte4::prelude::*;
 
@@ -162,6 +163,26 @@ pub fn terminal_size_hint(terminal: &vte::Terminal) -> PtySize {
 
 pub fn measured_terminal_size_hint(terminal: &vte::Terminal) -> Option<PtySize> {
     measured_terminal_size(terminal.row_count(), terminal.column_count())
+}
+
+pub fn dewrap_terminal_selection(text: &str, columns: usize) -> String {
+    if columns == 0 || !text.contains('\n') {
+        return text.to_string();
+    }
+
+    let mut output = String::with_capacity(text.len());
+    for segment in text.split_inclusive('\n') {
+        let has_newline = segment.ends_with('\n');
+        let without_newline = segment.strip_suffix('\n').unwrap_or(segment);
+        let line = without_newline
+            .strip_suffix('\r')
+            .unwrap_or(without_newline);
+        output.push_str(line);
+        if has_newline && UnicodeWidthStr::width(line) < columns {
+            output.push('\n');
+        }
+    }
+    output
 }
 
 fn measured_terminal_size(rows: i64, cols: i64) -> Option<PtySize> {
@@ -644,7 +665,7 @@ fn spawn_wait_thread(
 
 #[cfg(test)]
 mod tests {
-    use super::measured_terminal_size;
+    use super::{dewrap_terminal_selection, measured_terminal_size};
 
     #[test]
     fn measured_terminal_size_requires_positive_dimensions() {
@@ -653,5 +674,26 @@ mod tests {
         let size = measured_terminal_size(24, 80).expect("size should exist");
         assert_eq!(size.rows, 24);
         assert_eq!(size.cols, 80);
+    }
+
+    #[test]
+    fn selection_copy_joins_full_width_wrapped_rows() {
+        assert_eq!(
+            dewrap_terminal_selection("12345678\ncont\nnext", 8),
+            "12345678cont\nnext"
+        );
+    }
+
+    #[test]
+    fn selection_copy_preserves_short_explicit_lines() {
+        assert_eq!(
+            dewrap_terminal_selection("first\nsecond\n", 80),
+            "first\nsecond\n"
+        );
+    }
+
+    #[test]
+    fn selection_copy_counts_wide_characters_as_terminal_cells() {
+        assert_eq!(dewrap_terminal_selection("界界\nnext", 4), "界界next");
     }
 }

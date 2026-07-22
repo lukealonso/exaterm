@@ -1,7 +1,3 @@
-use crate::config::{
-    apply_app_config_environment, apply_terminal_assist_config_environment, load_app_config,
-    TerminalAssistConfig,
-};
 use crate::file_watch::{spawn_repo_watch, RepoWatchHandle};
 use crate::mcp::{
     McpServer, ServerInfo, ToolCallError, ToolCallOutcome, ToolCallResult, ToolDefinition,
@@ -14,16 +10,19 @@ use crate::observation::{
     compute_observation_refresh, find_git_worktree_root, record_terminal_input_activity,
     terminal_assist_history, SessionObservation,
 };
+use crate::pet::{
+    bootstrap_pet_profile, clamp_pet_comment_ttl, host_pet_origin, load_pet_profile,
+    profile_from_draft, sanitize_pet_comment_message, save_pet_profile, PetProfileDraft,
+};
 use crate::proto::{
-    ClientMessage, InputSyncScope, ObservationSnapshot, ServerMessage, SessionSnapshot,
-    TerminalDisplayCapabilities, WorkspaceSnapshot,
+    ClientMessage, InputSyncScope, ObservationSnapshot, PetComment, PetOrigin, ServerMessage,
+    SessionSnapshot, TerminalDisplayCapabilities, WorkspaceSnapshot,
 };
 use crate::runtime::{spawn_headless_runtime, RuntimeEvent, SessionRuntime};
-use crate::synthesis::{
-    ProviderCallResult, ProviderPreferences, SynthesisBackendRegistry, TerminalAssistEvidence,
-};
+use crate::synthesis::{CodexAppServerClient, TerminalAssistEvidence};
 use exaterm_types::model::{
-    GroupId, SupervisedGroupRecord, SupervisorActionRecord, SupervisorProvider, WorkspaceItem,
+    GroupId, PetProfile, SupervisedGroupRecord, SupervisorActionRecord, SupervisorProvider,
+    WorkspaceItem,
 };
 use portable_pty::PtySize;
 use serde::Serialize;
@@ -43,12 +42,15 @@ use std::time::{Duration, Instant};
 
 const CONTROL_SOCKET_NAME: &str = "beachhead-control.sock";
 const MCP_SOCKET_NAME: &str = "beachhead-mcp.sock";
+const PET_MCP_SOCKET_NAME: &str = "beachhead-pet-mcp.sock";
 const CANONICAL_TERMINAL_ROWS: u16 = 40;
 const CANONICAL_TERMINAL_COLS: u16 = 120;
 const REPLAY_BYTES_LIMIT: usize = 8 * 1024 * 1024;
 const REFRESH_INTERVAL: Duration = Duration::from_millis(300);
 const CONTROL_EVENTS_PER_TICK: usize = 128;
 const TERMINAL_RETURN_DELAY: Duration = Duration::from_millis(35);
+const PET_COMMENT_GLOBAL_COOLDOWN: Duration = Duration::from_secs(25);
+const PET_COMMENT_SESSION_COOLDOWN: Duration = Duration::from_secs(75);
 
 struct AssistWorker {
     requests: mpsc::Sender<AssistJob>,
@@ -59,13 +61,12 @@ struct AssistJob {
     request_id: u64,
     origin_session_id: SessionId,
     evidence: crate::synthesis::TerminalAssistEvidence,
-    preferences: ProviderPreferences,
 }
 
 struct AssistResult {
     request_id: u64,
     origin_session_id: SessionId,
-    suggestion: ProviderCallResult<exaterm_types::synthesis::TerminalAssistSuggestion>,
+    suggestion: Result<exaterm_types::synthesis::TerminalAssistSuggestion, String>,
 }
 
 struct ObservationWorker {
@@ -142,6 +143,48 @@ impl ObservationCacheEntry {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum McpClientKind {
+    Supervisor,
+    Pet,
+}
+
+struct PetCommentRateState {
+    last_global: Option<Instant>,
+    last_by_session: BTreeMap<SessionId, Instant>,
+}
+
+impl PetCommentRateState {
+    fn new() -> Self {
+        Self {
+            last_global: None,
+            last_by_session: BTreeMap::new(),
+        }
+    }
+
+    fn check_and_record(&mut self, session_id: SessionId, now: Instant) -> Result<(), String> {
+        if self
+            .last_global
+            .is_some_and(|last| now.duration_since(last) < PET_COMMENT_GLOBAL_COOLDOWN)
+        {
+            return Err("pet comment rate limited globally".into());
+        }
+        if self
+            .last_by_session
+            .get(&session_id)
+            .is_some_and(|last| now.duration_since(*last) < PET_COMMENT_SESSION_COOLDOWN)
+        {
+            return Err(format!(
+                "pet comment rate limited for session {}",
+                session_id.0
+            ));
+        }
+        self.last_global = Some(now);
+        self.last_by_session.insert(session_id, now);
+        Ok(())
+    }
+}
+
 struct DaemonState {
     workspace: WorkspaceStore,
     workspace_items: Vec<WorkspaceItem>,
@@ -161,6 +204,12 @@ struct DaemonState {
     input_sync_enabled: bool,
     input_sync_scope: InputSyncScope,
     terminal_display_capabilities: TerminalDisplayCapabilities,
+    pet_origin: Option<PetOrigin>,
+    pet_profile: Option<PetProfile>,
+    pet_session_id: Option<SessionId>,
+    pet_introduction_sent: bool,
+    next_pet_comment_id: u64,
+    pet_comment_rate: PetCommentRateState,
     snapshot_dirty: bool,
 }
 
@@ -236,6 +285,12 @@ impl DaemonState {
             input_sync_enabled: false,
             input_sync_scope: InputSyncScope::RootVisible,
             terminal_display_capabilities: TerminalDisplayCapabilities::default(),
+            pet_origin: None,
+            pet_profile: load_pet_profile(),
+            pet_session_id: None,
+            pet_introduction_sent: false,
+            next_pet_comment_id: 1,
+            pet_comment_rate: PetCommentRateState::new(),
             snapshot_dirty: false,
         }
     }
@@ -263,7 +318,7 @@ impl DaemonState {
         mut launch: SessionLaunch,
         top_level: bool,
     ) -> Result<SessionId, String> {
-        let idx = self.workspace.sessions().len();
+        let idx = self.operator_session_count();
         apply_terminal_display_env(&mut launch, &self.terminal_display_capabilities);
         launch.env.push(("EXATERM_IDX".into(), idx.to_string()));
         launch
@@ -293,6 +348,27 @@ impl DaemonState {
         }
         self.runtimes.insert(session_id, runtime.session_runtime);
         Ok(session_id)
+    }
+
+    fn operator_session_count(&self) -> usize {
+        let hidden = self.hidden_session_ids();
+        self.workspace
+            .sessions()
+            .iter()
+            .filter(|session| !hidden.contains(&session.id))
+            .count()
+    }
+
+    fn hidden_session_ids(&self) -> BTreeSet<SessionId> {
+        let mut hidden = self
+            .groups
+            .values()
+            .filter_map(|group| group.supervisor_session_id)
+            .collect::<BTreeSet<_>>();
+        if let Some(session_id) = self.pet_session_id {
+            hidden.insert(session_id);
+        }
+        hidden
     }
 
     fn attach_repo_watch(
@@ -343,6 +419,7 @@ impl DaemonState {
                 .workspace
                 .sessions()
                 .iter()
+                .filter(|record| Some(record.id) != self.pet_session_id)
                 .cloned()
                 .map(|record| {
                     let record_id = record.id;
@@ -439,16 +516,24 @@ impl DaemonState {
         }
         self.session_repo_roots.clear();
         self.forwarded_sessions.clear();
-        self.input_sync_enabled = false;
-        self.input_sync_scope = InputSyncScope::RootVisible;
+        self.disable_input_sync();
+        self.pet_session_id = None;
+        self.pet_introduction_sent = false;
+        self.pet_comment_rate = PetCommentRateState::new();
         self.workspace.replace_sessions(Vec::new());
         self.snapshot_dirty = true;
+    }
+
+    fn disable_input_sync(&mut self) {
+        self.input_sync_enabled = false;
+        self.input_sync_scope = InputSyncScope::RootVisible;
     }
 }
 
 enum ClientControl {
     Message(ClientMessage),
     McpToolCall {
+        kind: McpClientKind,
         name: String,
         arguments: Value,
         response: mpsc::Sender<ToolCallOutcome>,
@@ -506,10 +591,10 @@ impl LocalBeachheadClient {
 
         thread::spawn(move || {
             let mut reader = BufReader::new(control_reader);
-            loop {
+            let disconnect_message = loop {
                 let mut line = String::new();
                 match reader.read_line(&mut line) {
-                    Ok(0) => break,
+                    Ok(0) => break "Host session connection closed".to_string(),
                     Ok(_) => {
                         let trimmed = line.trim();
                         if trimmed.is_empty() {
@@ -518,20 +603,32 @@ impl LocalBeachheadClient {
                         match serde_json::from_str::<ServerMessage>(trimmed) {
                             Ok(message) => {
                                 if event_tx.send(message).is_err() {
-                                    break;
+                                    return;
                                 }
                                 match event_wake_writer.write(&[1]) {
                                     Ok(_) => {}
                                     Err(error)
                                         if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                                    Err(_) => break,
+                                    Err(error) => {
+                                        break format!("Host session event wake failed: {error}")
+                                    }
                                 }
                             }
-                            Err(_) => break,
+                            Err(error) => {
+                                break format!("Host session sent invalid control data: {error}")
+                            }
                         }
                     }
-                    Err(_) => break,
+                    Err(error) => break format!("Host session connection failed: {error}"),
                 }
+            };
+            if event_tx
+                .send(ServerMessage::Error {
+                    message: disconnect_message,
+                })
+                .is_ok()
+            {
+                let _ = event_wake_writer.write(&[1]);
             }
         });
 
@@ -569,6 +666,29 @@ impl LocalBeachheadClient {
 }
 
 fn spawn_mcp_client(stream: UnixStream, control_tx: ControlNotifier) {
+    spawn_mcp_client_with_tools(
+        stream,
+        control_tx,
+        McpClientKind::Supervisor,
+        exaterm_mcp_tools(),
+    );
+}
+
+fn spawn_pet_mcp_client(stream: UnixStream, control_tx: ControlNotifier) {
+    spawn_mcp_client_with_tools(
+        stream,
+        control_tx,
+        McpClientKind::Pet,
+        exaterm_pet_mcp_tools(),
+    );
+}
+
+fn spawn_mcp_client_with_tools(
+    stream: UnixStream,
+    control_tx: ControlNotifier,
+    kind: McpClientKind,
+    tools: Vec<ToolDefinition>,
+) {
     thread::spawn(move || {
         let reader = match stream.try_clone() {
             Ok(reader) => BufReader::new(reader),
@@ -579,6 +699,7 @@ fn spawn_mcp_client(stream: UnixStream, control_tx: ControlNotifier) {
             let (response_tx, response_rx) = mpsc::channel();
             control_tx
                 .send(ClientControl::McpToolCall {
+                    kind,
                     name: name.to_string(),
                     arguments,
                     response: response_tx,
@@ -590,7 +711,7 @@ fn spawn_mcp_client(stream: UnixStream, control_tx: ControlNotifier) {
         };
         let server = McpServer::new(
             ServerInfo::new("exaterm-persistent-sessions", env!("CARGO_PKG_VERSION")),
-            exaterm_mcp_tools(),
+            tools,
             dispatcher,
         );
         let _ = server.serve(reader, writer);
@@ -650,6 +771,59 @@ fn exaterm_mcp_tools() -> Vec<ToolDefinition> {
     ]
 }
 
+fn exaterm_pet_mcp_tools() -> Vec<ToolDefinition> {
+    vec![
+        ToolDefinition::new(
+            "exaterm_pet_initialize_profile",
+            "Create the persistent Exaterm pet profile. This may only succeed once.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "minLength": 1 },
+                    "appearance_ascii": { "type": "string", "minLength": 1 },
+                    "temperament": { "type": "string", "minLength": 1 },
+                    "backstory": { "type": "string", "minLength": 1 },
+                    "comment_style": { "type": "string", "minLength": 1 }
+                },
+                "required": ["name", "appearance_ascii", "temperament", "backstory", "comment_style"],
+                "additionalProperties": false
+            }),
+        ),
+        ToolDefinition::new(
+            "exaterm_pet_profile",
+            "Read the persistent Exaterm pet identity and current seed.",
+            json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+        ),
+        ToolDefinition::new(
+            "exaterm_pet_workspace",
+            "Read terminal and supervision evidence visible to the Exaterm pet.",
+            json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+        ),
+        ToolDefinition::new(
+            "exaterm_pet_comment",
+            "Show one ephemeral pet comment near a target terminal. This does not write to the terminal.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "integer", "minimum": 0 },
+                    "message": { "type": "string", "minLength": 1 },
+                    "ttl_secs": { "type": "integer", "minimum": 1 }
+                },
+                "required": ["session_id", "message"],
+                "additionalProperties": false
+            }),
+        ),
+    ]
+}
+
 pub fn run_local_daemon() -> ExitCode {
     match run_local_daemon_inner() {
         Ok(()) => ExitCode::SUCCESS,
@@ -660,17 +834,51 @@ pub fn run_local_daemon() -> ExitCode {
     }
 }
 
-fn run_local_daemon_inner() -> Result<(), String> {
-    apply_app_config_environment(&load_app_config());
+pub fn run_mcp_stdio_bridge(socket_path: &std::path::Path) -> ExitCode {
+    match run_mcp_stdio_bridge_inner(socket_path) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("{error}");
+            ExitCode::from(1)
+        }
+    }
+}
 
+fn run_mcp_stdio_bridge_inner(socket_path: &std::path::Path) -> Result<(), String> {
+    let mut socket = UnixStream::connect(socket_path).map_err(|error| {
+        format!(
+            "failed to connect MCP stdio bridge to {}: {error}",
+            socket_path.display()
+        )
+    })?;
+    let mut socket_writer = socket
+        .try_clone()
+        .map_err(|error| format!("failed to clone MCP stdio bridge socket: {error}"))?;
+    thread::spawn(move || {
+        let stdin = std::io::stdin();
+        let mut stdin = stdin.lock();
+        let _ = std::io::copy(&mut stdin, &mut socket_writer);
+        let _ = socket_writer.shutdown(std::net::Shutdown::Write);
+    });
+
+    let stdout = std::io::stdout();
+    let mut stdout = stdout.lock();
+    std::io::copy(&mut socket, &mut stdout)
+        .map_err(|error| format!("MCP stdio bridge failed: {error}"))?;
+    Ok(())
+}
+
+fn run_local_daemon_inner() -> Result<(), String> {
     let control_socket_path = control_socket_path()?;
     let mcp_socket_path = mcp_socket_path()?;
+    let pet_mcp_socket_path = pet_mcp_socket_path()?;
     if let Some(parent) = control_socket_path.parent() {
         fs::create_dir_all(parent)
             .map_err(|error| format!("failed to create daemon socket dir: {error}"))?;
     }
     clear_stale_control_socket(&control_socket_path)?;
     clear_stale_mcp_socket(&mcp_socket_path)?;
+    clear_stale_mcp_socket(&pet_mcp_socket_path)?;
 
     let control_listener = UnixListener::bind(&control_socket_path)
         .map_err(|error| format!("failed to bind daemon control socket: {error}"))?;
@@ -682,6 +890,11 @@ fn run_local_daemon_inner() -> Result<(), String> {
     mcp_listener
         .set_nonblocking(true)
         .map_err(|error| format!("failed to set daemon MCP socket nonblocking: {error}"))?;
+    let pet_mcp_listener = UnixListener::bind(&pet_mcp_socket_path)
+        .map_err(|error| format!("failed to bind daemon pet MCP socket: {error}"))?;
+    pet_mcp_listener
+        .set_nonblocking(true)
+        .map_err(|error| format!("failed to set daemon pet MCP socket nonblocking: {error}"))?;
 
     let (control_tx, control_rx) = mpsc::channel::<ClientControl>();
     let (mut wake_reader, wake_writer) = UnixStream::pair()
@@ -704,6 +917,7 @@ fn run_local_daemon_inner() -> Result<(), String> {
     while !should_exit {
         let control_ready;
         let mcp_ready;
+        let pet_mcp_ready;
         let wake_ready;
         let mut ready_session_ids = Vec::new();
         {
@@ -717,6 +931,11 @@ fn run_local_daemon_inner() -> Result<(), String> {
                 },
                 libc::pollfd {
                     fd: mcp_listener.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: pet_mcp_listener.as_raw_fd(),
                     events: libc::POLLIN,
                     revents: 0,
                 },
@@ -750,9 +969,10 @@ fn run_local_daemon_inner() -> Result<(), String> {
 
             control_ready = pollfds[0].revents & libc::POLLIN != 0;
             mcp_ready = pollfds[1].revents & libc::POLLIN != 0;
-            wake_ready = pollfds[2].revents & libc::POLLIN != 0;
+            pet_mcp_ready = pollfds[2].revents & libc::POLLIN != 0;
+            wake_ready = pollfds[3].revents & libc::POLLIN != 0;
             for (index, session_id) in session_ids.into_iter().enumerate() {
-                if pollfds[index + 3].revents & libc::POLLIN != 0 {
+                if pollfds[index + 4].revents & libc::POLLIN != 0 {
                     ready_session_ids.push(session_id);
                 }
             }
@@ -780,6 +1000,7 @@ fn run_local_daemon_inner() -> Result<(), String> {
                             .map_err(|error| format!("failed to clone client stream: {error}"))?;
                         spawn_client_reader(reader, control_notifier.clone());
                         client_writer = Some(stream);
+                        state.pet_introduction_sent = false;
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
                     Err(error) => return Err(format!("daemon control accept failed: {error}")),
@@ -796,6 +1017,19 @@ fn run_local_daemon_inner() -> Result<(), String> {
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
                     Err(error) => return Err(format!("daemon MCP accept failed: {error}")),
+                }
+            }
+        }
+
+        if pet_mcp_ready {
+            loop {
+                match pet_mcp_listener.accept() {
+                    Ok((stream, _)) => {
+                        let _ = stream.set_nonblocking(false);
+                        spawn_pet_mcp_client(stream, control_notifier.clone());
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(error) => return Err(format!("daemon pet MCP accept failed: {error}")),
                 }
             }
         }
@@ -867,16 +1101,24 @@ fn run_local_daemon_inner() -> Result<(), String> {
                     }
                 }
                 ClientControl::McpToolCall {
+                    kind,
                     name,
                     arguments,
                     response,
                 } => {
-                    let result =
-                        handle_mcp_tool_call(&mut state, &control_notifier, &name, arguments);
+                    let result = handle_mcp_tool_call(
+                        &mut state,
+                        &control_notifier,
+                        client_writer.as_mut(),
+                        kind,
+                        &name,
+                        arguments,
+                    );
                     let _ = response.send(result);
                 }
                 ClientControl::ControlDisconnected => {
                     client_writer = None;
+                    state.disable_input_sync();
                 }
                 ClientControl::StreamDisconnected(session_id) => {
                     if let Some(stream) = state.session_streams.get(&session_id) {
@@ -924,8 +1166,7 @@ fn run_local_daemon_inner() -> Result<(), String> {
 
         if state.snapshot_dirty {
             if let Some(writer) = client_writer.as_mut() {
-                let snapshot = state.workspace_snapshot();
-                let _ = write_json_line(writer, &ServerMessage::WorkspaceSnapshot { snapshot });
+                write_workspace_snapshot(&mut state, writer);
             }
             state.snapshot_dirty = false;
         }
@@ -933,6 +1174,8 @@ fn run_local_daemon_inner() -> Result<(), String> {
 
     let _ = fs::remove_file(&control_socket_path);
     let _ = fs::remove_file(&mcp_socket_path);
+    let _ = fs::remove_file(&pet_mcp_socket_path);
+    let _ = fs::remove_dir(daemon_socket_dir());
     Ok(())
 }
 
@@ -945,13 +1188,18 @@ fn handle_client_message(
     match message {
         ClientMessage::AttachClient => {
             if let Some(writer) = client_writer.as_mut() {
-                let snapshot = state.workspace_snapshot();
-                let _ = write_json_line(writer, &ServerMessage::WorkspaceSnapshot { snapshot });
+                write_workspace_snapshot(state, writer);
             }
             Ok(false)
         }
         ClientMessage::SetTerminalDisplayCapabilities { capabilities } => {
             state.terminal_display_capabilities = capabilities;
+            Ok(false)
+        }
+        ClientMessage::SetPetOrigin { origin } => {
+            state.pet_origin = Some(origin);
+            ensure_pet_session(state, control_tx)?;
+            state.snapshot_dirty = true;
             Ok(false)
         }
         ClientMessage::CreateOrResumeDefaultWorkspace => {
@@ -961,21 +1209,23 @@ fn handle_client_message(
                 let session_id = session.id;
                 ensure_runtime_forwarder(state, session_id, control_tx.clone());
             }
+            ensure_pet_session(state, control_tx)?;
             state.snapshot_dirty = true;
             Ok(false)
         }
         ClientMessage::AddTerminals { source_session } => {
-            let count = additions_for_session_count(state.workspace.sessions().len());
+            let count = additions_for_session_count(state.operator_session_count());
             if count > 0 {
                 add_n_terminals(state, source_session, count, control_tx)?;
             }
+            ensure_pet_session(state, control_tx)?;
             Ok(false)
         }
         ClientMessage::AddTerminalsTo {
             source_session,
             target_total,
         } => {
-            let current_total = state.workspace.sessions().len();
+            let current_total = state.operator_session_count();
             if target_total > current_total && supported_terminal_target(target_total) {
                 add_n_terminals(
                     state,
@@ -984,10 +1234,12 @@ fn handle_client_message(
                     control_tx,
                 )?;
             }
+            ensure_pet_session(state, control_tx)?;
             Ok(false)
         }
         ClientMessage::AddOneTerminal { source_session } => {
             add_n_terminals(state, source_session, 1, control_tx)?;
+            ensure_pet_session(state, control_tx)?;
             Ok(false)
         }
         ClientMessage::CloseSession { session_id } => {
@@ -1026,6 +1278,9 @@ fn handle_client_message(
                 }
             }
             state.forwarded_sessions.remove(&session_id);
+            if state.pet_session_id == Some(session_id) {
+                state.pet_session_id = None;
+            }
             state.workspace.remove_session(session_id);
             state.snapshot_dirty = true;
             Ok(false)
@@ -1088,19 +1343,6 @@ fn handle_client_message(
             state.snapshot_dirty = true;
             Ok(false)
         }
-        ClientMessage::ConfigureTerminalAssist {
-            openai_api_key,
-            openai_base_url,
-            model,
-        } => {
-            apply_terminal_assist_config_environment(&TerminalAssistConfig {
-                openai_api_key: openai_api_key.unwrap_or_default(),
-                openai_base_url,
-                model,
-            });
-            state.assist_worker = spawn_assist_worker();
-            Ok(false)
-        }
         ClientMessage::RequestTerminalAssist {
             request_id,
             session_id,
@@ -1140,6 +1382,19 @@ fn handle_client_message(
 fn handle_mcp_tool_call(
     state: &mut DaemonState,
     _control_tx: &ControlNotifier,
+    client_writer: Option<&mut UnixStream>,
+    kind: McpClientKind,
+    name: &str,
+    arguments: Value,
+) -> ToolCallOutcome {
+    match kind {
+        McpClientKind::Supervisor => handle_supervisor_mcp_tool_call(state, name, arguments),
+        McpClientKind::Pet => handle_pet_mcp_tool_call(state, client_writer, name, arguments),
+    }
+}
+
+fn handle_supervisor_mcp_tool_call(
+    state: &mut DaemonState,
     name: &str,
     arguments: Value,
 ) -> ToolCallOutcome {
@@ -1218,6 +1473,197 @@ fn handle_mcp_tool_call(
     }
 }
 
+fn handle_pet_mcp_tool_call(
+    state: &mut DaemonState,
+    client_writer: Option<&mut UnixStream>,
+    name: &str,
+    arguments: Value,
+) -> ToolCallOutcome {
+    match name {
+        "exaterm_pet_initialize_profile" => initialize_pet_profile(state, arguments),
+        "exaterm_pet_profile" => pet_profile_result(state),
+        "exaterm_pet_workspace" => pet_workspace_result(state),
+        "exaterm_pet_comment" => pet_comment_result(state, client_writer, arguments),
+        _ => Err(ToolCallError::new(format!(
+            "unknown Exaterm pet MCP tool: {name}"
+        ))),
+    }
+}
+
+fn initialize_pet_profile(state: &mut DaemonState, arguments: Value) -> ToolCallOutcome {
+    if state.pet_profile.is_some() || load_pet_profile().is_some() {
+        state.pet_profile = load_pet_profile();
+        return Err(ToolCallError::new(
+            "pet profile is already initialized and cannot be overwritten",
+        ));
+    }
+    let seed_hash = pet_seed_hash_for_state(state);
+    let draft = PetProfileDraft {
+        name: argument_string(&arguments, "name")?,
+        appearance_ascii: argument_string(&arguments, "appearance_ascii")?,
+        temperament: argument_string(&arguments, "temperament")?,
+        backstory: argument_string(&arguments, "backstory")?,
+        comment_style: argument_string(&arguments, "comment_style")?,
+    };
+    let profile = profile_from_draft(draft, &seed_hash).map_err(ToolCallError::new)?;
+    save_pet_profile(&profile).map_err(ToolCallError::new)?;
+    state.pet_profile = Some(profile.clone());
+    Ok(ToolCallResult::structured(
+        json!({
+            "initialized": true,
+            "profile": profile,
+        }),
+        "Initialized Exaterm pet profile",
+    ))
+}
+
+fn pet_profile_result(state: &DaemonState) -> ToolCallOutcome {
+    let seed_hash = pet_seed_hash_for_state(state);
+    let structured = json!({
+        "initialized": state.pet_profile.is_some(),
+        "seed_hash": seed_hash,
+        "profile": state.pet_profile.clone(),
+    });
+    Ok(ToolCallResult::structured(
+        structured,
+        if state.pet_profile.is_some() {
+            "Exaterm pet profile is initialized"
+        } else {
+            "Exaterm pet profile is not initialized"
+        },
+    ))
+}
+
+fn pet_workspace_result(state: &DaemonState) -> ToolCallOutcome {
+    let visible_items = state.visible_workspace_items();
+    let sessions = state
+        .workspace
+        .sessions()
+        .iter()
+        .filter(|session| Some(session.id) != state.pet_session_id)
+        .map(|session| {
+            let observation = state
+                .observations
+                .get(&session.id)
+                .map(observation_snapshot)
+                .unwrap_or_default();
+            let role = pet_session_role(state, session.id);
+            let richer_observation = state.observations.get(&session.id);
+            json!({
+                "session_id": session.id.0,
+                "role": role,
+                "visible_root_item": visible_items.contains(&WorkspaceItem::Session(session.id)),
+                "name": session.launch.name.clone(),
+                "display_name": session.display_name.clone(),
+                "status": session.status.clone(),
+                "pid": session.pid,
+                "working_directory": session.launch.cwd.as_ref().map(|path| path.display().to_string()),
+                "observation": observation,
+                "active_command": richer_observation.and_then(|obs| obs.active_command.clone()),
+                "dominant_process": richer_observation.and_then(|obs| obs.dominant_process.clone()),
+                "process_tree_excerpt": richer_observation.and_then(|obs| obs.process_tree_excerpt.clone()),
+                "recent_files": richer_observation.map(|obs| obs.recent_files.clone()).unwrap_or_default(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let structured = json!({
+        "pet_profile": state.pet_profile.clone(),
+        "visible_items": visible_items,
+        "groups": state.group_snapshots(),
+        "sessions": sessions,
+    });
+    Ok(ToolCallResult::structured(
+        structured,
+        "Exaterm pet workspace snapshot",
+    ))
+}
+
+fn pet_session_role(state: &DaemonState, session_id: SessionId) -> &'static str {
+    if state
+        .groups
+        .values()
+        .any(|group| group.supervisor_session_id == Some(session_id))
+    {
+        return "group_supervisor";
+    }
+    if state
+        .groups
+        .values()
+        .any(|group| group.member_session_ids.contains(&session_id))
+    {
+        return "group_member";
+    }
+    "terminal"
+}
+
+fn pet_comment_result(
+    state: &mut DaemonState,
+    client_writer: Option<&mut UnixStream>,
+    arguments: Value,
+) -> ToolCallOutcome {
+    let profile = state
+        .pet_profile
+        .clone()
+        .or_else(load_pet_profile)
+        .ok_or_else(|| ToolCallError::new("pet profile is not initialized"))?;
+    state.pet_profile = Some(profile.clone());
+
+    let session_id = SessionId(argument_u32(&arguments, "session_id")?);
+    if Some(session_id) == state.pet_session_id || state.workspace.session(session_id).is_none() {
+        return Err(ToolCallError::new(format!(
+            "unknown or invalid pet comment target session {}",
+            session_id.0
+        )));
+    }
+    state
+        .pet_comment_rate
+        .check_and_record(session_id, Instant::now())
+        .map_err(ToolCallError::new)?;
+
+    let message = sanitize_pet_comment_message(&argument_string(&arguments, "message")?)
+        .map_err(ToolCallError::new)?;
+    let ttl_secs = clamp_pet_comment_ttl(optional_argument_u64(&arguments, "ttl_secs"));
+    let comment = PetComment {
+        id: state.next_pet_comment_id,
+        session_id,
+        name: profile.name,
+        appearance_ascii: profile.appearance_ascii,
+        message,
+        ttl_secs,
+    };
+    state.next_pet_comment_id = state.next_pet_comment_id.saturating_add(1);
+
+    let mut delivery_error = None::<String>;
+    let delivered = if let Some(writer) = client_writer {
+        match write_json_line(
+            writer,
+            &ServerMessage::PetComment {
+                comment: comment.clone(),
+            },
+        ) {
+            Ok(()) => true,
+            Err(error) => {
+                delivery_error = Some(error.to_string());
+                false
+            }
+        }
+    } else {
+        false
+    };
+    Ok(ToolCallResult::structured(
+        json!({
+            "delivered": delivered,
+            "delivery_error": delivery_error,
+            "comment": comment,
+        }),
+        if delivered {
+            "Pet comment delivered"
+        } else {
+            "Pet comment accepted but no UI client is attached"
+        },
+    ))
+}
+
 fn mcp_group_detail(state: &DaemonState, group_id: GroupId) -> Result<Value, ToolCallError> {
     let group = state
         .groups
@@ -1273,6 +1719,14 @@ fn argument_string(arguments: &Value, key: &str) -> Result<String, ToolCallError
         .and_then(Value::as_str)
         .map(|value| value.to_string())
         .ok_or_else(|| ToolCallError::new(format!("missing or invalid string argument `{key}`")))
+}
+
+fn optional_argument_u64(arguments: &Value, key: &str) -> Option<u64> {
+    let camel = to_camel_case(key);
+    arguments
+        .get(key)
+        .or_else(|| arguments.get(camel.as_str()))
+        .and_then(Value::as_u64)
 }
 
 fn to_camel_case(key: &str) -> String {
@@ -1577,6 +2031,200 @@ fn record_group_action(state: &mut DaemonState, group_id: GroupId, summary: impl
     }
 }
 
+fn ensure_pet_session(state: &mut DaemonState, control_tx: &ControlNotifier) -> Result<(), String> {
+    if state.operator_session_count() == 0 {
+        return Ok(());
+    }
+    if state
+        .pet_session_id
+        .is_some_and(|session_id| state.workspace.session(session_id).is_some())
+        && state
+            .pet_session_id
+            .is_some_and(|session_id| state.runtimes.contains_key(&session_id))
+    {
+        return Ok(());
+    }
+
+    let provider = if command_exists("codex") {
+        SupervisorProvider::Codex
+    } else if command_exists("claude") {
+        SupervisorProvider::Claude
+    } else {
+        return Ok(());
+    };
+
+    let seed_hash = pet_seed_hash_for_state(state);
+    if state.pet_profile.is_none() {
+        state.pet_profile = load_pet_profile();
+    }
+    let prompt = pet_prompt(state.pet_profile.as_ref(), &seed_hash);
+    let pet_socket_path = pet_mcp_socket_path()?;
+    let mut launch = match provider {
+        SupervisorProvider::Codex => command_launch(
+            "Exaterm Pet",
+            "Hidden workspace pet",
+            SessionKind::RunningStream,
+            "/usr/bin/env",
+            codex_pet_args(&prompt, &pet_socket_path)?,
+        ),
+        SupervisorProvider::Claude => command_launch(
+            "Exaterm Pet",
+            "Hidden workspace pet",
+            SessionKind::RunningStream,
+            "/usr/bin/env",
+            claude_pet_args(&prompt, &pet_socket_path)?,
+        ),
+        SupervisorProvider::Other => return Ok(()),
+    };
+    launch.env.push(("EXATERM_PET".into(), "1".into()));
+    launch.env.push(("EXATERM_PET_SEED_HASH".into(), seed_hash));
+
+    let session_id = state.add_shell_session_with_visibility(launch, false)?;
+    state.pet_session_id = Some(session_id);
+    ensure_runtime_forwarder(state, session_id, control_tx.clone());
+    Ok(())
+}
+
+fn pet_mcp_bridge_command(socket_path: &std::path::Path) -> Result<(String, Vec<String>), String> {
+    let bridge_program = env::current_exe()
+        .map_err(|error| format!("failed to locate Exaterm MCP bridge executable: {error}"))?
+        .to_string_lossy()
+        .into_owned();
+    Ok((
+        bridge_program,
+        vec![
+            "--mcp-stdio-bridge".into(),
+            socket_path.to_string_lossy().into_owned(),
+        ],
+    ))
+}
+
+fn codex_pet_args(prompt: &str, socket_path: &std::path::Path) -> Result<Vec<String>, String> {
+    let (bridge_program, bridge_args) = pet_mcp_bridge_command(socket_path)?;
+    let command_value = serde_json::to_string(&bridge_program)
+        .map_err(|error| format!("failed to configure pet MCP command: {error}"))?;
+    let args_value = serde_json::to_string(&bridge_args)
+        .map_err(|error| format!("failed to configure pet MCP arguments: {error}"))?;
+
+    Ok(vec![
+        "codex".into(),
+        "-c".into(),
+        format!("mcp_servers.exaterm_pet.command={command_value}"),
+        "-c".into(),
+        format!("mcp_servers.exaterm_pet.args={args_value}"),
+        "-c".into(),
+        "mcp_servers.exaterm_pet.required=true".into(),
+        "-c".into(),
+        "mcp_servers.exaterm_pet.default_tools_approval_mode=\"approve\"".into(),
+        "-c".into(),
+        "mcp_servers.exaterm_pet.enabled_tools=[\"exaterm_pet_initialize_profile\",\"exaterm_pet_profile\",\"exaterm_pet_workspace\",\"exaterm_pet_comment\"]".into(),
+        "--dangerously-bypass-approvals-and-sandbox".into(),
+        prompt.into(),
+    ])
+}
+
+fn claude_pet_args(prompt: &str, socket_path: &std::path::Path) -> Result<Vec<String>, String> {
+    let (bridge_program, bridge_args) = pet_mcp_bridge_command(socket_path)?;
+    let config = json!({
+        "mcpServers": {
+            "exaterm_pet": {
+                "type": "stdio",
+                "command": bridge_program,
+                "args": bridge_args,
+            }
+        }
+    });
+    Ok(vec![
+        "claude".into(),
+        "--strict-mcp-config".into(),
+        "--mcp-config".into(),
+        config.to_string(),
+        "--dangerously-skip-permissions".into(),
+        prompt.into(),
+    ])
+}
+
+fn pet_seed_hash_for_state(state: &DaemonState) -> String {
+    state
+        .pet_origin
+        .as_ref()
+        .filter(|origin| {
+            origin.seed_hash.len() == 16
+                && origin.seed_hash.chars().all(|ch| ch.is_ascii_hexdigit())
+        })
+        .map(|origin| origin.seed_hash.clone())
+        .unwrap_or_else(|| host_pet_origin().seed_hash)
+}
+
+fn pet_prompt(profile: Option<&PetProfile>, seed_hash: &str) -> String {
+    let identity = match profile {
+        Some(profile) => format!(
+            "Your persistent identity is already initialized:\nname: {}\nappearance_ascii:\n{}\ntemperament: {}\nbackstory: {}\ncomment_style: {}\n",
+            profile.name,
+            profile.appearance_ascii,
+            profile.temperament,
+            profile.backstory,
+            profile.comment_style,
+        ),
+        None => format!(
+            "No persistent pet identity exists yet. First, call exaterm_pet_initialize_profile with a compact ASCII appearance and identity generated from seed {seed_hash}. \
+             The name and appearance should feel terminal-native, weird in a restrained way, and specific without referencing real hardware details. \
+             ASCII art must be printable ASCII only, at most 8 lines and 48 columns. After initialization, call exaterm_pet_profile to confirm it."
+        ),
+    };
+
+    format!(
+        "You are Exaterm's long-lived workspace pet. Seed hash: {seed_hash}\n\
+         Use only the registered exaterm_pet MCP tools. You cannot type into terminals and must never try to run commands for the operator.\n\
+         {identity}\n\
+         Your job is to occasionally observe terminal-native coding sessions and make one short helpful or dryly sarcastic comment near exactly one terminal. \
+         Use exaterm_pet_workspace as your source of truth. Use exaterm_pet_comment for comments. \
+         Comment rarely. Prefer silence when work is healthy or evidence is thin. \
+         Base comments only on visible terminal/process/file evidence. Do not claim hidden model reasoning. \
+         Keep comments terse, operational, and consistent with your profile."
+    )
+}
+
+fn write_workspace_snapshot(state: &mut DaemonState, writer: &mut UnixStream) {
+    let snapshot = state.workspace_snapshot();
+    if write_json_line(writer, &ServerMessage::WorkspaceSnapshot { snapshot }).is_ok() {
+        maybe_write_pet_introduction(state, writer);
+    }
+}
+
+fn maybe_write_pet_introduction(state: &mut DaemonState, writer: &mut UnixStream) {
+    if state.pet_introduction_sent || state.pet_origin.is_none() {
+        return;
+    }
+    let Some(session_id) =
+        state
+            .visible_workspace_items()
+            .into_iter()
+            .find_map(|item| match item {
+                WorkspaceItem::Session(session_id) => Some(session_id),
+                WorkspaceItem::Group(_) => None,
+            })
+    else {
+        return;
+    };
+    let profile = state
+        .pet_profile
+        .clone()
+        .unwrap_or_else(|| bootstrap_pet_profile(&pet_seed_hash_for_state(state)));
+    let comment = PetComment {
+        id: state.next_pet_comment_id,
+        session_id,
+        name: profile.name,
+        appearance_ascii: profile.appearance_ascii,
+        message: "online".into(),
+        ttl_secs: 10,
+    };
+    if write_json_line(writer, &ServerMessage::PetComment { comment }).is_ok() {
+        state.next_pet_comment_id = state.next_pet_comment_id.saturating_add(1);
+        state.pet_introduction_sent = true;
+    }
+}
+
 fn queue_terminal_assist(
     state: &mut DaemonState,
     request_id: u64,
@@ -1591,13 +2239,14 @@ fn queue_terminal_assist(
         return Err("assist prompt cannot be empty".into());
     }
     let evidence = build_terminal_assist_evidence(state, session_id, prompt)?;
-    let _ = worker.requests.send(AssistJob {
-        request_id,
-        origin_session_id: session_id,
-        evidence,
-        preferences: ProviderPreferences::default(),
-    });
-    Ok(())
+    worker
+        .requests
+        .send(AssistJob {
+            request_id,
+            origin_session_id: session_id,
+            evidence,
+        })
+        .map_err(|_| "terminal assist worker is unavailable".to_string())
 }
 
 fn build_terminal_assist_evidence(
@@ -1714,7 +2363,7 @@ fn drain_worker_results(state: &mut DaemonState, client_writer: &mut Option<Unix
             break;
         };
 
-        let (inserted, error) = match result.suggestion.value {
+        let (inserted, error) = match result.suggestion {
             Ok(suggestion) if !suggestion.insert_text.trim().is_empty() => {
                 match send_terminal_assist_insert_bytes(
                     state,
@@ -1758,9 +2407,25 @@ fn handle_runtime_event(
             );
             let observation = state.observations.entry(session_id).or_default();
             apply_stream_update(observation, update);
-            state.snapshot_dirty = true;
+            if state.pet_session_id != Some(session_id) {
+                state.snapshot_dirty = true;
+            }
         }
         RuntimeEvent::Exited(exit_code) => {
+            if state.pet_session_id == Some(session_id) {
+                state.runtimes.remove(&session_id);
+                state.observations.remove(&session_id);
+                state.observation_cache.remove(&session_id);
+                state.replay_buffers.remove(&session_id);
+                if let Some(stream) = state.session_streams.remove(&session_id) {
+                    let _ = fs::remove_file(&stream.socket_path);
+                }
+                state.forwarded_sessions.remove(&session_id);
+                state.workspace.remove_session(session_id);
+                state.pet_session_id = None;
+                state.snapshot_dirty = true;
+                return;
+            }
             state.workspace.mark_exited(session_id, exit_code);
             state.snapshot_dirty = true;
         }
@@ -1930,13 +2595,30 @@ fn append_replay_buffer(buffer: &mut Vec<u8>, chunk: &[u8]) {
 }
 
 fn spawn_assist_worker() -> Option<AssistWorker> {
-    let registry = SynthesisBackendRegistry::from_env()?;
     let (request_tx, request_rx) = mpsc::channel::<AssistJob>();
     let (result_tx, result_rx) = mpsc::channel::<AssistResult>();
     thread::spawn(move || {
+        let mut client = None::<CodexAppServerClient>;
         while let Ok(job) = request_rx.recv() {
-            let suggestion =
-                registry.suggest_terminal_assist_blocking(&job.preferences, &job.evidence);
+            let suggestion = match client.as_mut() {
+                Some(client) => {
+                    client.suggest_terminal_assist(job.origin_session_id, &job.evidence)
+                }
+                None => match CodexAppServerClient::launch() {
+                    Ok(mut launched) => {
+                        let result =
+                            launched.suggest_terminal_assist(job.origin_session_id, &job.evidence);
+                        client = Some(launched);
+                        result
+                    }
+                    Err(error) => Err(error),
+                },
+            };
+            if suggestion.as_ref().is_err_and(|error| {
+                error.contains("WebSocket") || error.contains("app-server closed")
+            }) {
+                client = None;
+            }
             let _ = result_tx.send(AssistResult {
                 request_id: job.request_id,
                 origin_session_id: job.origin_session_id,
@@ -2043,7 +2725,7 @@ fn spawn_raw_stream_reader(
     thread::spawn(move || {
         let mut reader = stream;
         let mut buf = [0u8; 8192];
-        let mut response_filter = TerminalResponseInputFilter::default();
+        let mut input_filters = TerminalInputFilters::default();
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => {
@@ -2051,23 +2733,25 @@ fn spawn_raw_stream_reader(
                     break;
                 }
                 Ok(n) => {
-                    let bytes = {
+                    let synchronized_bytes = {
                         let Ok(mut writer) = input_writer.lock() else {
                             break;
                         };
-                        let filter_responses = terminal_echoes_canonical_input(&writer);
-                        let bytes = response_filter.filter(&buf[..n], filter_responses);
-                        if bytes.is_empty() {
-                            continue;
-                        }
-                        if writer.write_all(&bytes).is_err() {
+                        let filter_source_responses = terminal_echoes_canonical_input(&writer);
+                        let filtered = input_filters.filter(&buf[..n], filter_source_responses);
+                        if !filtered.source_bytes.is_empty()
+                            && writer.write_all(&filtered.source_bytes).is_err()
+                        {
                             break;
                         }
-                        bytes
+                        filtered.synchronized_bytes
                     };
+                    if synchronized_bytes.is_empty() {
+                        continue;
+                    }
                     let _ = control_tx.send(ClientControl::TerminalInputBytes {
                         source_session: session_id,
-                        bytes,
+                        bytes: synchronized_bytes,
                     });
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -2078,6 +2762,26 @@ fn spawn_raw_stream_reader(
             }
         }
     });
+}
+
+#[derive(Default)]
+struct TerminalInputFilters {
+    source: TerminalResponseInputFilter,
+    synchronized: TerminalResponseInputFilter,
+}
+
+struct FilteredTerminalInput {
+    source_bytes: Vec<u8>,
+    synchronized_bytes: Vec<u8>,
+}
+
+impl TerminalInputFilters {
+    fn filter(&mut self, bytes: &[u8], filter_source_responses: bool) -> FilteredTerminalInput {
+        FilteredTerminalInput {
+            source_bytes: self.source.filter(bytes, filter_source_responses),
+            synchronized_bytes: self.synchronized.filter(bytes, true),
+        }
+    }
 }
 
 fn terminal_echoes_canonical_input(pty_master: &File) -> bool {
@@ -2120,6 +2824,10 @@ impl TerminalResponseInputFilter {
                 output.push(byte);
             }
         }
+        if matches!(self.state, TerminalResponseInputState::Escape) {
+            output.push(0x1b);
+            self.state = TerminalResponseInputState::Ground;
+        }
         output
     }
 
@@ -2134,7 +2842,7 @@ impl TerminalResponseInputFilter {
             }
             TerminalResponseInputState::Escape => match byte {
                 b']' => self.state = TerminalResponseInputState::Osc,
-                b'P' => self.state = TerminalResponseInputState::Dcs,
+                b'P' | b'X' | b'^' | b'_' => self.state = TerminalResponseInputState::Dcs,
                 b'[' => self.state = TerminalResponseInputState::Csi(Vec::new()),
                 _ => {
                     output.push(0x1b);
@@ -2195,14 +2903,17 @@ fn is_terminal_response_csi(sequence: &[u8]) -> bool {
         return false;
     };
     match final_byte {
-        b'R' => body
+        b'R' | b'n' => body
+            .strip_prefix(b"?")
+            .unwrap_or(body)
             .iter()
             .all(|byte| byte.is_ascii_digit() || *byte == b';'),
         b'c' => matches!(body.first(), Some(b'?' | b'>')),
         b'y' => body.contains(&b'$'),
-        b'n' => body
+        b't' | b'x' => body
             .iter()
             .all(|byte| byte.is_ascii_digit() || *byte == b';'),
+        b'u' => body.starts_with(b"?"),
         _ => false,
     }
 }
@@ -2329,7 +3040,7 @@ fn add_n_terminals(
         .session(source_session)
         .and_then(|session| session.launch.cwd.clone());
     for _ in 0..count {
-        let number = state.workspace.sessions().len() + 1;
+        let number = state.operator_session_count() + 1;
         let mut launch = user_shell_launch(format!("Shell {number}"), "Generic command session");
         if let Some(cwd) = cwd.clone() {
             launch = launch.with_cwd(cwd);
@@ -2395,6 +3106,10 @@ pub fn mcp_socket_path() -> Result<PathBuf, String> {
     Ok(daemon_socket_dir().join(MCP_SOCKET_NAME))
 }
 
+pub fn pet_mcp_socket_path() -> Result<PathBuf, String> {
+    Ok(daemon_socket_dir().join(PET_MCP_SOCKET_NAME))
+}
+
 pub fn session_raw_socket_path(socket_name: &str) -> Result<PathBuf, String> {
     Ok(daemon_socket_dir().join(socket_name))
 }
@@ -2442,8 +3157,26 @@ fn drain_wake_socket(reader: &mut UnixStream) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn beachhead_client_reports_control_disconnect() {
+        let (client_stream, server_stream) = UnixStream::pair().expect("control socket pair");
+        let client =
+            LocalBeachheadClient::connect_control(client_stream).expect("connect beachhead client");
+        drop(server_stream);
+
+        let message = client
+            .events
+            .recv_timeout(Duration::from_secs(1))
+            .expect("disconnect event");
+        match message {
+            ServerMessage::Error { message } => {
+                assert!(message.contains("connection"));
+            }
+            other => panic!("unexpected disconnect event: {other:?}"),
+        }
+    }
 
     #[test]
     fn add_terminals_follows_staged_density_growth() {
@@ -2549,10 +3282,30 @@ mod tests {
 
         assert_eq!(filter.filter(b"\x1b[?12;4$y", true), b"");
         assert_eq!(filter.filter(b"\x1b[24;80R", true), b"");
+        assert_eq!(filter.filter(b"\x1b[?24;80R", true), b"");
+        assert_eq!(filter.filter(b"\x1b[8;24;80t", true), b"");
+        assert_eq!(filter.filter(b"\x1b[2;1;1;128;128;1;0x", true), b"");
+        assert_eq!(filter.filter(b"\x1b[?3u", true), b"");
         assert_eq!(
-            filter.filter(b"\x1b[A\x1bOB\x1b[6~", true),
-            b"\x1b[A\x1bOB\x1b[6~"
+            filter.filter(b"\x1b[A\x1bOB\x1b[6~\x1b[65;2u", true),
+            b"\x1b[A\x1bOB\x1b[6~\x1b[65;2u"
         );
+    }
+
+    #[test]
+    fn terminal_input_filters_keep_raw_replies_local_but_never_sync_them() {
+        let mut filters = TerminalInputFilters::default();
+        let bytes = b"a\x1b[?24;80R\x1b[8;24;80t\x1b_Gi=1;OK\x1b\\b";
+
+        let raw = filters.filter(bytes, false);
+
+        assert_eq!(raw.source_bytes, bytes);
+        assert_eq!(raw.synchronized_bytes, b"ab");
+
+        let mut filters = TerminalInputFilters::default();
+        let cooked = filters.filter(bytes, true);
+        assert_eq!(cooked.source_bytes, b"ab");
+        assert_eq!(cooked.synchronized_bytes, b"ab");
     }
 
     #[test]
@@ -2561,6 +3314,14 @@ mod tests {
         let bytes = b"\x1b]10;rgb:ffff/ffff/ffff\x07\x1bP1+r6b75=1B4F41\x1b\\";
 
         assert_eq!(filter.filter(bytes, false), bytes);
+    }
+
+    #[test]
+    fn terminal_response_filter_does_not_delay_standalone_escape_key() {
+        let mut filter = TerminalResponseInputFilter::default();
+
+        assert_eq!(filter.filter(b"\x1b", true), b"\x1b");
+        assert_eq!(filter.filter(b"j", true), b"j");
     }
 
     #[test]
@@ -2640,6 +3401,20 @@ mod tests {
         let targets = input_sync_targets(&state);
 
         assert_eq!(targets, BTreeSet::from([member_a, member_b]));
+    }
+
+    #[test]
+    fn input_sync_is_cleared_with_client_state() {
+        let mut state = DaemonState::new();
+        state.input_sync_enabled = true;
+        state.input_sync_scope = InputSyncScope::GroupMembers {
+            group_id: GroupId(7),
+        };
+
+        state.disable_input_sync();
+
+        assert!(!state.input_sync_enabled);
+        assert_eq!(state.input_sync_scope, InputSyncScope::RootVisible);
     }
 
     #[test]
@@ -2727,9 +3502,201 @@ mod tests {
         assert_eq!(targets, BTreeSet::from([root]));
     }
 
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+    fn sample_pet_profile() -> PetProfile {
+        PetProfile {
+            name: "Bracket".into(),
+            appearance_ascii: "/\\_/\\\\\n( -.- )".into(),
+            temperament: "dry and watchful".into(),
+            backstory: "Spawned from a terminal resize that nobody can reproduce.".into(),
+            comment_style: "short, technical, mildly sarcastic".into(),
+            seed_hash: "0123456789abcdef".into(),
+        }
+    }
+
+    #[test]
+    fn workspace_snapshot_excludes_pet_session() {
+        let mut state = DaemonState::new();
+        let worker = state
+            .workspace
+            .add_session(user_shell_launch("Worker", "visible"));
+        let pet = state
+            .workspace
+            .add_session(user_shell_launch("Exaterm Pet", "hidden"));
+        state.workspace_items = vec![WorkspaceItem::Session(worker)];
+        state.pet_session_id = Some(pet);
+
+        let snapshot = state.workspace_snapshot();
+
+        assert_eq!(snapshot.sessions.len(), 1);
+        assert_eq!(snapshot.sessions[0].record.id, worker);
+        assert_eq!(snapshot.items, vec![WorkspaceItem::Session(worker)]);
+    }
+
+    #[test]
+    fn pet_introduction_follows_workspace_snapshot() {
+        let mut state = DaemonState::new();
+        let worker = state
+            .workspace
+            .add_session(user_shell_launch("Worker", "visible"));
+        state.workspace_items = vec![WorkspaceItem::Session(worker)];
+        state.pet_origin = Some(PetOrigin {
+            seed_hash: "0123456789abcdef".into(),
+        });
+        state.pet_profile = Some(sample_pet_profile());
+        let (mut writer, reader) = UnixStream::pair().expect("control socket pair");
+
+        write_workspace_snapshot(&mut state, &mut writer);
+
+        let mut reader = BufReader::new(reader);
+        let mut snapshot_line = String::new();
+        let mut comment_line = String::new();
+        reader.read_line(&mut snapshot_line).expect("snapshot line");
+        reader.read_line(&mut comment_line).expect("comment line");
+        assert!(matches!(
+            serde_json::from_str::<ServerMessage>(&snapshot_line).unwrap(),
+            ServerMessage::WorkspaceSnapshot { .. }
+        ));
+        match serde_json::from_str::<ServerMessage>(&comment_line).unwrap() {
+            ServerMessage::PetComment { comment } => {
+                assert_eq!(comment.session_id, worker);
+                assert_eq!(comment.name, "Bracket");
+                assert_eq!(comment.message, "online");
+            }
+            other => panic!("expected pet comment, got {other:?}"),
+        }
+        assert!(state.pet_introduction_sent);
+    }
+
+    #[test]
+    fn pet_agent_launches_register_stdio_mcp_bridge() {
+        let socket_path = std::path::Path::new("/tmp/exaterm-pet-test.sock");
+        let codex_args = codex_pet_args("observe", socket_path).expect("Codex arguments");
+        assert_eq!(codex_args.first().map(String::as_str), Some("codex"));
+        assert!(codex_args.iter().any(|arg| {
+            arg == "mcp_servers.exaterm_pet.args=[\"--mcp-stdio-bridge\",\"/tmp/exaterm-pet-test.sock\"]"
+        }));
+        assert!(codex_args
+            .iter()
+            .any(|arg| arg == "mcp_servers.exaterm_pet.required=true"));
+
+        let claude_args = claude_pet_args("observe", socket_path).expect("Claude arguments");
+        let config_index = claude_args
+            .iter()
+            .position(|arg| arg == "--mcp-config")
+            .expect("MCP config flag");
+        let config: Value = serde_json::from_str(&claude_args[config_index + 1]).unwrap();
+        assert_eq!(
+            config["mcpServers"]["exaterm_pet"]["args"],
+            json!(["--mcp-stdio-bridge", "/tmp/exaterm-pet-test.sock"])
+        );
+    }
+
+    #[test]
+    fn pet_mcp_cannot_call_supervisor_mutation_tool() {
+        let mut state = DaemonState::new();
+        let result = handle_mcp_tool_call(
+            &mut state,
+            &ControlNotifier {
+                tx: mpsc::channel().0,
+                wake: std::sync::Arc::new(std::sync::Mutex::new(
+                    UnixStream::pair().expect("wake pair").0,
+                )),
+            },
+            None,
+            McpClientKind::Pet,
+            "exaterm_send_message_to_agent",
+            json!({"group_id": 1, "session_id": 0, "message": "continue"}),
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn pet_profile_initialize_refuses_existing_profile() {
+        let mut state = DaemonState::new();
+        state.pet_origin = Some(PetOrigin {
+            seed_hash: "0123456789abcdef".into(),
+        });
+        state.pet_profile = Some(sample_pet_profile());
+        let args = json!({
+            "name": "Bracket",
+            "appearance_ascii": "/\\_/\\\\\n( -.- )",
+            "temperament": "dry and watchful",
+            "backstory": "Spawned from a terminal resize that nobody can reproduce.",
+            "comment_style": "short, technical, mildly sarcastic"
+        });
+
+        assert!(initialize_pet_profile(&mut state, args).is_err());
+    }
+
+    #[test]
+    fn pet_workspace_excludes_pet_and_includes_evidence() {
+        let mut state = DaemonState::new();
+        let worker = state
+            .workspace
+            .add_session(user_shell_launch("Worker", "visible"));
+        let pet = state
+            .workspace
+            .add_session(user_shell_launch("Exaterm Pet", "hidden"));
+        state.workspace_items = vec![WorkspaceItem::Session(worker)];
+        state.pet_session_id = Some(pet);
+        let observation = state.observations.entry(worker).or_default();
+        observation.recent_lines = vec!["cargo test failed".into()];
+        observation.painted_line = Some("error: nope".into());
+
+        let result = pet_workspace_result(&state).expect("workspace");
+        let structured = result.structured_content.expect("structured");
+        let sessions = structured
+            .get("sessions")
+            .and_then(Value::as_array)
+            .expect("sessions array");
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0]["session_id"], json!(worker.0));
+        assert_eq!(
+            sessions[0]["observation"]["painted_line"],
+            json!("error: nope")
+        );
+    }
+
+    #[test]
+    fn pet_comment_accepts_without_client_and_rate_limits() {
+        let mut state = DaemonState::new();
+        let worker = state
+            .workspace
+            .add_session(user_shell_launch("Worker", "visible"));
+        state.workspace_items = vec![WorkspaceItem::Session(worker)];
+        state.pet_profile = Some(sample_pet_profile());
+
+        let result = pet_comment_result(
+            &mut state,
+            None,
+            json!({
+                "session_id": worker.0,
+                "message": "still compiling, allegedly",
+                "ttl_secs": 99
+            }),
+        )
+        .expect("comment");
+        assert_eq!(
+            result.structured_content.as_ref().unwrap()["delivered"],
+            json!(false)
+        );
+        let comment = &result.structured_content.as_ref().unwrap()["comment"];
+        assert_eq!(comment["session_id"], json!(worker.0));
+        assert_eq!(comment["ttl_secs"], json!(30));
+        assert_eq!(comment["message"], json!("still compiling, allegedly"));
+
+        assert!(pet_comment_result(
+            &mut state,
+            None,
+            json!({"session_id": worker.0, "message": "again"})
+        )
+        .is_err());
+    }
+
+    fn env_lock() -> &'static std::sync::Mutex<()> {
+        crate::pet::env_test_lock()
     }
 
     /// Returns false when Unix socket creation is blocked (e.g. inside the
@@ -2852,6 +3819,10 @@ mod tests {
         drop(stream);
         let result = handle.join().expect("daemon thread should join");
         assert!(result.is_ok(), "daemon should exit cleanly: {result:?}");
+        assert!(
+            !runtime_dir.join("exaterm").exists(),
+            "daemon should remove its empty runtime directory"
+        );
 
         std::env::remove_var("EXATERM_RUNTIME_DIR");
         let _ = fs::remove_dir_all(runtime_dir);

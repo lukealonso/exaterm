@@ -81,6 +81,7 @@ fn relay_loop(
                             eprintln!("daemon error: {message}");
                         }
                         Ok(ServerMessage::TerminalAssistCompleted { .. }) => {}
+                        Ok(ServerMessage::PetComment { .. }) => {}
                         Err(_) => {
                             eprintln!("daemon disconnected, reconnecting");
                             let _ = snapshot_tx.send(WorkspaceSnapshot::default());

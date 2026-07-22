@@ -129,6 +129,9 @@ Completion behavior:
 - do not automatically press Enter unless the product intentionally adds that later
 - use recent terminal history and internal deterministic observation as evidence
 - keep the interaction lightweight enough to feel like command-line autocomplete help, not a chat surface
+- lazily connect the beachhead to `codex app-server` over a loopback WebSocket
+- create one Codex thread per terminal on first use and continue that thread for later corrections
+- use the Codex installation, authentication, and default model configuration on the beachhead host
 
 ## Observation Boundaries
 

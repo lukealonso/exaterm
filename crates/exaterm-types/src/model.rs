@@ -7,6 +7,16 @@ pub struct SessionId(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct GroupId(pub u32);
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PetProfile {
+    pub name: String,
+    pub appearance_ascii: String,
+    pub temperament: String,
+    pub backstory: String,
+    pub comment_style: String,
+    pub seed_hash: String,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceItem {

@@ -414,6 +414,25 @@ window {
     border-radius: 18px;
 }
 
+.pet-overlay {
+    background: rgba(0, 0, 0, 0.68);
+    border: 1px solid rgba(148, 163, 184, 0.16);
+    border-radius: 8px;
+    padding: 7px 9px;
+}
+
+.pet-art,
+.pet-message {
+    color: rgba(226, 232, 240, 0.9);
+    font-family: monospace;
+    font-size: 13px;
+    line-height: 1.12;
+}
+
+.pet-art {
+    color: rgba(148, 163, 184, 0.78);
+}
+
 terminal {
     border-radius: 18px;
     padding: 12px;
@@ -505,5 +524,13 @@ mod tests {
         let css = generate_application_css();
         assert!(css.contains(".terminal-dim-overlay"));
         assert!(css.contains("background: rgba(0, 0, 0, 0.10);"));
+    }
+
+    #[test]
+    fn contains_pet_overlay_selector() {
+        let css = generate_application_css();
+        assert!(css.contains(".pet-overlay"));
+        assert!(css.contains(".pet-art"));
+        assert!(css.contains("font-family: monospace;"));
     }
 }

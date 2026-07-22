@@ -1,9 +1,6 @@
 use crate::style::{configure_app_icons, load_css};
 use crate::ui::{launch_workspace, APP_ID};
-use exaterm_core::config::{
-    apply_app_config_environment, load_app_config, save_app_config, AppConfig, RememberedHost,
-    TerminalAssistConfig, DEFAULT_OPENAI_BASE_URL, DEFAULT_TERMINAL_ASSIST_MODEL,
-};
+use exaterm_core::config::{load_app_config, save_app_config, AppConfig, RememberedHost};
 use exaterm_ui::beachhead::{
     list_local_live_workspaces, list_remote_live_workspaces, LiveWorkspace, ParsedArgs, RunMode,
     WorkspaceArg,
@@ -38,7 +35,6 @@ pub(crate) fn present_launcher(app: &gtk::Application, initial: ParsedArgs) {
     configure_app_icons(APP_ID);
 
     let config = Rc::new(RefCell::new(load_app_config()));
-    apply_app_config_environment(&config.borrow());
     if let RunMode::Ssh { target } = &initial.mode {
         remember_remote_target(&config, target);
     }
@@ -108,6 +104,12 @@ pub(crate) fn present_launcher(app: &gtk::Application, initial: ParsedArgs) {
     }
     let scan_button = gtk::Button::builder().label("Scan").build();
     scan_button.add_css_class("launcher-secondary-button");
+    let remove_host_button = gtk::Button::builder()
+        .icon_name("user-trash-symbolic")
+        .tooltip_text("Forget selected remote host")
+        .sensitive(false)
+        .build();
+    remove_host_button.add_css_class("launcher-secondary-button");
     let spinner = gtk::Spinner::builder().visible(false).build();
 
     let source_status = gtk::Label::builder()
@@ -265,6 +267,7 @@ pub(crate) fn present_launcher(app: &gtk::Application, initial: ParsedArgs) {
                 source_status.set_label(&format!("Remote host: {target}"));
                 start_remote_scan(
                     target.clone(),
+                    &source,
                     &workspace_list,
                     &workspaces,
                     &workspace_status,
@@ -285,12 +288,14 @@ pub(crate) fn present_launcher(app: &gtk::Application, initial: ParsedArgs) {
         let reconnect_button = reconnect_button.clone();
         let source_status = source_status.clone();
         let spinner = spinner.clone();
+        let remove_host_button = remove_host_button.clone();
         source_list.connect_row_selected(move |_, row| {
             let Some(row) = row else {
                 return;
             };
             let index = row.index();
             if index == 0 {
+                remove_host_button.set_sensitive(false);
                 source.replace(LauncherSource::Local);
                 source_status.set_label("Local host");
                 let found = list_local_live_workspaces();
@@ -308,10 +313,12 @@ pub(crate) fn present_launcher(app: &gtk::Application, initial: ParsedArgs) {
                     return;
                 };
                 remote_entry.set_text(&target);
+                remove_host_button.set_sensitive(true);
                 source.replace(LauncherSource::Remote(target.clone()));
                 source_status.set_label(&format!("Remote host: {target}"));
                 start_remote_scan(
                     target,
+                    &source,
                     &workspace_list,
                     &workspaces,
                     &workspace_status,
@@ -332,6 +339,7 @@ pub(crate) fn present_launcher(app: &gtk::Application, initial: ParsedArgs) {
         let reconnect_button = reconnect_button.clone();
         let source_status = source_status.clone();
         let spinner = spinner.clone();
+        let remove_host_button = remove_host_button.clone();
         scan_button.connect_clicked(move |_| {
             let Some(target) = normalized_remote_target(&remote_entry.text()) else {
                 workspace_status.set_label("Enter an SSH target first.");
@@ -340,9 +348,11 @@ pub(crate) fn present_launcher(app: &gtk::Application, initial: ParsedArgs) {
             remember_remote_target(&config, &target);
             populate_source_list(&source_list, &config.borrow());
             source.replace(LauncherSource::Remote(target.clone()));
+            remove_host_button.set_sensitive(true);
             source_status.set_label(&format!("Remote host: {target}"));
             start_remote_scan(
                 target,
+                &source,
                 &workspace_list,
                 &workspaces,
                 &workspace_status,
@@ -362,6 +372,7 @@ pub(crate) fn present_launcher(app: &gtk::Application, initial: ParsedArgs) {
         let reconnect_button = reconnect_button.clone();
         let source_status = source_status.clone();
         let spinner = spinner.clone();
+        let remove_host_button = remove_host_button.clone();
         remote_entry.connect_activate(move |_| {
             let Some(target) = normalized_remote_target(&remote_entry_for_scan.text()) else {
                 workspace_status.set_label("Enter an SSH target first.");
@@ -370,9 +381,11 @@ pub(crate) fn present_launcher(app: &gtk::Application, initial: ParsedArgs) {
             remember_remote_target(&config, &target);
             populate_source_list(&source_list, &config.borrow());
             source.replace(LauncherSource::Remote(target.clone()));
+            remove_host_button.set_sensitive(true);
             source_status.set_label(&format!("Remote host: {target}"));
             start_remote_scan(
                 target,
+                &source,
                 &workspace_list,
                 &workspaces,
                 &workspace_status,
@@ -381,10 +394,58 @@ pub(crate) fn present_launcher(app: &gtk::Application, initial: ParsedArgs) {
             );
         });
     }
+    {
+        let config = config.clone();
+        let source_list = source_list.clone();
+        let source = source.clone();
+        let remote_entry = remote_entry.clone();
+        let workspace_list = workspace_list.clone();
+        let workspaces = workspaces.clone();
+        let workspace_status = workspace_status.clone();
+        let reconnect_button = reconnect_button.clone();
+        let source_status = source_status.clone();
+        let spinner = spinner.clone();
+        let remove_host_button_for_signal = remove_host_button.clone();
+        remove_host_button.connect_clicked(move |_| {
+            let LauncherSource::Remote(target) = &*source.borrow() else {
+                remove_host_button_for_signal.set_sensitive(false);
+                return;
+            };
+            let target = target.clone();
+            let mut next = config.borrow().clone();
+            if !next.remove_host(&target) {
+                remove_host_button_for_signal.set_sensitive(false);
+                return;
+            }
+            if let Err(error) = save_app_config(&next) {
+                workspace_status.set_label(&format!("Could not forget {target}: {error}"));
+                return;
+            }
+
+            config.replace(next);
+            source.replace(LauncherSource::Local);
+            remote_entry.set_text("");
+            source_status.set_label("Local host");
+            spinner.stop();
+            spinner.set_visible(false);
+            remove_host_button_for_signal.set_sensitive(false);
+            populate_source_list(&source_list, &config.borrow());
+            let found = list_local_live_workspaces();
+            *workspaces.borrow_mut() = found;
+            refresh_workspace_list(
+                &workspace_list,
+                &workspace_status,
+                &reconnect_button,
+                &workspaces.borrow(),
+                "local",
+            );
+        });
+    }
 
     if let LauncherSource::Remote(target) = &*source.borrow() {
         start_remote_scan(
             target.clone(),
+            &source,
             &workspace_list,
             &workspaces,
             &workspace_status,
@@ -401,6 +462,7 @@ pub(crate) fn present_launcher(app: &gtk::Application, initial: ParsedArgs) {
         .build();
     remote_row.append(&remote_entry);
     remote_row.append(&scan_button);
+    remote_row.append(&remove_host_button);
     remote_row.append(&spinner);
 
     let source_panel = launcher_panel("Hosts", "Local or SSH");
@@ -479,34 +541,11 @@ fn present_settings_window(parent: &adw::ApplicationWindow, config: &Rc<RefCell<
         .css_classes(vec!["launcher-title".to_string()])
         .build();
     let subtitle = gtk::Label::builder()
-        .label("Configure terminal behavior and Ctrl-K assist before opening a workspace.")
+        .label("Configure terminal behavior before opening a workspace.")
         .xalign(0.0)
         .wrap(true)
         .css_classes(vec!["launcher-subtitle".to_string()])
         .build();
-
-    let api_key_entry = gtk::Entry::builder()
-        .placeholder_text("OpenAI API key")
-        .hexpand(true)
-        .build();
-    api_key_entry.add_css_class("launcher-entry");
-    api_key_entry.set_visibility(false);
-    api_key_entry.set_input_purpose(gtk::InputPurpose::Password);
-    api_key_entry.set_text(&current.terminal_assist.openai_api_key);
-
-    let base_url_entry = gtk::Entry::builder()
-        .placeholder_text(DEFAULT_OPENAI_BASE_URL)
-        .hexpand(true)
-        .build();
-    base_url_entry.add_css_class("launcher-entry");
-    base_url_entry.set_text(&current.terminal_assist.openai_base_url);
-
-    let model_entry = gtk::Entry::builder()
-        .placeholder_text(DEFAULT_TERMINAL_ASSIST_MODEL)
-        .hexpand(true)
-        .build();
-    model_entry.add_css_class("launcher-entry");
-    model_entry.set_text(&current.terminal_assist.model);
 
     let audible_bell_switch = gtk::Switch::builder()
         .active(current.terminal.audible_bell)
@@ -522,12 +561,7 @@ fn present_settings_window(parent: &adw::ApplicationWindow, config: &Rc<RefCell<
 
     let terminal_fields = launcher_panel("Terminal", "Behavior");
     terminal_fields.append(&settings_switch_row("Audible bell", &audible_bell_switch));
-
-    let fields = launcher_panel("Ctrl-K Assist", "OpenAI");
-    fields.append(&settings_row("API Key", &api_key_entry));
-    fields.append(&settings_row("Base URL", &base_url_entry));
-    fields.append(&settings_row("Model", &model_entry));
-    fields.append(&status);
+    terminal_fields.append(&status);
 
     let cancel_button = gtk::Button::builder().label("Cancel").build();
     cancel_button.add_css_class("launcher-secondary-button");
@@ -553,7 +587,6 @@ fn present_settings_window(parent: &adw::ApplicationWindow, config: &Rc<RefCell<
     content.append(&title);
     content.append(&subtitle);
     content.append(&terminal_fields);
-    content.append(&fields);
     content.append(&actions);
     window.set_child(Some(&content));
 
@@ -570,16 +603,9 @@ fn present_settings_window(parent: &adw::ApplicationWindow, config: &Rc<RefCell<
         save_button.connect_clicked(move |_| {
             let mut next = config.borrow().clone();
             next.terminal.audible_bell = audible_bell_switch.is_active();
-            next.terminal_assist = TerminalAssistConfig {
-                openai_api_key: api_key_entry.text().trim().to_string(),
-                openai_base_url: base_url_entry.text().trim().to_string(),
-                model: model_entry.text().trim().to_string(),
-            }
-            .normalized();
             let next = next.normalized();
             match save_app_config(&next) {
                 Ok(()) => {
-                    apply_app_config_environment(&next);
                     config.replace(next);
                     window.close();
                 }
@@ -591,22 +617,6 @@ fn present_settings_window(parent: &adw::ApplicationWindow, config: &Rc<RefCell<
     }
 
     window.present();
-}
-
-fn settings_row(label: &str, entry: &gtk::Entry) -> gtk::Box {
-    let label = gtk::Label::builder()
-        .label(label)
-        .xalign(0.0)
-        .width_chars(10)
-        .css_classes(vec!["launcher-row-title".to_string()])
-        .build();
-    let row = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(10)
-        .build();
-    row.append(&label);
-    row.append(entry);
-    row
 }
 
 fn settings_switch_row(label: &str, switch: &gtk::Switch) -> gtk::Box {
@@ -627,6 +637,7 @@ fn settings_switch_row(label: &str, switch: &gtk::Switch) -> gtk::Box {
 
 fn start_remote_scan(
     target: String,
+    active_source: &Rc<RefCell<LauncherSource>>,
     workspace_list: &gtk::ListBox,
     workspaces: &Rc<RefCell<Vec<LiveWorkspace>>>,
     status: &gtk::Label,
@@ -647,12 +658,19 @@ fn start_remote_scan(
     });
 
     let workspace_list = workspace_list.clone();
+    let active_source = active_source.clone();
     let workspaces = workspaces.clone();
     let status = status.clone();
     let spinner = spinner.clone();
     let reconnect_button = reconnect_button.clone();
     glib::timeout_add_local(Duration::from_millis(80), move || match rx.try_recv() {
         Ok((target, result)) => {
+            if !matches!(
+                &*active_source.borrow(),
+                LauncherSource::Remote(active_target) if active_target == &target
+            ) {
+                return glib::ControlFlow::Break;
+            }
             spinner.stop();
             spinner.set_visible(false);
             match result {

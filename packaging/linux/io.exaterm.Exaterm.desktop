@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Exaterm
+GenericName=Terminal Supervisor
+Comment=Supervise terminal-native coding agents
+Exec=exaterm
+Icon=io.exaterm.Exaterm
+Terminal=false
+Categories=System;TerminalEmulator;
+Keywords=terminal;coding;agents;supervision;
+StartupNotify=true
+StartupWMClass=io.exaterm.Exaterm

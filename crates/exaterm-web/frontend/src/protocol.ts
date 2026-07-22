@@ -93,14 +93,29 @@ export interface TerminalDisplayCapabilities {
   vte_version: string | null;
 }
 
+export interface PetOrigin {
+  seed_hash: string;
+}
+
+export interface PetComment {
+  id: number;
+  session_id: SessionId;
+  name: string;
+  appearance_ascii: string;
+  message: string;
+  ttl_secs: number;
+}
+
 export type ServerMessage =
   | { type: "workspace_snapshot"; snapshot: WorkspaceSnapshot }
   | { type: "terminal_assist_completed"; request_id: number; session_id: SessionId; inserted: boolean; error: string | null }
+  | { type: "pet_comment"; comment: PetComment }
   | { type: "error"; message: string };
 
 export type ClientMessage =
   | { type: "attach_client" }
   | { type: "set_terminal_display_capabilities"; capabilities: TerminalDisplayCapabilities }
+  | { type: "set_pet_origin"; origin: PetOrigin }
   | { type: "create_or_resume_default_workspace" }
   | { type: "add_terminals"; source_session: SessionId }
   | { type: "add_terminals_to"; source_session: SessionId; target_total: number }

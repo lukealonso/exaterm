@@ -82,7 +82,7 @@ You’ll need:
 
 The exact package names depend on distro.
 
-Exaterm can use OpenAI for Ctrl-K terminal assist.
+Ctrl-K terminal assist uses the local Codex app server.
 
 On macOS, initialize the SwiftTerm submodule before building:
 
@@ -92,18 +92,18 @@ git submodule update --init --recursive
 
 Required:
 - no model credential is required to run the app
+- Ctrl-K requires an installed and authenticated `codex` CLI on the beachhead host
 
 Configuration:
 - open the launcher Settings panel before choosing a workspace
 - leave the terminal audible bell disabled, or enable it there if wanted
-- set the OpenAI API key, base URL, and Ctrl-K model there
-- the default base URL is `https://api.openai.com/v1`
-- the default Ctrl-K model is `gpt-5.5-nano`
 - settings are stored in the Exaterm application config file at `$XDG_CONFIG_HOME/exaterm/config.json`, or `~/.config/exaterm/config.json`
 
 Notes:
-- Exaterm appends `/chat/completions` automatically when needed
-- without an OpenAI API key in application settings, the app still runs, but Ctrl-K terminal assist is unavailable
+- Exaterm launches `codex app-server` using its experimental loopback WebSocket transport when Ctrl-K is first used
+- each terminal receives its own Codex thread, and later Ctrl-K requests in that terminal continue the same thread
+- remote Ctrl-K assist requires `codex` to be installed and authenticated on the remote beachhead
+- see the [Codex app-server documentation](https://developers.openai.com/codex/app-server)
 
 ## Building
 
@@ -144,6 +144,33 @@ You can also run the daemon directly:
 
 ```bash
 make daemon
+```
+
+## Linux System Install
+
+Build and install Exaterm under `/usr/local`:
+
+```bash
+make system-install
+```
+
+This installs:
+- `exaterm`, `exaterm-gtk`, and `exatermd` under `/usr/local/bin`
+- `io.exaterm.Exaterm.desktop` under `/usr/local/share/applications`
+- scalable and 128px application icons under the hicolor icon theme
+
+The desktop entry appears as **Exaterm** in application launchers. To install
+under another prefix or stage a package filesystem, use standard Make variables:
+
+```bash
+make system-install PREFIX=/usr
+make install PREFIX=/usr DESTDIR="$PWD/pkgroot"
+```
+
+Remove an installation with matching variables:
+
+```bash
+make system-uninstall
 ```
 
 ## Remote Mode
@@ -213,6 +240,8 @@ make test
 make test-workspace
 make core-test
 make daemon-check
+make system-install
+make system-uninstall
 make web
 make web-run
 make web-test
